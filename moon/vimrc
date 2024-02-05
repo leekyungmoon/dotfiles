@@ -1,1 +1,3115 @@
-command W w
+" @wookayin's vimrc file
+" https://dotfiles.wook.kr/vim/vimrc
+"
+" https://github.com/wookayin/dotfiles
+
+scriptencoding utf-8
+
+" Allow lazy execution of plugin inits (after VimEnter and then UI initializes)
+autocmd! VimEnter
+autocmd! User LazyInit
+if exists("*timer_start") && exists('*nvim_command')  " neovim
+  autocmd! VimEnter * call timer_start(0, { -> nvim_command('doautocmd User LazyInit') })
+else  " No timer support, this will run during VimEnter (before UI draws)
+  autocmd! VimEnter * call execute('doautocmd User LazyInit')
+endif
+
+" Check neovim version.
+if has('nvim') && !has('nvim-0.7.0')
+  let s:warning_msg = 'Please upgrade to latest neovim (0.7.0+). Support for neovim <= 0.6 will be dropped soon. '
+  let s:install_command_hint = printf('(Try: %s install neovim)', has('mac') ? 'brew' : 'dotfiles')
+  autocmd VimEnter * echohl WarningMsg | echom s:warning_msg . s:install_command_hint | echohl None
+endif
+
+"""""""""""""""""""""""""""""""""""""""""
+" 0. Load Plugin {{{
+"""""""""""""""""""""""""""""""""""""""""
+
+" All the vim plugins are managed by 'vim-plug'
+" and listed up in the separate file 'plugins.vim',
+" so that this vimrc would still work standalone without plugins.
+let g:plugs = {}
+if filereadable(expand('~/.vim/plugins.vim'))
+  source \~/.vim/plugins.vim
+endif
+
+" Utilities to tell whether a plugin is configured or installed.
+function! HasPlug(name) abort
+  return has_key(g:plugs, a:name)
+endfunction
+function! IsPlugInstalled(name) abort
+  return has_key(g:plugs, a:name) && isdirectory(g:plugs[a:name].dir)
+endfunction
+
+" }}}
+"""""""""""""""""""""""""""""""""""""""""
+" 1. General Settings {{{
+"""""""""""""""""""""""""""""""""""""""""
+
+filetype plugin on
+filetype indent on
+if !exists('g:syntax_on')
+  syntax on
+  let g:syntax_on = 1
+end
+
+set nocompatible
+
+if !empty($SHELL) && filereadable($SHELL)
+  let &g:shell=$SHELL
+elseif filereadable('/bin/zsh')
+  set shell=/bin/zsh
+else
+  set shell=/bin/bash
+endif
+
+" use path '~/.vim' even on non-unix machine
+set runtimepath+=~/.vim
+
+" add ~/.local/bin and ~/.dotfiles/bin to $PATH
+let $PATH .= ':' . expand('~/.local/bin')
+let $PATH .= ':' . expand('~/.dotfiles/bin')
+
+" load plugins with pathogen
+try
+  runtime bundle/vim-pathogen/autoload/pathogen.vim
+  call pathogen#infect()
+catch
+endtry
+
+" basic displays
+set number                  " show line numbers
+set ruler
+
+" input settings
+set backspace=indent,eol,start     " allow backspaces over everything
+set autoindent
+set smartindent
+set pastetoggle=<F8>
+
+set nowrap
+set textwidth=0             " disable automatic line breaking
+set cursorline
+
+" tab settings
+if has('vim_starting')
+  set tabstop=4
+  set shiftwidth=4
+  set softtabstop=4
+  set shiftround
+endif
+
+" tab navigation
+set showtabline=2           " always show tab pannel
+
+set scrolloff=3
+
+if exists('##TermEnter')
+  " Disable scrolloff in terminal buffers (to avoid flickering)
+  " Note: scrolloff is a global option until neovim 0.5 (neovim/neovim#11915)
+  augroup TermScrollFix
+    autocmd!
+    autocmd TermOpen,TermEnter * setlocal scrolloff=0
+    autocmd TermLeave          * setlocal scrolloff=3        " workaround for nvim<0.5
+  augroup end
+endif
+
+if exists('##TermOpen')
+  augroup TermSignColumn
+    autocmd!
+    autocmd TermOpen           * set signcolumn=no
+  augroup end
+endif
+
+" search
+set ignorecase              " case-insensitive by default
+set smartcase               " case-sensitive if keyword contains both uppercase and lowercase
+set incsearch
+set hlsearch
+
+if has('nvim')
+  " live preview of substitute command, with a split window
+  " @seealso http://vimcasts.org/episodes/neovim-eyecandy/
+  set inccommand=split
+endif
+
+" Fold level: when starting, let all the folds be open
+set nofoldenable
+
+" When jumping to line, folds on the line should be opened (:help 'foldopen')
+set foldopen+=jump
+
+" foldcolumn display
+if has('nvim-0.5.0')
+  set foldcolumn=auto
+endif
+
+" use spaces for tabbing, by default
+set expandtab
+
+" vertical splits
+set fillchars+=vert:│
+
+" listchars for whitespaces
+set list
+set listchars=tab:»\ ,trail:·,extends:>,precedes:<
+
+augroup listchars_filetype
+  autocmd!
+  autocmd FileType GV setlocal listchars-=trail:·
+augroup END
+
+" wildmenu settings
+set wildmenu
+try
+  " neovim 0.4.0+: popupmenu completion in the cmdline mode
+  set wildoptions+=pum
+  set wildmode=longest:full,full
+
+  " make <up>, <down>, <tab>, <shift-tab> work well with popupmenu in cmdline
+  " (Note) this setting will be overriden later for wilder.nvim
+  cnoremap <expr> <up>   pumvisible() ? "<C-p>" : "<up>"
+  cnoremap <expr> <down> pumvisible() ? "<C-n>" : "<down>"
+catch
+  " old wildmenu heavior (vanilla vim)
+  set wildmode=list,longest:full
+endtry
+set wildignore=*.swp,*.swo,*.class,*.pyc,__pycache__,
+
+" status line
+" Neovim(0.8+): lualine will override with laststatus=3,
+" see ~/.config/nvim/lua/config/statusline.lua
+set laststatus=2            " show anytime (legacy vim behavior)
+
+set noshowmode              " don't display mode, e.g. '-- INSERT --'
+set showcmd
+
+" title: turn on if tmux is ON
+if !empty($TMUX)
+  set title
+endif
+
+" customize the native statusline, just in case airline/lualine is not available
+" (this setting will be replaced afterwards by airline/lualine)
+if empty(&statusline)
+  set statusline=%1*%{winnr()}\ %*%<\ %f\ %h%m%r%=%l,%c%V\ (%P)
+endif
+
+" mouse behaviour
+if has('mouse')
+  set mouse=nvc
+endif
+if ! has('nvim')
+  " vim only (not in neovim)
+  set ttymouse=xterm2
+endif
+
+
+" encoding and line ending settings
+if !has('nvim')
+  set encoding=utf-8
+endif
+set fileencodings=utf-8,cp949,latin1
+set fileformats=unix,dos
+
+" split and autocomplete settings
+set splitbelow                              " :split  opens window below (:belowright split), including preview windows
+set splitright                              " :vsplit opens window right (:belowright vsplit)
+set completeopt=menuone,preview,longest     " show preview and pop-up menu
+
+" Avoid 'Pattern not found' messages (nvim-compe, etc.)
+set shortmess+=c
+
+" no fucking swap and backup files
+set noswapfile
+set nobackup
+
+" dictionary
+if filereadable('/usr/share/dict/words')
+  set dictionary+=/usr/share/dict/words
+endif
+
+" Retain more history (:, search strings, etc.)
+set history=10000
+set undolevels=1000
+
+" miscellanious
+set visualbell
+set lazyredraw              " no redrawing during macro execution
+
+" Make gitgutter signs, etc. be more responsive (default is 4000ms)
+set updatetime=200
+
+set matchpairs+=<:>
+
+" when launching files via quickfix, FZF, or something else,
+" first switch to existing tab (if any) that contains the target buffer,
+" or open a new buffer by splitting window in the current tab otherwise.
+set switchbuf+=usetab,split
+
+" diff: ignore whitespaces
+if &diff
+  set diffopt+=iwhite
+  " use more intuitive, semantically easy-to-parse diff algorithm
+  if has("patch-8.1.0360") || has('nvim')
+    set diffopt+=internal,algorithm:patience
+  endif
+endif
+
+" jump to the last position when reopening a file
+if has('autocmd')
+  let s:last_position_disable_filetypes = ['gitcommit']
+  au BufReadPost * if index(s:last_position_disable_filetypes, &ft) < 0 && line("'\"") > 1 && line("'\"") <= line("$") | exe "normal! g'\"zz" | endif
+endif
+
+" use strong encryption
+if ! has('nvim')
+  if v:version >= 800 || v:version == 704 && has('patch399')
+    set cryptmethod=blowfish2 " Requires >= 7.4.399
+  else
+    set cryptmethod=blowfish
+  endif
+endif
+
+" When opening http urls using netrw, follow 302 redirects
+let g:netrw_http_cmd = 'curl -L -o'
+
+" terminal mode (neovim)
+if has('nvim')
+  au TermOpen * setlocal nonumber norelativenumber
+endif
+
+" Use nvr as git editor (inside neovim terminal)
+if has('nvim') && executable('nvr')
+  let $GIT_EDITOR = 'nvr -cc split --remote-wait'
+  autocmd FileType gitcommit set bufhidden=delete
+endif
+
+" python
+if !has('nvim') && !has('python3')
+  autocmd VimEnter * echohl WarningMsg |
+        \ echom 'WARNING: This version of vim is unsupported, lacking +python3. Install vim from brew/apt or use neovim.' |
+        \ echohl None
+endif
+
+" For debugging
+function! ToggleVerbose()
+  if !&verbose
+    set verbosefile=~/.vim/verbose.log
+    set verbose=15
+  else
+    set verbose=0
+    set verbosefile=
+  endif
+endfunction
+
+" :lua vim.notify / VimNotify
+if has('nvim') && luaeval('vim.notify == nil')
+  " Backward compatibility for neovim < 0.5
+  " see nvim-notify plugin settings below
+  lua vim.notify = function(msg, log_level, opts) print(msg) end
+endif
+
+if has('nvim')
+  function! VimNotify(msg, ...)
+    " Compatible with vanilla vim, neovim 0.4.x, and 0.5.0+ (native)
+    " Same spec as v:lua.vim.notify(msg, log, opts).
+    let l:log_level = a:0 >= 1 ? a:000[0] : 'info'
+    let l:opts = a:0 >= 2 ? a:000[1] : {}
+    return luaeval("vim.notify(_A[1], _A[2], _A[3])", [a:msg, l:log_level, l:opts])
+  endfunction
+else  " fallback for vanilla vim
+  function! VimNotify(msg, ...)
+    echom a:msg
+  endfunction
+endif
+command! -nargs=+ Notify         :call VimNotify(<q-args>)
+command! -nargs=+ NotifyError    :call VimNotify(<q-args>, 'error')
+
+" }}}
+"""""""""""""""""""""""""""""""""""""""""
+" 2. Key and Functional Mappings {{{
+"""""""""""""""""""""""""""""""""""""""""
+
+" the leader key
+" (NOTE) leader key is mapped to vim-which-key, see sections below
+let mapleader=','           " comma is the <Leader> key.
+let maplocalleader=','      " comma : <LocalLeader>
+nnoremap <leader>:  :
+
+nnoremap <Space> :
+
+inoremap <silent> <C-k> <ESC>:update<CR>
+nnoremap <silent> <leader>e   :<C-u>e<CR>zR
+
+nnoremap Q <Nop>
+nnoremap QQ ZQ
+
+" navigation key mapping
+map <silent> k gk
+map <silent> j gj
+sunmap k
+sunmap j
+
+nmap <up> gk
+nmap <down> gj
+
+inoremap <up> <c-\><c-o>gk
+inoremap <down> <c-\><c-o>gj
+
+noremap <C-F> <C-D>
+noremap <C-B> <C-U>
+
+" Ignore errornous input in Mac OS X
+imap <D-space> <Nop>
+
+" Workaround neovim bug (it freezes, why?)
+imap <F3> <Nop>
+
+" <Ctrl-Space> invokes <C-X><C-O> (omni-completion)
+inoremap <C-Space> <C-x><C-o>
+inoremap <C-@> <C-x><C-o>
+
+" window navigation
+noremap <C-h> <C-w>h
+noremap <C-j> <C-w>j
+noremap <C-k> <C-w>k
+noremap <C-l> <C-w>l
+
+noremap <M-h> <C-w>h
+noremap <M-l> <C-w>l
+
+" window navigation: aware of tmux
+let g:tmux_navigator_no_mappings = 1
+if has_key(g:plugs, 'vim-tmux-navigator') && !empty($TMUX)
+  nnoremap <silent> <c-h> :TmuxNavigateLeft<cr>
+  nnoremap <silent> <c-j> :TmuxNavigateDown<cr>
+  nnoremap <silent> <c-k> :TmuxNavigateUp<cr>
+  nnoremap <silent> <c-l> :TmuxNavigateRight<cr>
+endif
+
+" window resize (simply)
+nnoremap _ <C-W>-
+nnoremap + <C-W>+
+nnoremap <S-Right> <C-W>>
+nnoremap <S-Left>  <C-W><
+nnoremap <S-Down>  <C-W>-
+nnoremap <S-Up>    <C-W>+
+
+if exists(':tnoremap')
+  tnoremap <S-Right> <cmd>wincmd ><CR>
+  tnoremap <S-Left>  <cmd>wincmd <<CR>
+  tnoremap <S-Down>  <cmd>wincmd -<CR>
+  tnoremap <S-Up>    <cmd>wincmd +<CR>
+endif
+
+
+" zoom and unzoom (like tmux) -- by 'vim-maximizer'
+nnoremap <C-w>z :MaximizerToggle<CR>
+let g:maximizer_set_default_mapping = 0         " do not map <F3>
+
+" well...?
+inoremap <C-C> <ESC>
+
+" folding and unfolding:
+
+" z<space> toggles folding.
+" It will open the current fold recursively when fold is closed,
+" or close (the narrow one) when fold is open at the cursor.
+nnoremap <expr>  z<space>   foldclosed(line(".")) >= 0 ? "zO" : "zc"
+
+
+" in terminal mode (neovim)
+if has('nvim')
+  " <C-\><C-n> is the key sequence for escaping form terminal mode
+  " double <ESC> and double <C-\> also goes for escaping from terminal,
+  " whereas single <ESC> would be directly passed inside the terminal.
+  tnoremap <silent> <C-[><C-[> <C-\><C-n>
+  tnoremap <silent> <C-\><C-\> <C-\><C-n>
+
+  " Automatically enter insert mode when entering neovim terminal buffer
+  augroup terminal_autoinsert
+    autocmd!
+    autocmd BufWinEnter,WinEnter *  if &buftype == 'terminal' | startinsert | endif
+    autocmd TermOpen *  if nvim_buf_get_name(0) =~# '^term://' | startinsert | endif
+
+    " mouse click puts into normal mode even in terminal; disable this
+    autocmd TermOpen * tnoremap <buffer><silent> <LeftRelease> <Nop>
+    autocmd TermOpen * tnoremap <buffer><silent> <LeftMouse> <cmd>startinsert<CR>
+  augroup END
+
+  " terminal in a new tab or vsplit buffer
+  command! -nargs=*        -complete=shellcmd Term         :tabnew | :term <args>
+  command! -nargs=*        -complete=shellcmd Ttab         :tabnew | :term <args>
+
+  command! -nargs=* -count -complete=shellcmd TermSplit    :exec <q-mods> .' '. (<count> ? <count> : '').'split  | :term ' . <q-args>
+  command! -nargs=* -count -complete=shellcmd TermVSplit   :exec <q-mods> .' '. (<count> ? <count> : '').'vsplit | :term ' . <q-args>
+
+  command! -nargs=* -count -complete=shellcmd Tsplit       :exec <q-mods> .' '. (<count> ? <count> : '').'split  | :term ' . <q-args>
+  command! -nargs=* -count -complete=shellcmd Tvsplit      :exec <q-mods> .' '. (<count> ? <count> : '').'vsplit | :term ' . <q-args>
+
+  " Mapping for <c-hjkl> in terminal mode
+  " <c-h> might not work: see https://github.com/neovim/neovim/issues/2048
+  tmap <silent> <C-h> <C-\><C-n><cmd>wincmd h<CR>
+  tmap <silent> <C-j> <C-\><C-n><cmd>wincmd j<CR>
+  tmap <silent> <C-k> <C-\><C-n><cmd>wincmd k<CR>
+  "tmap <silent> <C-l> <C-\><C-n><cmd>wincmd l<CR>   " Ctrl-L is clear screen
+  tmap <silent> <M-h> <C-\><C-n><cmd>wincmd h<CR>
+  tmap <silent> <M-l> <C-\><C-n><cmd>wincmd l<CR>
+
+  " Ctrl-E, Ctrl-Y: Scroll window in terminal-normal mode
+  tmap <silent> <C-e> <C-\><C-n><C-e>
+  tmap <silent> <C-y> <C-\><C-n><C-y>
+
+  " Ctrl-/ requires key remapping (neovim 0.8.0, see #18735)
+  tnoremap <c-/> <c-_>
+endif
+
+if has('nvim')
+  " workaround for <c-h> mapping bug in neovim
+  " @see https://github.com/neovim/neovim/issues/2048
+  nmap <BS> <C-W>h
+
+  " ignore erroneous key input on scrolling, <ffffffff>
+  tnoremap <ScrollWheelLeft> <nop>
+endif
+
+" Buffer navigations
+nnoremap [b  :bprevious<CR>
+nnoremap ]b  :bnext<CR>
+if has('nvim')
+  nnoremap <silent> [b <C-\><C-n>:bprevious<CR>
+  nnoremap <silent> ]b <C-\><C-n>:bnext<CR>
+endif
+
+" Tab navigations
+nnoremap <silent> [t  :tabprevious<CR>
+nnoremap <silent> ]t  :tabnext<CR>
+if has('nvim')
+  tnoremap <silent> [t <C-\><C-n>:tabprevious<CR>
+  tnoremap <silent> ]t <C-\><C-n>:tabnext<CR>
+endif
+
+nnoremap <C-t>     :tabnew<CR>
+
+nnoremap <silent>   <C-S-tab> :tabprevious<CR>
+nnoremap <silent>   <C-tab>   :tabnext<CR>
+if has('nvim')
+  tnoremap <silent> <C-S-tab> <C-\><C-n>:tabprevious<CR>
+  tnoremap <silent> <C-tab>   <C-\><C-n>:tabnext<CR>
+endif
+
+" Handy tab navigations: <Alt-num>
+nnoremap 1 1gt
+nnoremap 2 2gt
+nnoremap 3 3gt
+nnoremap 4 4gt
+nnoremap 5 5gt
+nnoremap 6 6gt
+nnoremap 7 7gt
+nnoremap 8 8gt
+nnoremap 9 9gt
+
+" do not exit from visual mode when shifting
+" (gv : select the preivous area)
+vnoremap < <gv
+vnoremap > >gv
+
+" Locations
+nnoremap [l :lprevious<CR>
+nnoremap ]l :lnext<CR>
+
+" -----------------------
+" [F5] Make and Build {{{
+" -----------------------
+" use Make (vim-dispatch) or Neomake (neomake)
+if has_key(g:plugs, 'neomake')
+    " neomake; always use the bang version so that :copen can sync
+    command! -nargs=0 -bang TheMake cexpr [] | Neomake!
+    command! -nargs=0 TheCopen copen
+else
+    " vim-dispatch
+    command! -nargs=0 -bang TheMake Make<bang>
+    command! -nargs=0 TheCopen Copen
+endif
+
+
+" smartly dispatch according to filetype
+command! -nargs=0 -bang RunMake call s:run_make("<bang>")
+function! s:run_make(bang)
+    let l:silent_filetypes = ['tex', 'pandoc', 'lilypond']
+    " (1) bang given, force background
+    if a:bang ==# '!' | TheMake!
+    " (2) for specified filetypes, use background
+    elseif index(l:silent_filetypes, &filetype) >= 0 | TheMake!
+    " (3) otherwise, make with foreground shown
+    else | TheMake
+    endif
+    echo printf(':RunMake  (%s)', &makeprg)
+endfunction
+
+" A handy way to set makeprg.
+command! -nargs=1 Makeprg let &g:makeprg="<args>" | echo "makeprg = <args>"
+
+if has_key(g:plugs, 'vim-dispatch')
+    " use vim-dispatch if exists
+
+    " <F5>: run make, asynchronously or split windows (dispatch)
+    map  <F5> <ESC>:w<CR>:RunMake<CR>
+    imap <F5> <ESC><F5>a
+
+    " <leader-F5>: run make with visible progress (split window in tmux)
+    map  <leader><F5> <ESC>:w<CR>:RunMake!<CR>
+
+else
+    " otherwise, fallback to default make
+    map <F5> <ESC>:w<CR>:make!<CR>
+    imap <F5> <ESC><F5>a
+endif
+
+" Make for vim script files is to reload itself.
+augroup VimscriptMakeprg
+  autocmd!
+  autocmd FileType vim   nmap <buffer> <F5>
+        \ <cmd>source %<CR><cmd>call VimNotify("Sourced " . bufname('%'))<CR>
+augroup END
+
+" Alternative to <F5>
+map <leader>m <F5>
+
+" }}}
+
+" <F6>: show/close quickfix window (scroll bottom)
+function! QuickfixToggle()
+  let nr = winnr('$')
+  :TheCopen
+  let nr2 = winnr('$')
+  if nr == nr2 | cclose | endif
+endfunction
+map  <silent> <F6> :call QuickfixToggle()<CR>
+imap <silent> <F6> <ESC>:call QuickfixToggle()<CR>G:wincmd w<CR>a
+nmap  <silent> <C-Q> :call QuickfixToggle()<CR>
+
+" <leader>L: show/close location list window
+function! LocListToggle()
+  let nr = winnr('$')
+  :lopen
+  let nr2 = winnr('$')
+  if nr == nr2 | lclose | endif
+endfunction
+map  <silent> <leader>L :call LocListToggle()<CR>
+
+" [F4] Next Error [Shift+F4] Previous Error
+map <F4> <ESC>:cn<CR>
+map [26~ <ESC>:cp<CR>
+map [1;2S <ESC>:cp<CR>
+map [29~ <ESC>:cp<CR>
+
+" [F2] save
+imap <F2> <ESC>:w<CR>
+map <F2> <ESC><ESC>:w<CR>
+
+" save in the insert mode?
+inoremap <C-S> <ESC>:update<CR>a
+
+" Sudo Save (:Wsudo command)
+command! Wsudo w !sudo tee % > /dev/null
+
+
+" Useful leader key combinations {{{
+
+" <leader><space> : turn off search highlight
+nmap <silent> <leader><space> :noh<CR>
+
+" Plugin ag.vim
+" <leader>ag (or rg): Ag (search file contents)
+nnoremap <leader>ag           :Ag! -i ""<Left>
+xnoremap <silent> <leader>ag  y:Ag <C-R>"<CR>
+
+if executable('rg')
+  " Use ripgrep instead :)
+  let g:ag_prg = 'rg --no-heading --vimgrep'
+endif
+
+
+" CD: switch to the directory of the current buffer
+function! CD_to(dir)
+  if empty(a:dir) || a:dir == -1
+    return
+  endif
+  execute 'silent cd ' . a:dir
+  echohl Directory | echom getcwd() | echohl None
+
+  " if NERDTree is open, chdir NERDTree as well
+  if exists('g:NERDTree') && g:NERDTree.IsOpen()
+    :NERDTreeCWD | wincmd w
+  endif
+endfunction
+command! -nargs=0   CD   :call CD_to(expand('%:p:h'))
+
+" CDRoot: switch to the project root directory of the current buffer
+function! DetermineProjectRoot() abort
+  " If the current file is under a git repository, that's it!
+  let l:git_dir = s:get_git_dir('%')
+  if !empty(l:git_dir)
+    return resolve(l:git_dir . "/..")
+  endif
+
+  " Not a git repository. Use heuristic and domain knowledge as much as you can
+  let l:base_dir = expand("%:p")
+  if l:base_dir =~ 'python[^/]*/site-packages/[^/]\+/'
+    return resolve(substitute(l:base_dir, '\(python[^/]*/site-packages/[^/]\+/\).*$', '\1', 'g'))
+  else
+    return ''
+  endif
+endfunction
+function! s:CDRoot() abort
+  let l:project_root = DetermineProjectRoot()
+  if empty(l:project_root)
+    echohl WarningMsg | echom 'Cannot determine project root directory. (Want :CD?)' | echohl None
+  else
+    return CD_to(l:project_root)
+  endif
+endfunction
+command! -nargs=0   CDRoot  :call s:CDRoot()
+nmap <silent> <leader>cd    :<C-U>CDRoot<CR>
+
+
+" <leader>R : screen sucks, redraw everything
+function! Redraw()
+  :mode
+  call s:auto_termguicolors()   " re-detect true colors
+endfunction
+nnoremap <silent> <leader>R :call Redraw()<CR>
+
+" <leader>src : source ~/.vimrc
+nnoremap <leader>src   <cmd>call _source_rc()<CR>
+if v:vim_did_enter == 0   " Do not redefine the function
+  function! _source_rc() abort
+    if has('nvim')
+      source ~/.config/nvim/init.vim
+      doautocmd VimEnter
+      echo 'Sourced ~/.config/nvim/init.vim'
+    else
+      source ~/.vimrc
+      doautocmd VimEnter
+      echo 'Sourced ~/.vimrc'
+    endif
+  endfunction
+endif
+
+" :Vimrc opens vim config files in a new tab
+command! -nargs=0 Vimrc   call s:open_vimrc_tab()
+function! s:open_vimrc_tab()
+  let l:plug_width = max([5, float2nr(0.333 * &columns)])
+  let l:addon_height = max([2, float2nr(0.1 * &lines)])
+
+  exec ":tabnew " . resolve(expand("~/.vim/vimrc"))
+  if filereadable(expand("~/.config/nvim/lua/config/lsp.lua"))
+    exec ":vsplit " . resolve(expand("~/.config/nvim/lua/config/lsp.lua"))
+    exec printf(":vertical resize %d", 2 * l:plug_width)
+  endif
+  if filereadable(expand("~/.vimrc.local"))
+    exec ":botright sp " . resolve(expand("~/.vimrc.local"))
+    exec printf(":resize %d", l:addon_height)
+  endif
+
+  exec ":botright vnew " . resolve(expand("~/.vim/plugins.vim"))
+  exec printf(":vertical resize %d", l:plug_width)
+  if filereadable(expand("~/.vim/plugins.local.vim"))
+    exec ":belowright sp " . resolve(expand("~/.vim/plugins.local.vim"))
+    exec printf(":resize %d", l:addon_height)
+  endif
+  wincmd t  " focus on the first window (~/.vimrc)
+endfunction
+
+" :Plugins
+command! -nargs=0 Plugins  exec ":rightbelow vs " . resolve(expand("~/.vim/plugins.vim"))
+
+" <leader>{y,x,p} : {yank,cut,paste} wrt the system clipboard
+map <leader>y "*y
+noremap <leader>x "*x
+noremap <leader>p "*p
+
+" <leader>w : save
+nnoremap <leader>w :w!<CR>
+
+" <leader>q : quit/close window
+nnoremap <silent> <leader>q :q<CR>
+
+" <leader>S : Strip trailing whitespaces
+command! -nargs=0 Strip call StripTrailingWhitespaces()
+nnoremap <leader>S :Strip<CR>
+
+" <leader>df : diffthis
+nnoremap <leader>df :diffthis<CR>
+
+" Surround a word with quotes, single quotes, parens, brackets, braces, etc.
+"   requires and powered by the plugin surround.vim :-)
+" (Note) for visual blocks, use S command from surround.vim
+nmap  <leader>s" ysiw"
+nmap  <leader>s' ysiw'
+nmap  <leader>s` ysiw`
+nmap  <leader>s* ysiw*l
+nmap  <leader>s_ ysiw_l
+nmap  <leader>s~ ysiw~l
+nmap  <leader>s$ ysiw$
+nmap  <leader>s( ysiw(
+nmap  <leader>s) ysiw)
+nmap  <leader>s[ ysiw[
+nmap  <leader>s] ysiw]
+nmap  <leader>s{ ysiw{
+nmap  <leader>s} ysiw}
+" ask function: e.g., word -> function(word)
+nmap  <leader>sf ysiwf
+
+vmap  <leader>s" S"
+vmap  <leader>s' S'
+vmap  <leader>s` S`
+vmap  <leader>s* S*
+vmap  <leader>s_ S_
+vmap  <leader>s~ S~
+vmap  <leader>s$ S$
+vmap  <leader>s( S(
+vmap  <leader>s) S)
+vmap  <leader>s[ S[
+vmap  <leader>s] S]
+vmap  <leader>s{ S{
+vmap  <leader>s} S}
+" ask function: e.g., word -> function(word)
+vmap  <leader>sf Sf
+
+
+" Zoom Tmux
+noremap <silent> <leader>z :silent exec "!tmux resize-pane -Z"<CR>
+
+" Prevent accidental <Ctrl-A> (on tmux) and <Ctrl-X>
+if !empty($TMUX)
+  nnoremap <C-a> <nop>
+  nnoremap <C-x> <nop>
+  " To increase/decrease numbers, press <comma>, <c-a>, a ...?
+  nnoremap <leader><C-a> <C-a>
+  nnoremap <leader><C-x> <C-x>
+endif
+
+" }}}
+
+" }}}
+"""""""""""""""""""""""""""""""""""""""""
+" 3. More Functions and Commands {{{
+"""""""""""""""""""""""""""""""""""""""""
+
+" Utilities
+if exists('*trim')
+  function! Trim(input_string)
+    return trim(a:input_string)  " builtin trim() if neovim 0.3.2+ or vim 8.0.1630+
+  endfunction
+else
+  function! Trim(input_string)
+    return substitute(a:input_string, '^\s*\(.\{-}\)\s*$', '\1', '')
+  endfunction
+endif
+
+function! TrimRight(input_string)
+  return substitute(a:input_string, '\s*$', '\1', '')
+endfunction
+
+function! Echo(msg) abort
+  echo a:msg
+  return a:msg
+endfunction
+function! Echom(msg) abort
+  echom a:msg
+  return a:msg
+endfunction
+
+if exists('*expandcmd')  " neovim 0.5, vim: +v8.1.1510
+  function! ExpandCmd(string) abort
+    return expandcmd(a:string)
+  endfunction
+else
+  let s:expandable = '\\*\%(<\w\+>\|%\|#\d*\)\%(:[p8~.htre]\|:g\=s\(.\).\{-\}\1.\{-\}\1\)*'
+  function! ExpandCmd(string) abort
+    return substitute(a:string, s:expandable, '\=expand(submatch(0))', 'g')
+  endfunction
+endif
+
+" Command aliases or abbrevations
+" CommandAlias(aliasname, target, [register_cmd = v:false])
+function! CommandAlias(aliasname, target, ...)
+  let l:register_cmd = get(a:000, 0, )
+
+  " :aliasname => :target  (only applicable at the beginning of the command line)
+  exec printf('cnoreabbrev <expr> %s ', a:aliasname)
+    \ .printf('((getcmdtype() ==# ":" && getcmdline() =~# "^%s") ? ', a:aliasname)
+    \ .printf('("%s") : ("%s"))', escape(a:target, '"'), escape(a:aliasname, '"'))
+
+  " optionally, make a dummy command to facilitate cmdline completion
+  if l:register_cmd
+    exec printf(':command! -nargs=0 %s %s', a:aliasname, a:target)
+  endif
+endfunction
+
+" some basic command abbrs
+call CommandAlias('s%', 'source %')
+call CommandAlias('tnew', 'tabnew')
+
+" WinDo: Like :windo, but preserves the current window and view.
+function! WinDo(command) abort
+  let l:currwin = winnr()
+  let l:view = winsaveview()
+  try
+    execute printf('noautocmd windo execute "%s"', escape(a:command, '"'))
+  finally
+    noautocmd execute l:currwin . 'wincmd w'
+    call winrestview(l:view)
+  endtry
+endfunction
+command! -nargs=* WinDo   call WinDo(<q-args>)
+
+" :Q -- close tab
+function! s:Q() abort
+  if tabpagenr('$') == 1
+    qall
+  else
+    tabclose
+  endif
+endfunction
+command! -nargs=0 Q   call s:Q()
+
+" Lua utilities (helpful for debugging)
+if has('nvim-0.5.0')
+  function! LuaEcho(expr) abort
+    echo luaeval("vim.inspect(" . a:expr . ")")
+  endfunction
+  command! -complete=lua -nargs=* LuaEcho   call LuaEcho(<q-args>)
+  call CommandAlias('Luaecho', 'LuaEcho')
+  call CommandAlias('luaecho', 'LuaEcho')
+  call CommandAlias('luae', 'LuaEcho')
+  call CommandAlias('l', 'LuaEcho')
+endif
+
+" ----------------------------------------------------------------------------
+" <Leader>?/! : Google it / Feeling lucky
+"   (code brought from @junegunn/dotfiles)
+" ----------------------------------------------------------------------------
+function! s:goog(pat, lucky)
+  let q = '"'.substitute(a:pat, '["\n]', ' ', 'g').'"'
+  let q = substitute(q, '[[:punct:] ]',
+        \ '\=printf("%%%02X", char2nr(submatch(0)))', 'g')
+  call system(printf('open "https://www.google.com/search?%sq=%s"',
+        \ a:lucky ? 'btnI&' : '', q))
+endfunction
+
+nnoremap <leader>? :call <SID>goog(expand("<cword>"), 0)<cr>
+nnoremap <leader>! :call <SID>goog(expand("<cword>"), 1)<cr>
+xnoremap <leader>? "gy:call <SID>goog(@g, 0)<cr>gv
+xnoremap <leader>! "gy:call <SID>goog(@g, 1)<cr>gv
+
+
+" command abbrevations
+" :eh, :vsh, :sph, :tabnewh => :{e, vs, sp, tabnew} %:h/
+"  (to open files in the same directory as the current buffer)
+function! EatWhitespace()
+  let c = nr2char(getchar(0))
+  return index([nr2char(9), nr2char(10), nr2char(13), ' '], c) >= 0 ? '' : c
+endfunction
+call CommandAlias('eh', "e %:h/<C-R>=EatWhitespace()<CR>")
+call CommandAlias('vsh', "vs %:h/<C-R>=EatWhitespace()<CR>")
+call CommandAlias('sph', "sp %:h/<C-R>=EatWhitespace()<CR>")
+call CommandAlias('tabnewh', "tabnew %:h/<C-R>=EatWhitespace()<CR>")
+
+
+" :Toggle... command aliases
+if has('lambda') && exists('##CmdlineEnter')
+  augroup RegisterToggleCommands
+    autocmd!
+    autocmd CmdlineEnter * call RegisterToggleCommands() | autocmd! RegisterToggleCommands
+  augroup END
+  function! RegisterToggleCommands() abort
+    " collect all commands ending with :...Toggle and re-register them as :Toggle...
+    redir => cout
+      silent command
+    redir END
+    let command_list = split(cout, "\n")[1:]   " strip the header line
+    let command_list = filter(
+                \ map(command_list, { l, v -> Trim((matchlist(v, '\S[A-Z]\+Toggle ') + [''])[0]) }),
+                \ '!empty(v:val)')
+    for cmd in command_list
+      let new_cmd = 'Toggle' . substitute(cmd, 'Toggle$', '', '')
+      " register both alias and command (to make tab completion work)
+      call CommandAlias(new_cmd, cmd, v:true)
+    endfor
+  endfunction
+endif
+
+" :CloseAllFloatingWindows
+" Closes all floating windows, useful for cleaning up messed up pop-ups
+if has('nvim-0.4.0')
+  command! CloseAllFloatingWindows   lua _G.CloseAllFloatingWindows()
+lua << EOF
+  _G.CloseAllFloatingWindows = function()
+    local closed_windows = {}
+    for _, win in ipairs(vim.api.nvim_list_wins()) do
+      local config = vim.api.nvim_win_get_config(win)
+      if config.relative ~= "" then  -- is_floating_window?
+        vim.api.nvim_win_close(win, false)  -- do not force
+        table.insert(closed_windows, win)
+      end
+    end
+    print(string.format('Closed %d windows: %s', #closed_windows, vim.inspect(closed_windows)))
+  end
+EOF
+endif
+
+" Open python libraries/modules easily.
+" :Pyedit (:pye) -- open the file for the python module
+" :Pysplit (:pysp), :Pyvsplit (:pyvs) -- similar, but in :split, :vsplit
+" e.g., :Pyedit numpy.core will open $(site-packages)/numpy/core/__init__.py
+if has('nvim') && has('python3')
+  " This feature requires jedi installed on the host python.
+python3 << EOF
+try:
+  import jedi
+  vim.command('let g:python_jedi_available = 1')
+except ImportError:
+  vim.command('let g:python_jedi_available = 0')
+EOF
+
+  " Get module path for the given module (e.g., numpy.core) *without* actually importing it.
+  function! PyModulePath(module) abort
+    return py3eval(printf('__import__("jedi").Script("import %s").infer()[0].module_path.__str__()', a:module))
+  endfunction
+
+  function! s:edit_python_file(cmd, module) abort
+    if !g:python_jedi_available
+      echohl WarningMsg | echom 'This feature requires jedi. Please pip install jedi.' | echohl NONE
+      return
+    end
+    try
+      exe a:cmd . " " . PyModulePath(a:module)
+    catch
+      echohl WarningMsg | echom 'Cannot find python module "' . a:module . '"' | echohl NONE
+    endtry
+  endfunction
+  command! -nargs=1 -complete=customlist,CompletePythonModules Pyedit    call s:edit_python_file("edit", <q-args>)
+  command! -nargs=1 -complete=customlist,CompletePythonModules Pysplit   call s:edit_python_file("split", <q-args>)
+  command! -nargs=1 -complete=customlist,CompletePythonModules Pyvsplit  call s:edit_python_file("vsplit", <q-args>)
+  call CommandAlias('pye', 'Pyedit')
+  call CommandAlias('pysp', 'Pysplit')
+  call CommandAlias('pyvs', 'Pyvsplit')
+
+  " Jedi-based completion for the current python interpreter.
+  function! CompletePythonModules(...)
+    if !g:python_jedi_available
+      return []
+    endif
+
+    let l:prefix = get(a:, 1, '')
+    let l:cmdline = get(a:, 2, '')
+    let l:cmdwords = len(split(l:cmdline, ' '))
+
+    let query = l:prefix
+    let completions = py3eval(
+          \ printf('[c.full_name for c in __import__("jedi").Script("import %s").complete(line=1)]', query))
+    return completions
+  endfunction
+endif
+
+
+" }}}
+"""""""""""""""""""""""""""""""""""""""""
+" 4. Appearance (e.g. Colors, Syntax) {{{
+"""""""""""""""""""""""""""""""""""""""""
+
+" color settings
+" @see http://www.calmar.ws/vim/256-xterm-24bit-rgb-color-chart.html
+set t_Co=256                 " use 256 color
+if &background != 'dark'
+  set background=dark
+endif
+
+if &term =~ '256color'
+  " Disable Background Color Erase (BCE) so that color schemes
+  " work properly when Vim is used inside tmux and GNU screen.
+  set t_ut=
+endif
+
+" 24-bit true color: neovim 0.1.5+ / vim 7.4.1799+
+" enable ONLY if TERM is set valid and it is NOT under mosh
+function! IsMosh()
+  let output = system('is_mosh -v')
+  if v:shell_error
+    return 0
+  endif
+  return !empty(l:output)
+endfunction
+
+" Use 24-bit color.
+if has('termguicolors')
+  " Note: We will use GUI colors even if the current session is running under mosh.
+  " Although the stable release does not support 24-bit color yet (see GH-961),
+  " users are expected to use a HEAD version of mosh both on server and client
+  " (e.g., brew install mosh --HEAD,  dotfiles install mosh)
+  if !&termguicolors
+    set termguicolors
+  endif
+endif
+
+" apply colorscheme (base: xoria256 + customization)
+" See ~/.vim/colors/xoria256-wook.vim
+if !exists('g:colors_name')
+  try
+    silent! colorscheme xoria256-wook
+  catch /E185/  " Cannot find color scheme
+    silent! colorscheme evening
+  endtry
+endif
+
+" airline theme: status line and tab line
+if has('termguicolors') && &termguicolors
+  let g:airline_theme = 'deus'
+else
+  let g:airline_theme = 'bubblegum'
+endif
+
+" show cursorline for active window only
+let g:NrHighlight_preserve_filetypes = ['nerdtree']
+augroup NrHighlight
+  autocmd!
+  autocmd WinEnter * setlocal cursorline
+  autocmd WinLeave * if index(g:NrHighlight_preserve_filetypes, &ft) == -1
+        \ |   setlocal nocursorline
+        \ | endif
+augroup END
+
+" vim syntax: embedded python (P) and lua (l) scripts
+" see $VIMRUNTIME/syntax/vim.vim
+let g:vimsyn_embed = 'lP'
+
+" filetype detections
+au BufRead,BufNewFile /etc/nginx/* if &ft == '' | setfiletype nginx | endif
+au BufRead,BufNewFile *.prototxt if &ft == '' | setfiletype yaml | endif
+au BufRead,BufNewFile *.ipynb if &ft == '' | setfiletype json | endif
+
+autocmd FileType git setlocal foldlevel=1
+autocmd FileType gitcommit setlocal cc=72 textwidth=72
+
+" remove trailing whitespaces on save
+fun! StripTrailingWhitespaces()
+  let l = line('.')
+  let c = col('.')
+  %s/\s\+$//e
+  call cursor(l, c)
+endfun
+
+augroup AutoStripTrailingWhitespaces
+  autocmd!
+  autocmd FileType c,cpp,java,javascript,html,ruby,python,pandoc
+        \ autocmd BufWritePre <buffer> :call StripTrailingWhitespaces()
+augroup END
+
+" highlight trailing whitespaces
+highlight ExtraWhitespace ctermbg=red guibg=red
+match ExtraWhitespace /\s\+$/
+
+augroup trailing_whitespaces
+  autocmd!
+  autocmd FileType GV,gitmessengerpopup,fugitive highlight clear ExtraWhitespace
+  autocmd BufWinEnter * if _is_file_buffer() | match ExtraWhitespace /\s\+$/ | endif
+  autocmd InsertEnter * if _is_file_buffer() | match ExtraWhitespace /\s\+\%#\@<!$/ | endif
+  autocmd InsertLeave * if _is_file_buffer() | match ExtraWhitespace /\s\+$/ | endif
+  autocmd BufWinLeave * call clearmatches()
+augroup END
+
+function! _is_file_buffer() abort
+  return &filetype != '' && &buftype == '' && &modifiable
+endfunction
+
+
+" Unset paste when leaving insert mode
+autocmd InsertLeave * silent! set nopaste
+
+" neovim 0.4.0+ : semi-transparent popup menu
+" seealso: s:auto_termguicolors
+if has('nvim') && has('termguicolors') && (&termguicolors)
+  silent! set pumblend=10
+endif
+
+" neovim 0.4.0+ : Default background for floating windows (should be dark, not Pmenu)
+if hlexists('NormalFloat')
+  highlight NormalFloat     ctermbg=233 guibg=#121212
+endif
+
+" Use different popupmenu highlight color for nvim-lsp
+if get(g:, 'dotfiles_completion_backend') == '@lsp'
+  " oc-yellow-1
+  hi Pmenu guibg=#fff3bf
+endif
+
+" http://vim.wikia.com/wiki/Identify_the_syntax_highlighting_group_used_at_the_cursor
+function! ShowSyntaxGroup()
+  if exists(':TSHighlightCapturesUnderCursor')
+    :TSHighlightCapturesUnderCursor
+  end
+  echo 'hi<' . synIDattr(synID(line('.'),col('.'),1),'name') . '> trans<'
+        \ . synIDattr(synID(line('.'),col('.'),0),'name') . '> lo<'
+        \ . synIDattr(synIDtrans(synID(line('.'),col('.'),1)),'name') . '>'
+endfunction
+
+noremap <leader>syn :call ShowSyntaxGroup()<cr>
+
+" }}}
+"""""""""""""""""""""""""""""""""""""""""
+" 5. GUI Options {{{
+"""""""""""""""""""""""""""""""""""""""""
+
+" gui settings
+if has('gui_running')
+
+  if has('unix')
+    let s:uname = substitute(system('uname -s'), '\n', '', '')
+  endif
+
+  if has('gui_win32')
+    language mes en         " use english messages (korean characters broken)
+    set langmenu=none       " use english context menus (korean characters broken)
+    set guioptions-=T       " exclude toolbar
+    set guioptions-=m       " exclude menubar
+
+    " font setting for windows
+    set guifont=Consolas:h11:cANSI
+    set guifontwide=GulimChe:h12:cDEFAULT
+
+  elseif has('gui_gtk2')
+    " font setting for Ubuntu linux (GTK)
+    set guifont=Ubuntu\ Mono\ derivative\ Powerline\ 12
+
+  elseif has('unix') && s:uname ==? 'Darwin'
+    " font setting for Mac OS X (Darwin)
+    if !has('gui_vimr')
+      set guifont=Monaco\ for\ Powerline:h12
+      set guifontwide=Apple\ SD\ Gothic\ Neo\ UltraLight:h12
+    endif
+  endif
+
+endif
+
+
+" }}}
+"""""""""""""""""""""""""""""""""""""""""
+" 6. Plugin Settings {{{
+"""""""""""""""""""""""""""""""""""""""""
+
+" ----------------------------------------------------------------
+" vim-localvimrc {{{
+
+" store and restore all decisions on whether to load lvimrc
+let g:localvimrc_persistent = 2
+
+" ---------------------------------------------------------------- }}}
+" vim-polyglot {{{
+
+" in favor of python-mode and vimtex ...
+let g:polyglot_disabled = ['python', 'python-indent', 'python-compiler', 'latex']
+
+" ---------------------------------------------------------------- }}}
+" vim-startify {{{
+
+let g:startify_bookmarks = [
+    \ '~/.vim/vimrc',
+    \ '~/.vim/plugins.vim',
+    \ ]
+
+let g:startify_skiplist = [
+    \ 'COMMIT_EDITMSG',
+    \ $VIMRUNTIME .'/doc',
+    \ 'plugged/.*/doc',
+    \ 'bundle/.*/doc',
+    \ ]
+
+" ---------------------------------------------------------------- }}}
+" vim-eunuch {{{
+
+" remove all rm-like commands, which are too dangerous (even no confirm...)
+if has_key(g:plugs, 'vim-eunuch')
+  autocmd User LazyInit call s:remove_eunuch_commands()
+  function! s:remove_eunuch_commands()
+    if !exists('g:loaded_eunuch') | return | endif
+    if exists(':Remove') | delcommand Remove | endif
+    if exists(':Delete') | delcommand Delete | endif
+    if exists(':Unlink') | delcommand Unlink | endif
+  endfunction
+endif
+
+" ---------------------------------------------------------------- }}}
+" vim-emoji {{{
+
+" replace emoji in selected lines
+" (snippet brought from @junegunn/dotfiles)
+function! s:replace_emojis() range
+  for lnum in range(a:firstline, a:lastline)
+    let line = getline(lnum)
+    let subs = substitute(line,
+          \ ':\([^:]\+\):', '\=emoji#for(submatch(1), submatch(0))', 'g')
+    if line != subs
+      call setline(lnum, subs)
+    endif
+  endfor
+  redraw!
+endfunction
+
+command! -range EmojiReplace <line1>,<line2>call s:replace_emojis()
+xnoremap <leader>emoji :Emoji<CR>
+
+
+" :Emoji --- emoji search with fzf
+" insert-completion <c-x><c-e>   (fzf-complete-emoji)
+command! -nargs=* Emoji          call fzf#run(Fzf_emoji_opts(<q-args>))
+imap <expr> <silent> <C-x><C-e>  fzf#vim#complete(Fzf_emoji_opts(''))
+function! Fzf_emoji_opts(query)
+  let opts = {}
+  let opts.source = map(sort(emoji#list()), 'printf("%-10s \t %s", emoji#for(v:val), v:val)')
+  let opts.options = ['--delimiter', '\t', '--nth', '-1', '--no-multi']
+  if !empty(a:query)
+    let opts.options += ['--query', a:query]
+  endif
+  let opts.reducer = { lines -> split(lines[0])[0] }                 " for insert-complete mode
+  let opts.sink = { line -> execute('normal! a' . split(line)[0]) }  " for normal-command mode
+  return fzf#wrap(opts)
+endfunction
+
+" ---------------------------------------------------------------- }}}
+" vim-asterisk (enhanced *) {{{
+
+" Use z (stay) behavior as default
+if has_key(g:plugs, 'vim-asterisk')
+  map *  <Plug>(asterisk-z*)
+  map #  <Plug>(asterisk-z#)
+  map g* <Plug>(asterisk-gz*)
+  map g# <Plug>(asterisk-gz#)
+endif
+
+" Keep cursor position across matches
+let g:asterisk#keeppos = 1
+
+" ---------------------------------------------------------------- }}}
+" incsearch {{{
+
+" incsearch.vim
+if has_key(g:plugs, 'incsearch.vim')
+  if !has('patch-8.0.1238')
+    map /  <Plug>(incsearch-forward)
+    map ?  <Plug>(incsearch-backward)
+  endif
+  " forward search, but does not move cursor during incsearch
+  map g/ <Plug>(incsearch-stay)
+endif
+
+" incsearch-fuzzy.vim
+map z/ <Plug>(incsearch-fuzzy-/)
+map z? <Plug>(incsearch-fuzzy-?)
+map zg/ <Plug>(incsearch-fuzzy-stay)
+
+" ---------------------------------------------------------------- }}}
+" vim-highlightedyank {{{
+if has_key(g:plugs, 'vim-highlightedyank') && !exists('##TextYankPost')
+  map y <Plug>(highlightedyank)
+endif
+
+"hi HighlightedyankRegion cterm=reverse gui=reverse
+let g:highlightedyank_highlight_duration = 1000
+
+" ---------------------------------------------------------------- }}}
+" vim-quickhl {{{
+
+nmap <leader>* <Plug>(quickhl-manual-this)
+xmap <leader>* <Plug>(quickhl-manual-this)
+nmap <leader>8 <Plug>(quickhl-manual-reset)
+xmap <leader>8 <Plug>(quickhl-manual-reset)
+
+" ---------------------------------------------------------------- }}}
+" vim-highlightedundo {{{
+
+if has_key(g:plugs, 'vim-highlightedundo')
+  nmap u     <Plug>(highlightedundo-undo)
+  nmap <C-r> <Plug>(highlightedundo-redo)
+  nmap U     <Plug>(highlightedundo-Undo)
+  nmap g-    <Plug>(highlightedundo-gminus)
+  nmap g+    <Plug>(highlightedundo-gplus)
+
+  let g:highlightedundo#highlight_duration_delete = 500
+  let g:highlightedundo#highlight_duration_add = 700
+endif
+
+" ---------------------------------------------------------------- }}}
+" which-key.nvim {{{
+
+" Make timeout delay slightly smaller (before popup appears), default is 1000ms
+set timeoutlen=500
+
+if HasPlug('which-key.nvim')
+  autocmd User LazyInit call s:setup_which_key()
+endif
+function! s:setup_which_key()
+lua << EOF
+  require("which-key").setup {
+    window = {
+      border = "single",
+      winblend = 10,
+    },
+    layout = {
+      height = { min = 4, max = 8 },
+    }
+  }
+EOF
+endfunction
+
+" appearances for which-key
+hi WhichKeyFloat  guibg=#1a2a3a
+
+
+" ---------------------------------------------------------------- }}}
+" vim-peekaboo {{{
+
+" Use floating window instead of vsplit for peeking registers.
+" https://github.com/junegunn/vim-peekaboo/issues/68
+if has('nvim-0.5.0')
+  let g:peekaboo_window = "call CreateCenteredFloatingWindow()"
+  function! CreateCenteredFloatingWindow()
+    let width = float2nr(&columns * 0.8)
+    let height = float2nr(&lines * 0.7)
+    let top = ((&lines - height) / 2) - 1
+    let left = (&columns - width) / 2
+    let opts = {
+          \ 'relative': 'editor', 'row': top, 'col': left, 'width': width, 'height': height,
+          \ 'style': 'minimal', 'border': 'rounded'}
+
+    call nvim_open_win(nvim_create_buf(v:false, v:true), v:true, opts)
+    setlocal winblend=10
+  endfunction
+endif
+
+
+" ---------------------------------------------------------------- }}}
+" editorconfig {{{
+
+let g:EditorConfig_core_mode = 'vim_core'
+"let g:EditorConfig_core_mode = 'python_external'
+"let g:EditorConfig_core_mode = 'external_command'
+
+
+" ---------------------------------------------------------------- }}}
+" nvim-notify {{{
+
+let g:nvim_notify_winblend = 20
+
+if IsPlugInstalled('nvim-notify')
+  lua function VimNotify(msg, log_level, opts) return vim.notify(msg, log_level, opts) end
+  autocmd User LazyInit  call s:setup_nvim_notify()
+endif
+function! s:setup_nvim_notify() abort
+lua << EOF
+require("notify").setup({
+  stages = "slide",
+  on_open = function(win)
+    vim.api.nvim_win_set_config(win, { focusable = false })
+    vim.api.nvim_win_set_option(win, "winblend", vim.g.nvim_notify_winblend)
+  end,
+  timeout = 5000,
+  background_colour = "#000000",
+})
+
+-- Notification APIs (lua function, command)
+-- See config/lsp.lua for telescope extensions as well
+vim.notify = require("notify")
+vim.cmd [[
+command! -nargs=0 NotificationsPrint   :lua require('notify')._print_history()
+command! -nargs=0 PrintNotifications   :NotificationsPrint
+]]
+EOF
+endfunction
+
+" ---------------------------------------------------------------- }}}
+" nvim-colorizer {{{
+
+if IsPlugInstalled('nvim-colorizer.lua')
+  lua require('colorizer').setup()
+endif
+
+" ---------------------------------------------------------------- }}}
+" lualine.nvim (Airline replacement) {{{
+
+" See ~/.config/nvim/lua/config/statusline.lua
+
+if has('nvim-0.8') && HasPlug('lualine.nvim')
+  " We will be using global statusline (laststatus=3) and winbar, configured lazily.
+  " To avoid vertical shifting and flickering which is quite noticeable,
+  " we can have a dummy winbar line until the config kicks in (see _G.winbarline)
+  lua vim.opt.winbar = " "
+endif
+
+" ---------------------------------------------------------------- }}}
+" Airline {{{
+" Note: for airline theme, see the 'appearance' section
+" (Neovim 0.5.0+) airline is deprecated in favor of lualine.nvim
+
+" use airline, with powerline-ish theme
+let g:airline_powerline_fonts=1
+
+" [section customization] (:h airline-sections)
+" See ~/.vim/plugged/vim-airline/autoload/airline/init.vim -> airline#init#sections() to see defaults {{{
+" -----------------------
+
+autocmd User AirlineAfterInit call AirlineSectionInit()
+function! AirlineSectionInit()
+  " define minwidth for some parts
+  call airline#parts#define_minwidth('branch', 120)
+
+  " section b: git info (need to call again after define_minwidth/branch)
+  let g:airline_section_b = airline#section#create(['hunks', 'branch'])
+
+  " section c:
+  let g:airline_section_c = airline#section#create([
+        \ '%<', 'file', g:airline_symbols.space, 'readonly',
+        \ ])
+
+  " LSP support (this should run after those plugin has been initialized)
+  if exists(':LspStatus')  | call airline#parts#define_function('lsp_status', 'AirlineLspStatus') | endif
+
+  " section y: +lsp status, -filetype
+  let g:airline_section_x = airline#section#create_right([
+        \ 'lsp_status',
+        \ 'bookmark', 'tagbar', 'vista', 'gutentags', 'grepper',
+        \ ])               " excludes filetype
+
+endfunction
+
+" airline + lsp-status
+function! AirlineLspStatus() abort
+  return v:lua.LspStatus()
+endfunction
+
+
+" section y (ffenc): skip if utf-8[unix]
+let g:airline#parts#ffenc#skip_expected_string = 'utf-8[unix]'
+
+" section z: current position, but more concisely
+let g:airline_section_z = 'L%3l:%v'
+
+" }}}
+
+" enable tabline feature
+let g:airline#extensions#tabline#enabled = 1
+
+" disable tagbar (in favor of LSP)
+let g:airline#extensions#tagbar#enabled = 0
+
+" Display buffers (like tabs) in the tabline
+" if there is only one tab
+let g:airline#extensions#tabline#show_buffers = 1
+
+" suppress mixed-indent warning for javadoc-like comments (/** */)
+let g:airline#extensions#whitespace#mixed_indent_algo = 1
+
+" ---------------------------------------------------------------- }}}
+" Neomake {{{
+
+" so that ':Neomake clean' invokes 'make clean'
+let g:neomake_clean_maker = { 'exe': 'make', 'args': ['clean'] }
+let g:neomake_job_status = {}
+
+command! NeomakeNotificationStart    call s:NeomakeNotificationSet(1)
+command! NeomakeNotificationStop     call s:NeomakeNotificationSet(0)
+let g:neomake_job_notification = 0       " notify when success?
+function! s:NeomakeNotificationSet(value) abort
+  let g:neomake_job_notification = a:value
+  call VimNotify((a:value ? "Enabled" : "Disabled") . " notification of successful jobs.",
+        \ "info", {'title': 'Neomake'})
+endfunction
+
+" General hook/callback on starting and finishing jobs {
+function! s:OnNeomakeJobStart()
+  " what will we do?
+  let l:context = g:neomake_hook_context
+  let g:neomake_job_status[l:context.jobinfo.make_id] = l:context.jobinfo
+endfunction
+
+function! s:OnNeomakeJobFinished()
+  let l:context = g:neomake_hook_context
+  let l:job = l:context.jobinfo
+  let l:exit_code = l:job['exit_code']
+
+  " Remove the job from the statusline after 2 seconds
+  if !exists('*timer_start')
+    unlet g:neomake_job_status[l:context.jobinfo.make_id]
+  else
+    call timer_start(2000, { -> execute(printf(
+          \"unlet g:neomake_job_status[%d]", l:context.jobinfo.make_id)) })
+  endif
+
+  let l:bufnr = l:context.jobinfo.bufnr
+  let l:job_title = printf('Neomake: %s', bufname(l:bufnr))
+
+  " If there is any failed job (non-zero exit code), notify it.
+  let l:failure_message = ''
+  if l:exit_code != 0
+    let l:failure_message = printf('%s%s ', l:failure_message, l:job['as_string']())
+  endif
+  if !empty(l:failure_message)
+    call VimNotify('Job Failed: ' . l:failure_message, 'warn', {'title': l:job_title})
+    copen | wincmd p   " copen, but not move to the quickfix window
+    if !s:is_copen()
+      let b:neomake_auto_copen = 1
+    endif
+  else
+    if g:neomake_job_notification > 0
+      call VimNotify('Job Finished, Success.', 'info',
+            \ {'title': l:job_title, 'timeout': 1000})
+    endif
+    if get(b:, 'neomake_auto_copen', 0) == 1
+      " if quickfix list is opened automatically by neomake callback,
+      " we should automatically close it upon the success of neomake job.
+      silent cclose
+      let b:neomake_auto_copen = 0
+    endif
+  endif
+endfunction
+
+function! s:is_copen() abort
+  for winnr in range(1, winnr('$'))
+    if getwinvar(winnr, '&syntax') == 'qf'
+      return 1
+    endif
+  endfor
+  return 0
+endfunction
+
+augroup neomake_hooks_common
+  au!
+  autocmd User NeomakeJobInit     call s:OnNeomakeJobStart()
+  autocmd User NeomakeJobFinished call s:OnNeomakeJobFinished()
+augroup END
+
+" }
+
+
+" ---------------------------------------------------------------- }}}
+" FZF {{{
+
+" If floating window is not available, use 33%-bottom layout
+let g:fzf_layout = { 'down' : '~33%' }
+
+" vim 8.2+: popup window (fzf.vim#821)
+if !has('nvim') && has('patch-8.2.194')
+  let g:fzf_layout = { 'window' : { 'width': 0.9, 'height': 0.6 } }
+  call extend(g:fzf_layout['window'], { 'border': 'sharp', 'highlight': 'FZFFloatBorder' })
+  hi def link FZFFloatBorder Comment
+endif
+
+" neovim 0.4+: FZF + floating window.
+if has('nvim-0.4')
+  " On floating windows, we use reverse layout, i.e. prompt is at the above.
+  let $FZF_DEFAULT_OPTS = $FZF_DEFAULT_OPTS . ' --layout=reverse  --margin=1,2'
+  let g:fzf_layout = { 'window': 'call FloatingFZF()' }
+
+  function! FloatingFZF()
+    let buf = nvim_create_buf(v:false, v:true)
+    call setbufvar(buf, '&signcolumn', 'no')
+
+    let height = float2nr(0.6 * &lines)
+    let width = float2nr(0.9 * &columns)
+    let horizontal = float2nr((&columns - width) / 2)
+    let vertical = (&lines - height) / 2
+
+    let opts = {
+          \ 'relative': 'editor',
+          \ 'row': vertical,
+          \ 'col': horizontal,
+          \ 'width': width,
+          \ 'height': height,
+          \ }
+    let winhl = 'Normal:FZFFloatNormal'
+    if has('nvim-0.5')
+      let opts['border'] = 'rounded'
+      let winhl = winhl . ',FloatBorder:FZFFloatNormal'
+    end
+    let fwinnr = nvim_open_win(buf, v:true, opts)
+    call setwinvar(fwinnr, '&winhl', winhl)
+
+    " Additional keymappings on the floating terminal buffer for fzf
+    " e.g. make <C-W>{H, J, K, L} work as if it were normal vim windows
+    tnoremap <buffer> <silent> <C-w>H       <C-\><C-n>:wincmd H<CR>:startinsert<CR>
+    tnoremap <buffer> <silent> <C-w>J       <C-\><C-n>:wincmd J<CR>:20wincmd _<CR>:startinsert<CR>
+    tnoremap <buffer> <silent> <C-w>K       <C-\><C-n>:wincmd K<CR>:20wincmd _<CR>:startinsert<CR>
+    tnoremap <buffer> <silent> <C-w>L       <C-\><C-n>:wincmd L<CR>:startinsert<CR>
+    " remap wincmd commands so that the window can work without the <C-\><C-n> prefix
+    tnoremap <buffer> <silent> <C-l>        <C-\><C-n>:wincmd l<CR>
+    tnoremap <buffer> <silent> <C-w>h       <C-\><C-n>:wincmd h<CR>
+    tnoremap <buffer> <silent> <C-w>j       <C-\><C-n>:wincmd j<CR>
+    tnoremap <buffer> <silent> <C-w>k       <C-\><C-n>:wincmd k<CR>
+    tnoremap <buffer> <silent> <C-w>l       <C-\><C-n>:wincmd l<CR>
+    tnoremap <buffer> <silent> <C-w>w       <C-\><C-n>:wincmd w<CR>
+    " Ctrl-{J, K} scrolls fzf (rather than wincmd)
+    tnoremap <buffer> <silent> <C-j>        <Down>
+    tnoremap <buffer> <silent> <C-k>        <Up>
+
+  endfunction
+
+  hi FZFFloatNormal term=None guibg=#1a2a31
+endif
+
+" Inside vim, set environment variable FZF_DEFAULT_COMMAND
+" so that it can list the files by 'git ls-files' or 'ag'.
+if executable('ag')
+  "let $FZF_DEFAULT_COMMAND = '(git ls-files ":/" || ag -l -g "") | LC_COLLATE=C sort | uniq  2> /dev/null'
+  let $FZF_DEFAULT_COMMAND = 'ag -l -g "" 2> /dev/null'
+endif
+
+" fzf.vim options
+
+" :Buffers => Jump to the existing window if possible
+let g:fzf_buffers_jump = 1
+
+" Customize built-in commands of 'vim-fzf' (overriden by commands here) {{{
+" For full list, @see https://github.com/junegunn/fzf.vim/blob/master/plugin/fzf.vim#L42
+
+" :GFiles (with preview), :GFiles? (git diff + preview)
+" Note - GFiles only works with the cwd, cannot deal with paths outside the current git repo
+" Pressing '?' when FZF is shown would toggle preview
+command! -bang -nargs=? -complete=dir GFiles
+      \ call s:fzf_gfiles_helpmsg(<q-args>) | call fzf#vim#gitfiles(expand(<q-args>),
+      \ <q-args> != '?' ? (
+      \ <bang>0 ? fzf#vim#with_preview(s:fzf_gfiles_spec, 'up:90%')
+      \         : fzf#vim#with_preview(s:fzf_gfiles_spec, 'right:50%', 'CTRL-/')
+      \) : <bang>0
+      \)
+let s:fzf_gfiles_spec = {'options': []}
+function! s:fzf_gfiles_helpmsg(args)
+  if a:args == '?' | return | endif
+  echohl Special | echon 'Press CTRL-/ for toggle preview.' | echohl NONE
+endfunction
+" }}}
+
+function! s:get_git_dir(path)
+  let curr = fnamemodify(expand(a:path), ':p')
+  if empty(curr)   " empty buffer, etc.: fall back to current dir
+    let curr = getcwd()
+  endif
+  try
+    return FugitiveExtractGitDir(curr)
+  catch /E117/  " Unknown function: maybe incompatible fugitive
+    return fugitive#extract_git_dir(curr)
+  endtry
+endfunction
+
+" Command :F (FzfSmart)
+function! FzfSmart(path) abort
+  " If args are given (e.g. :F <args>), run :Files <args>
+  let l:path = Trim(a:path)
+  if !empty(l:path)
+    let l:path = expand(l:path)
+    if !isdirectory(l:path)   " for a file, the directory that contains it
+      if filereadable(l:path)
+        let l:path = fnamemodify(l:path, ":h")
+      else  " does not exist, error
+        echohl WarningMsg | call Echom('Does not exist: ' . l:path) | echohl NONE | return 0
+      endif
+    endif
+  endif
+
+  " (1) If a FZF tree/explorer is shown with no argument,
+  " invoke :Files (with preview) rather than :GFiles
+  if empty(l:path) && index(['nerdtree'], &filetype) >= 0
+    let l:target_path = b:NERDTree.root.path._str()
+    " if the current buffer is the pinned on in the tab (vim-nerdtree-tabs),
+    " let fzf open files in another window. Otherwise, open in the current window.
+    if exists('t:NERDTreeBufName') && bufname('%') == t:NERDTreeBufName
+      wincmd w   " we need to move the focus outside nerdtree
+    endif
+    call fzf#vim#files(l:target_path, fzf#vim#with_preview())
+    return 1
+  endif
+
+  " (2) If the given path (or CWD) is in a git repo,
+  " invoke :GFiles (plus untracked files)
+  let l:git_dir = s:get_git_dir(!empty(l:path) ? l:path : '%')
+  if ! empty(l:git_dir)
+    let l:old_cwd = getcwd()
+    execute ':cd ' . l:git_dir . '/..'
+    echon ':GFiles (' | echohl Directory | echon getcwd() | echohl NONE | echon ')' | echon '    '
+    GFiles -c -o --exclude-standard
+    execute ':cd ' . l:old_cwd
+    return 2
+
+  " (3) not in git repo, invoke :Files <args> by fallback
+  else
+    execute ':Files ' . l:path
+    return 3
+  endif
+endfunction
+
+" :F is a shortcut for :GFiles or :FZF
+command! -complete=dir -nargs=* F        call FzfSmart(<q-args>)
+call CommandAlias('FC', 'F ~/.dotfiles/', v:true)
+
+" Invoke F (FZF) Using Ctrl-P
+nmap <C-P> :F<CR>
+
+" insert mode completion using fzf  (:h fzf-vim-mappings)
+"   --> ~/.vim/plugged/fzf.vim/autoload/fzf/vim/complete.vim
+" (similar to vim's insert mode completions, :h ins-completion)
+imap <C-x><C-k>   <plug>(fzf-complete-word)
+imap <C-x><C-f>   <plug>(fzf-complete-path)
+imap <C-x><C-l>   <plug>(fzf-complete-line-allfiles)
+"imap <C-x><C-e>   (fzf-complete-emoji, vim-emoji)
+
+" More advanced combinations on insert-mode line completion (CTRL-X CTRL-L)
+imap <C-x><C-l><c-l>   <plug>(fzf-complete-line-allfiles)
+imap <C-x><C-l><c-b>   <plug>(fzf-complete-line-buffers)
+imap <C-x><C-l><c-.>   <plug>(fzf-complete-line-allfiles)
+imap <C-x><C-l><c-i>   <plug>(fzf-complete-line-import)
+imap        <plug>(fzf-complete-line-buffers)    <plug>(fzf-complete-line)
+imap <expr> <plug>(fzf-complete-line-allfiles)   fzf#vim#complete(Fzf_completeline_rg('', ''))
+imap <expr> <plug>(fzf-complete-line-import)     fzf#vim#complete(Fzf_completeline_rg('import', 'py'))
+
+function! Fzf_completeline_rg(pattern, rg_filetype)
+  " TODO detect git directory for the current file and use it as search path
+  let l:pattern = empty(a:pattern) ? '""' : shellescape('\b' . a:pattern. '\b')
+  let l:filetype = empty(a:rg_filetype) ? ' ' : printf('-t %s ', shellescape(a:rg_filetype))
+
+  return fzf#wrap({
+        \ 'source': 'rg --column --line-number --no-heading --color=always ' . l:filetype . ' ' . l:pattern,
+        \ 'options': ['--delimiter', ':', '--ansi', '--nth', '3..', '--no-multi'],
+        \ 'reducer': { lines -> trim(join(split(lines[0], ':')[3:], ':')) },
+        \ })
+endfunction
+
+
+" custom commands using fzf
+" -------------------------
+
+" Utility functions brought from @junegunn/fzf.vim {{{
+" Copyright (c) Junegunn Choi, under MIT License
+function! s:get_color(attr, ...)
+  let gui = has('termguicolors') && &termguicolors
+  let fam = gui ? 'gui' : 'cterm'
+  let pat = gui ? '^#[a-f0-9]\+' : '^[0-9]\+$'
+  for group in a:000
+    let code = synIDattr(synIDtrans(hlID(group)), a:attr, fam)
+    if code =~? pat
+      return code
+    endif
+  endfor
+  return ''
+endfunction
+
+let s:ansi = {'black': 30, 'red': 31, 'green': 32, 'yellow': 33, 'blue': 34, 'magenta': 35, 'cyan': 36}
+
+function! s:csi(color, fg)
+  let prefix = a:fg ? '38;' : '48;'
+  if a:color[0] == '#'
+    return prefix.'2;'.join(map([a:color[1:2], a:color[3:4], a:color[5:6]], 'str2nr(v:val, 16)'), ';')
+  endif
+  return prefix.'5;'.a:color
+endfunction
+
+function! s:ansi(str, group, default, ...)
+  let fg = s:get_color('fg', a:group)
+  let bg = s:get_color('bg', a:group)
+  let color = (empty(fg) ? s:ansi[a:default] : s:csi(fg, 1)) .
+        \ (empty(bg) ? '' : ';'.s:csi(bg, 0))
+  return printf("\x1b[%s%sm%s\x1b[m", color, a:0 ? ';1' : '', a:str)
+endfunction
+
+for s:color_name in keys(s:ansi)
+  execute "function! s:".s:color_name."(str, ...)\n"
+        \ "  return s:ansi(a:str, get(a:, 1, ''), '".s:color_name."')\n"
+        \ "endfunction"
+endfor
+" }}}
+" Misc utility functions for fzf {{{
+function! s:rg_star_to_cword(args) abort
+  if a:args == '*'   " * is designated to word under cursor
+    return '\b' . expand("<cword>") . '\b'   " \b for word boundaries
+  else
+    return a:args
+  endif
+endfunction
+
+" }}}
+
+" fzf-ripgrep.vim
+" [@migrated] :Rg, :RgFzf are defined in ~/.vim/plugged/fzf-ripgrep.vim/plugin/fzf_ripgrep.vim
+"
+" :RgFzf, :RF, :RGF -- Ripgrep + fzf (grep then fuzzy-filter)
+command! -nargs=*     RGF     :RgFzf <args>
+call CommandAlias('RF', 'RgFzf')
+
+" :Rg, :Grep -- Ripgrep + fzf (but refreshs ripgrep result upon updating query)
+command! -nargs=*     Grep    :Rg <args>
+nnoremap <C-g>       :Grep<CR>
+
+" rg-this (current word or visual selection)
+nnoremap <leader>rg   :<c-u>RgF*<CR>
+xnoremap <leader>rg   "gy:RgF <C-R>g<CR>
+
+" :Def, :RgDef -- Easily find definition/declaration (requires ripgrep)
+" e.g. :Def class, :Def def, :Def myfunc, :Def class MyClass
+command! -bang -nargs=* Def     :RgDef <args>
+call CommandAlias('D', 'Def')
+
+" def-this (current cursor or visual selection)
+nnoremap <leader>def  :<C-U>Def*<CR>
+xnoremap <leader>def  "gy:Def <C-R>g<CR>
+
+
+" :RgPlug (perform :Rg on vim-plugins)
+command! -bang -nargs=* -complete=customlist,CompletePlugs
+      \ RgPlug call s:rgfzf_plug(<q-args>, <bang>1)
+function! s:rgfzf_plug(qargs, bang) abort
+  let l:args = split(a:qargs)
+  let l:query = join(l:args[1:])
+  if empty(l:args)   " corner case: empty query
+    echom "Argument required" | return
+  endif
+  let l:args[0] = Trim(l:args[0])
+  if l:args[0] == '*'   " search all packages.
+    let l:args[0] = ''
+  elseif index(keys(g:plugs), l:args[0]) == -1
+    echom printf("Unknown plug: %s", l:args[0]) | return
+  endif
+  call fzf#vim#ripgrep#rg_fzf(l:query, {'fullscreen': a:bang,
+        \ 'path': g:plug_home . "/" . l:args[0],
+        \ 'rg_additional_arg': '-u'} )
+endfunction
+
+function! CompletePlugs(...)
+  let l:prefix = get(a:, 1, '')
+  let l:cmdline = get(a:, 2, '')
+  let l:cmdwords = len(split(l:cmdline, ' '))
+  if l:cmdwords >= 3 || (l:cmdwords == 2 && l:cmdline =~ ' $')
+    return []  " from the second argument, no completion
+  endif
+  let filter_expr = '!empty(v:val)'
+  if !empty(l:prefix)
+    let filter_expr .= printf(' && v:val =~# "^%s"', escape(l:prefix, "'\""))
+  endif
+  return filter(sort(keys(g:plugs)), filter_expr)
+endfunction
+
+
+" :DefPackage (perform :Def on the python package directory)
+command! -bang -nargs=* -complete=customlist,CompletePythonSitePackages
+      \ DefPackage call s:rgfzf_pypackage('fzf#vim#ripgrep#rgdef_fzf', <q-args>, <bang>1)
+
+" :RgPackage (Perform :RgFzf on the python package directory)
+" TODO: too many lines (millions) on empty query; we should avoid it?
+command! -bang -nargs=* -complete=customlist,CompletePythonSitePackages
+      \ RgPackage call s:rgfzf_pypackage('fzf#vim#ripgrep#rg_fzf', <q-args>, <bang>1)
+
+" command alias (:DP, :RP)
+call CommandAlias('DP', 'DefPackage')
+call CommandAlias('RP', 'RgPackage')
+
+function! s:rgfzf_pypackage(fzfrg_func, qargs, bang) abort
+  " TODO: If sitepackage dir is missing, resolve from python import path?
+  let l:args = split(a:qargs)
+  let l:query = join(l:args[1:])
+  if empty(l:args)   " corner case: empty query
+    let l:args = ['']
+  elseif l:args[0] == '*'   " search all packages.
+    let l:args[0] = ''
+  endif
+  " package aliases (pd -> pandas, np -> numpy, etc.)
+  let l:args[0] = get(get(g:, 'python_package_alias', {}), l:args[0], l:args[0])
+
+  return call(a:fzfrg_func, [l:query, {'fullscreen': a:bang,
+        \ 'path': printf('%s/%s', PythonSitePackagesDir(), Trim(l:args[0]))
+        \ } ])
+endfunction
+
+let g:python_package_alias = {
+      \ 'np': 'numpy', 'pd': 'pandas', 'mpl': 'matplotlib', 'plt': 'matplotlib', 'sns': 'seaborn',
+      \ 'tf': 'tensorflow', 'tfa': 'tensorflow_addon', 'tfp': 'tensorflow_probability',
+      \ 'tfio': 'tensorflow_io', 'snt': 'sonnet', 'ta': 'tf_agents',
+      \ }
+
+function! PythonSitePackagesDir()
+  return systemlist('python -c "from distutils.sysconfig import get_python_lib; print(get_python_lib())"')[0]
+endfunction
+
+" Command line completion for python modules in site-packages.
+function! CompletePythonSitePackages(...)
+  let l:prefix = get(a:, 1, '')
+  let l:cmdline = get(a:, 2, '')
+  let l:cmdwords = len(split(l:cmdline, ' '))
+  if l:cmdwords >= 3 || (l:cmdwords == 2 && l:cmdline =~ ' $')
+    return []  " from the second argument, no completion
+  endif
+  if empty(get(g:, 'python_site_packages_cache', []))
+    " Listing of the site-packages directory (cached)
+    autocmd CmdlineLeave * ++once  let g:python_site_packages_cache = []
+    let g:python_site_packages_cache = systemlist(
+          \ 'python -c "from distutils.sysconfig import get_python_lib; print(get_python_lib())" ' .
+          \ ' | xargs -I{} find {}/ -maxdepth 1 -type d ' .
+          \ ' | grep -v "\(dist\|egg\)-info$" | grep -v "\.egg$" | grep -v "__pycache__" ' .
+          \ ' | sort ' .
+          \ ' | sed -e "s#\(.*\)/\(.*\)#\2#"'
+          \)
+  endif
+  let filter_expr = '!empty(v:val)'
+  if !empty(l:prefix)
+    let filter_expr .= printf(' && v:val =~# "^%s"', escape(l:prefix, "'\""))
+  endif
+  return filter(copy(g:python_site_packages_cache), filter_expr)
+endfunction
+
+
+" FZF-based finder commands
+" -------------------------
+
+" :Z -- cd to recent working directories using fasd
+command! -nargs=* Z call fzf#run
+      \(fzf#wrap({
+      \ 'source':  printf('fasd -Rdl "%s"',
+      \                   escape(empty(<q-args>) ? '' : <q-args>, '"\')),
+      \ 'options': ['-1', '-0', '--no-sort', '--no-multi',
+      \             '--prompt', 'Z> '],
+      \ 'sink':    'NERDTree'
+      \}))
+
+" :Plugs -- list all vim plugins and open the directory of the selected
+command! -nargs=* Plugs call fzf#run
+      \(fzf#wrap({
+      \ 'source':  map(sort(keys(g:plugs)), 'g:plug_home . "/" . s:yellow(v:val)'),
+      \ 'options': ['--ansi', '--delimiter', '/', '--nth', '-1', '--no-multi', '--inline-info',
+      \             '--query', <q-args>, '--prompt', 'Plugs> ',
+      \             ] + s:fzf_preview_directory_if_applicable(),
+      \ 'sink':    'NERDTree'
+      \}))
+
+" :SitePackages -- quickly jump to the site-packages directory for the current python
+command! -nargs=* SitePackages call fzf#run
+      \(fzf#wrap({
+      \ 'source':  ('python -c "from distutils.sysconfig import get_python_lib; print(get_python_lib())" ' .
+      \             ' | xargs -I{} find {}/ -maxdepth 1 -type d ' .
+      \             ' | grep -v "\(dist\|egg\)-info$" | grep -v "\.egg$" | sort ' .
+      \             ' | ' . s:sed_highlight_path_last_segment
+      \ ),
+      \ 'options': ['--ansi', '--delimiter', '/', '--nth', '-1', '--no-multi', '--inline-info',
+      \             '--query', <q-args>, '--prompt', 'SitePackages> ',
+      \             ] + s:fzf_preview_directory_if_applicable(),
+      \ 'sink':    'NERDTree'
+      \}))
+
+function! s:fzf_preview_directory_if_applicable()
+  let l:fzf_options = []
+  if &columns >= 100 && executable("tree")
+    " enable directory preview if width is sufficient; max depth 2.
+    let l:fzf_options += [
+          \ '--preview-window', 'right:25%',
+          \ '--preview', 'tree -I "node_modules|.git|*.pyc" -L 2 -x {}',
+          \ '--bind', '?:toggle-preview',
+          \ '--header', ':: Press "?" to toggle preview'
+          \ ]
+  endif
+  return l:fzf_options
+endfunction
+
+let s:sed_highlight_path_last_segment = 'sed -e "s#\(.*\)/\(.*\)#\1/$(tput setaf 3)\2$(tput sgr0)#"'
+
+
+" Leader key mappings for vim-fzf commands
+
+" List all open buffers
+nnoremap <leader>FB :Buffers<CR>
+nnoremap <leader>B  :Buffers<CR>
+" :B goes to :Buffers
+command! B Buffers
+" Tags in the current buffer (see tagbar)
+nnoremap <leader>FT :BTags<CR>
+" Git commits
+nnoremap <leader>FG :Commits<CR>
+" History (recently opened files)
+nnoremap <leader>FH :History<CR>
+nnoremap <leader>H  :History<CR>
+" :GS -> Git status (open modified file, etc.)
+command! GStatus GFiles?
+" :H goes to :History
+command! H History
+
+" Marks
+if has_key(g:plugs, 'fzf.vim')
+  nnoremap '' :Marks<CR>
+endif
+
+" ---------------------------------------------------------------- }}}
+" vim-floaterm {{{
+
+let g:floaterm_position = 'center'
+let g:floaterm_background = '#1a2a31'
+
+hi Floaterm         guibg=#1a2a31
+hi FloatermBorder   guibg=#1a2a31 guifg=white
+hi def link FloatermNF        Floaterm
+hi def link FloatermNC        Floaterm
+hi def link FloatermBorderNF  FloatermBorder
+
+command! -bang -nargs=? -complete=shellcmd  T                    :FloatermToggleOrNew<bang> <args>
+command! -bang -nargs=? -complete=shellcmd  FT                   :FloatermToggleOrNew<bang> <args>
+command! -bang -nargs=? -complete=shellcmd  FloatermToggleOrNew  call FloatermToggleOrNew(<q-args>, <bang>0)
+nnoremap <leader>tt  :FloatermToggle<CR>
+"
+function! FloatermToggleOrNew(...) abort
+  " FloatermToggleOrNew(cmdline: str, bang: int = 0)
+  "  - if bang=1, run the command in a shell use sendkeys.
+  "  - if bang=0, execute the program without shell
+  " We use a dedicated name 'FT' for the floaterm triggered by the :FT, :T command
+  let ft_bufnr = floaterm#terminal#get_bufnr('FT')
+  let bang = a:0 >= 2 ? a:2 : 0
+  let cmd = a:0 > 0 ? Trim(a:1) : ''
+  if ft_bufnr == -1
+    if empty(cmd)
+      " when there is no existing floaterm window
+      " and no argument given, just open a new floaterm shell.
+      execute ':FloatermNew --name=FT --autoclose=1'
+    elseif !bang
+      " if argument given but without bang,
+      " use it as the command line to execute (e.g. :FT git status)
+      execute ':FloatermNew --name=FT ' . cmd
+    elseif bang
+      " Given bang, (e.g. :FT! git status) run cmd in a (interactive) shell.
+      execute ':FloatermNew --name=FT --autoclose=1'
+      let ft_bufnr = floaterm#terminal#get_bufnr('FT')
+      call floaterm#terminal#send(ft_bufnr, [cmd])
+    endif
+  else
+    FloatermToggle FT
+  endif
+endfunction
+
+" Use 90% width for floaterm. If error occurs, update the plugin
+let g:floaterm_width = 0.9
+let g:floaterm_height = 0.7
+
+" Turn off auto-hiding of previous floaterm windows,
+" in favor of the autohide autocmd below (only works for 'floating' windows)
+let g:floaterm_autohide = 0
+
+augroup FloatermCustom
+  autocmd!
+  autocmd user FloatermOpen   call s:floaterm_configure_after()
+augroup END
+function! s:floaterm_configure_after()
+  " Automatically hide floaterm when leaving the buffer:
+  " When leaving out of floaterm, hide it so that it doesn't cover other windows
+  " This autocmd should be set after 'opening' floaterm is complete (i.e., autocmd FloatermOpen),
+  " because BufLeave can be triggered before that (e.g., while creating border windows).
+  augroup FloatermAutoHide
+    autocmd!
+    autocmd BufLeave <buffer> call <SID>autohide_floaterm()
+  augroup end
+  " Use <C-z> to auto-hide the current floaterm window and move back to the previous window
+  tnoremap <buffer> <silent> <C-z>    <C-\><C-n>:wincmd p<CR>
+endfunction
+function! s:floaterm_hide(bufnr)
+  "return floaterm#window#hide_floaterm(a:bufnr)   " API removed (d7196ee0)
+  execute a:bufnr . 'FloatermHide'
+endfunction
+function! s:autohide_floaterm() abort
+  " Ensure this BufLeave event handler gets executed only once
+  autocmd! FloatermAutoHide
+  if &filetype == 'floaterm' && nvim_win_get_config(0).relative != ""
+    let l:FuncHide = function('s:floaterm_hide', [bufnr('%')])   " neovim or 7.4.1836+
+    call timer_start(0, { -> l:FuncHide() })
+  endif
+endfunction
+
+" ---------------------------------------------------------------- }}}
+" quickui (floating windows) {{{
+
+
+" Use unicode-style border (┌─┐) which is more pretty
+let g:quickui_border_style = 2
+
+" Default preview window size (more lines and width)
+let g:quickui_preview_w = 100
+let g:quickui_preview_h = 25
+
+" Customize color scheme
+let g:quickui_color_scheme = 'papercol light'
+autocmd VimEnter * hi QuickPreview guibg=#262d2d
+
+
+" ---------------------------------------------------------------- }}}
+" vim-xtabline {{{
+
+let g:xtabline_settings = {}
+
+if has("patch-7.4.1658") && has_key(g:plugs, 'vim-xtabline')
+  if has('nvim-0.8')
+    " Using global statusline, so always prefer tabs mode
+    augroup TablineHybridMode
+      autocmd!
+      autocmd VimEnter * silent XTabMode tabs
+    augroup end
+  else
+    " Use tabs mode if there are 2+ tabs, or buffers mode if there is only one
+    augroup TablineHybridMode
+      autocmd!
+      autocmd TabNew,TabClosed * call s:tabline_automode()
+    augroup end
+    function! s:tabline_automode(...) abort
+      if !v:vim_did_enter | return | endif
+      if tabpagenr('$') >= 2
+        silent XTabMode tabs
+      else
+        silent XTabMode buffers
+      endif
+    endfunction
+  end
+
+  " Use 'buffers' as the default xtabline mode (when there is only one tab)
+  let g:xtabline_settings.tabline_modes = ['buffers', 'tabs', 'arglist']
+endif
+
+
+" ---------------------------------------------------------------- }}}
+" wilder.nvim - Better wildmenu {{{
+" https://github.com/gelguy/wilder.nvim#example-configs
+
+set wildchar=<Tab>
+set wildcharm=<Tab>
+
+if IsPlugInstalled('wilder.nvim')
+  augroup WilderLazyInit
+    autocmd!
+    autocmd CmdlineEnter * ++once call s:check_wilder_rplugins()
+    autocmd CmdlineEnter * ++once call s:setup_wilder() | call wilder#main#start()
+  augroup END
+endif
+function! s:setup_wilder()
+  cmap <expr> <Tab>   wilder#in_context() ? wilder#next()     : "\<Tab>"
+  cmap <expr> <S-Tab> wilder#in_context() ? wilder#previous() : "\<S-Tab>"
+
+  " only / and ? are enabled by default
+  call wilder#setup({'modes': ['/', '?', ':']})
+
+  " pipeline: enable fuzzy command matching, fuzzy file search (GH-101), search history
+  let l:pipeline = {}
+  let l:pipeline.noop = [{_ -> v:false}]
+  let l:pipeline.cmdline = wilder#cmdline_pipeline({
+        \ 'fuzzy' : 2, 'fuzzy_filter': wilder#lua_fzy_filter() })
+  let l:pipeline.history = [ wilder#check({_, x -> empty(x)}), wilder#history() ]
+
+  let l:pipeline.file_fuzzy = executable('fd') && has('nvim-0.5.0') ?
+        \ wilder#python_file_finder_pipeline({
+        \   'debounce': 50,
+        \   'file_command': {ctx, arg -> v:lua._wilder_fuzzy_fd_pipeline_command(ctx, arg, 'f')},
+        \   'dir_command':  {ctx, arg -> v:lua._wilder_fuzzy_fd_pipeline_command(ctx, arg, 'd')},
+        \   'filters': ['fuzzy_filter', 'difflib_sorter'],
+        \   'path': {-> getcwd()},
+        \ }) : l:pipeline.noop
+
+lua << EOF
+_G._wilder_fuzzy_fd_pipeline_command = function(ctx, arg, file_mode)
+  local cmd = {'fd'}
+
+  -- Do not enable if the argument starts with "./",
+  if string.sub(arg, 1, 2) == "./" then return false end
+  -- Do not enable if it's not a git repository, for the performance reason
+  local is_git_repo = (vim.fn.FugitiveExtractGitDir(vim.fn.getcwd()) ~= '')
+  if not is_git_repo then return false end
+
+  if file_mode == 'f' then   -- both file and directory (TODO: sharkdp/fd#436)
+    cmd = vim.list_extend(cmd, {'--type', 'f', '--type', 'd'})
+  else  -- directory only
+    cmd = vim.list_extend(cmd, {'--type', 'd'})
+  end
+
+  local arg_basedir, arg_filename = string.match(arg, "(.-)([^\\/]-%.?[^%.\\/]*)$")
+  -- Starting with dot: include hidden files, but restrict to the depth 1 only (exact subdir)
+  if string.sub(arg_filename, 1, 1) == "." then
+    cmd = vim.list_extend(cmd, {'--no-ignore', '--hidden', '--maxdepth', '1'})
+  end
+
+  table.insert(cmd, '.')
+  -- When the current path argument exactly matches a subdirectory, search inside it (narrow down);
+  -- otherwise search the entire current directory
+  if not (arg_basedir == "") and vim.fn.isdirectory(arg_basedir) == 1 then
+    table.insert(cmd, './' .. arg_basedir)
+  end
+
+  -- Avoid accidentally scanning the large volume ...
+  if not vim.tbl_contains(cmd, '--maxdepth') then
+    cmd = vim.list_extend(cmd, {'--maxdepth', '5'})
+  end
+
+  -- vim.o.titlestring = table.concat(cmd, ' ')   -- just for debugging :)
+  return cmd
+end
+EOF
+
+  call wilder#set_option('pipeline', [
+        \ wilder#branch(
+        \   l:pipeline.file_fuzzy,
+        \   l:pipeline.history,
+        \   l:pipeline.cmdline,
+        \   wilder#vim_search_pipeline(),
+        \ )])
+
+  " renderer: use popupmenu
+  let l:wilder_hl = {
+        \ 'accent': wilder#make_hl('WilderAccent', 'Pmenu', [
+        \     {}, {}, {'foreground': '#f03e3e', 'bold': 1, 'underline': 1}])
+        \ }
+  let l:wilder_renderer_option = {
+        \ 'apply_incsearch_fix': 1,
+        \ 'winblend': &pumblend,
+        \ 'highlighter': wilder#lua_fzy_highlighter(),
+        \ 'highlights': l:wilder_hl,
+        \ 'reverse': v:false,
+        \ 'max_height': '33%',
+        \ 'max_width': '90%',
+        \ 'left': [' ', wilder#popupmenu_devicons()],
+        \ 'right': [' ', wilder#popupmenu_scrollbar()],
+        \ }
+  call wilder#set_option('renderer', wilder#popupmenu_renderer(l:wilder_renderer_option))
+endfunction
+
+function! s:check_wilder_rplugins() abort
+  " Note that rplugin functions are defined only after its first invocation,
+  " so we first force loading it even before wilder initialization is complete.
+  doautocmd FuncUndefined _wilder_init
+  if !exists('*_wilder_init')
+    let l:msg = 'Please run :UpdateRemotePlugins and restart. (see :messages)'
+    echohl WarningMsg | echom l:msg | echohl None
+    call VimNotify(l:msg, 'error', {'timeout': 30 * 1000, 'title': 'wilder.nvim'})
+  endif
+endfunction
+
+" ---------------------------------------------------------------- }}}
+" Dash {{{
+
+" ----------------------------------------------------------------------------
+" <Leader>/ : Launch Dash on the words on cursor or in block
+" ----------------------------------------------------------------------------
+nnoremap <leader>/ :Dash <cword><cr>
+xnoremap <leader>/ "gy:Dash <c-r>g<cr>gv
+
+" ---------------------------------------------------------------- }}}
+" SuperTab {{{
+
+" Use 'omnicomplete' as the default completion type.
+" It may fallback to default keyword completion (<C-P>).
+let g:SuperTabDefaultCompletionType = '<C-X><C-O>'
+
+" sometimes we may want to insert tabs or spaces for indentation.
+" no tab completion at the start of line or after whitespace.
+let g:SuperTabNoCompleteAfter = ['^', '\s']
+
+
+" ---------------------------------------------------------------- }}}
+" NerdTree {{{
+
+" change CWD when the NERDtree is first loaded to the directory initialized in
+" (e.g. change CWD to the directory hitted by CtrlPZ)
+let g:NERDTreeChDirMode = 1
+
+" <Leader>N toggles NERDTree (across tab)
+map <Leader>N <plug>NERDTreeTabsToggle<CR>
+
+" By default nerdtree maps <C-j> and <C-k> which I want to reserve for window
+" navigation instead for the sake consistency. Therefore use different keymaps.
+let g:NERDTreeMapJumpNextSibling = '<leader><C-j>'
+let g:NERDTreeMapJumpPrevSibling = '<leader><C-k>'
+
+" Startup Options (do NOT show automatically)
+let g:nerdtree_tabs_open_on_console_startup = 0
+let g:nerdtree_tabs_open_on_gui_startup = 0
+
+" filter out some files, by extension
+let NERDTreeIgnore = [
+      \ '\.git$', '^__node_modules__$',
+      \ '\.pyc$', '^__pycache__$', '^.pytest_cache$', '.mypy_cache', '\.egg-info$',
+      \ '\.class$', '\.o$',
+      \]
+let NERDTreeRespectWildIgnore = 1   " see wildignore
+
+" ---------------------------------------------------------------- }}}
+" neotree {{{
+
+function! s:setup_neotree() abort
+lua << EOF
+  -- https://github.com/nvim-neo-tree/neo-tree.nvim#quickstart
+  -- ~/.vim/plugged/neo-tree.nvim/lua/neo-tree/defaults.lua
+  require('neo-tree').setup {
+    filesystem = {
+      hijack_netrw_behavior = "open_current",
+      window = {
+        width = 30,
+
+        mappings = {
+          ["r"] = "refresh",
+          ["R"] = "rename",
+          ["I"] = "toggle_hidden",
+          -- Do not reserve default vim keybindings (I want zt, zz, etc.)
+          ["z"] = "none",
+          ["H"] = "none",
+          -- neo-tree's search does not work well, so I don't use it
+          ["/"] = "none",
+        },
+      },
+
+      -- This is a useful feature to turn on,
+      -- but should be disabled for a workaround until #111 is fixed
+      follow_current_file = false,
+      use_libuv_file_watcher = false,
+
+      -- #320: Do not hide hidden files when the root folder is otherwise empty
+      filtered_items = {
+        force_visible_in_empty_folder = true,
+      },
+
+      -- Append trailing slashes on directories (#112)
+      components = {
+        trailing_slash = function ()
+          return {
+            text = "/",
+            highlight = "NeoTreeDirectoryIcon",
+          }
+        end,
+      },
+      renderers = {
+        directory = {
+          {"icon"},
+          {"name", use_git_status_colors = false},
+          {"trailing_slash"},
+          {"diagnostics"},
+          {"git_status"},
+        }
+      },
+    },
+
+    -- Layout (see #130)
+    default_component_configs = {
+      indent = {
+        with_markers = true,
+        indent_marker = "│",
+        last_indent_marker = "└",
+        indent_size = 2,
+        padding = 0, -- extra padding on the left hand side
+      },
+      icon = {
+        default = "",
+      },
+      git_status = {
+        symbols = {
+          untracked = "?",
+          unstaged = "*",
+          staged = "✚",
+        }
+      },
+    },
+  }
+EOF
+
+endfunction
+
+if has_key(g:plugs, 'neo-tree.nvim')
+  " Use 2.x compatibility mode
+  let g:neo_tree_remove_legacy_commands = 1
+
+  if luaeval('vim.tbl_contains(vim.tbl_map(vim.fn.isdirectory, vim.fn.argv()), 1)')
+    " If any of the startup argument is a directory,
+    " we don't lazy-load neotree so it can hijack netrw.
+    call s:setup_neotree()
+  else
+    autocmd User LazyInit      call s:setup_neotree()
+  endif
+  nmap <leader>E  :Neotree toggle<CR>
+
+  " Highlights
+  hi link NeoTreeDirectoryName Directory
+  hi NeoTreeGitUntracked guifg=#E3DB88
+  hi NeoTreeGitIgnored guifg=#acacac
+
+endif
+
+" ---------------------------------------------------------------- }}}
+" nvim-tree.lua {{{
+" DEPRECATED: Use neo-tree.nvim instead.
+
+function! s:setup_nvimtree() abort
+  " Ignore some files
+  let g:nvim_tree_ignore = ['.git', '__node_modules__',
+        \ '__pycache__', '.pytest_cache', '.mypy_cache', '.cache',
+        \ ]
+  let g:nvim_tree_gitignore = 1
+  " Use trailing '/' for folders
+  let g:nvim_tree_add_trailing = 1
+  " Show indent markers (vertical segments)
+  let g:nvim_tree_indent_markers = 1
+  " Don't ask which window should be picked to open files.
+  let g:nvim_tree_disable_window_picker = 1
+
+lua << EOF
+  -- Config: https://github.com/kyazdani42/nvim-tree.lua#setup
+  local tree_cb = require('nvim-tree.config').nvim_tree_callback
+  require('nvim-tree').setup {
+    -- Update the location cursor whenever entering a buffer
+    update_focused_file = {
+      enable = true,
+    },
+    -- Custom Keymappings
+    view = {
+      mappings = {
+        list = {
+          { key = "?",                            cb = tree_cb("toggle_help") },
+          { key = "r",                            cb = tree_cb("refresh") },
+        }
+      }
+    }
+  }
+EOF
+endfunction
+
+if has_key(g:plugs, 'nvim-tree.lua')
+  autocmd User LazyInit      call s:setup_nvimtree()
+  nmap <leader>E  :NvimTreeToggle<CR>
+
+  " On focus, refresh automatically
+  augroup NvimTreeCustomization
+    autocmd!
+    autocmd BufEnter NvimTree*   :NvimTreeRefresh
+  augroup end
+endif
+
+" ---------------------------------------------------------------- }}}
+" Voom {{{
+
+let g:voom_ft_modes = {'pandoc': 'markdown', 'tex': 'latex'}
+
+"nnoremap <leader>V :VoomToggle<CR>
+
+" ---------------------------------------------------------------- }}}
+" Easymotion {{{
+
+" Trigger <,f> to launch easymotion global jump
+nmap <leader>f <Plug>(easymotion-s)
+
+" backward, forward search may mapped to easymotion.
+"map  / <Plug>(easymotion-sn)
+"omap / <Plug>(easymotion-tn)
+
+" Jump to first match, by Enter or Space
+let g:EasyMotion_enter_jump_first = 1
+let g:EasyMotion_space_jump_first = 1
+
+" ---------------------------------------------------------------- }}}
+" quick-scope {{{
+
+" Trigger a highlight in the appropriate direction when pressing these keys:
+let g:qs_highlight_on_keys = ['f', 'F', 't', 'T']
+
+highlight QuickScopePrimary   guifg=#afff5f gui=underline ctermfg=155 cterm=underline
+highlight QuickScopeSecondary guifg=#5fffff gui=underline ctermfg=81  cterm=underline
+
+
+" ---------------------------------------------------------------- }}}
+" vim-easy-align {{{
+
+" Start interactive EasyAlign in visual mode (e.g. vipga)
+xmap ga <Plug>(EasyAlign)
+" Start interactive EasyAlign for a motion/text object (e.g. gaip)
+nmap ga <Plug>(EasyAlign)
+
+" ---------------------------------------------------------------- }}}
+" indent-blankline.nvim {{{
+" :help indent-blankline
+
+if has_key(g:plugs, 'indent-blankline.nvim')
+  let g:indent_blankline_char = '┊'
+  let g:indent_blankline_filetype_exclude = ['help', 'NvimTree', 'pandoc']
+  let g:indent_blankline_buftype_exclude = ['terminal']
+  let g:indent_blankline_show_first_indent_level = v:false
+
+  highlight IndentBlanklineChar guifg=#444444 gui=nocombine
+endif
+
+" ---------------------------------------------------------------- }}}
+" indentLine {{{
+"
+if has_key(g:plugs, 'indentLine')
+
+  " conceal might break latex/json/markdown syntax, etc.
+  " see also after/ftplugin/*.vim settings for conceal level configuration.
+  let g:indentLine_conceallevel = 1
+
+  " conceal values might not work well for tex files (hides some characters)
+  let g:indentLine_fileTypeExclude = ['tex', 'markdown', 'pandoc', 'NvimTree', 'floaterm', 'tagbar']
+
+  " command alias
+  command! -nargs=0 ToggleIndentLines   :IndentLinesToggle
+
+endif
+
+" ---------------------------------------------------------------- }}}
+" nvim-scrollview {{{
+
+" Make the scrollbar aware of foldings (see #11).
+let g:scrollview_mode = 'virtual'
+
+" Disable scrollbar on some filetypes                                                                          │
+" (to avoid which can cause floating-window related errors)                                                    │
+let g:scrollview_excluded_filetypes = ['vim-plug', 'GV', 'git']
+
+" ---------------------------------------------------------------- }}}
+" pretty-fold {{{
+
+if HasPlug('pretty-fold.nvim')
+  autocmd User LazyInit  call s:setup_prettyfold()
+endif
+function! s:setup_prettyfold() abort
+lua << EOF
+  -- Configuration
+  -- https://github.com/anuvyklack/pretty-fold.nvim#foldtext-configuration
+  local number_of_folded_lines = function()
+    return string.format('%3d lines', vim.v.foldend - vim.v.foldstart + 1)
+  end
+  local rep_fill_char = function(times)
+    return function(config) return config.fill_char:rep(times) end
+  end
+  require("pretty-fold").setup {
+    fill_char = '╶',
+    sections = {
+      left = {
+        'content',
+      },
+      right = {
+         ' ', 'number_of_folded_lines', ' ', rep_fill_char(3),
+      }
+    },
+    process_comment_signs = false,
+  }
+
+  -- Preview closed folds
+  -- https://github.com/anuvyklack/pretty-fold.nvim#preview
+  -- Note: help 'foldopen' to specify when fold will be opened upon actions
+  require('pretty-fold.preview').setup {
+    border = 'none',
+
+    -- Disable default keybindings (h/l) which are confusing. Use `zp` instead
+    key = false,
+    default_keybindings = false,
+  }
+
+  _G.PreviewFold = function()
+    require('pretty-fold.preview').show_preview()
+  end
+EOF
+  command! -nargs=0 PreviewFold :lua _G.PreviewFold()
+  nnoremap zp <cmd>PreviewFold<CR>
+endfunction
+
+" ---------------------------------------------------------------- }}}
+" UltiSnips {{{
+let g:UltiSnipsExpandTrigger = '<c-j>'
+let g:UltiSnipsJumpForwardTrigger = '<c-j>'
+let g:UltiSnipsJumpBackwardTrigger = '<c-k>'
+
+" edit snippets: split the window vertically or horizontally
+let g:UltiSnipsEditSplit = 'context'
+let g:UltiSnipsSnippetDirectories = [$HOME . '/.vim/UltiSnips']
+
+command! -nargs=0 UltiSnipsRefreshSnippets call UltiSnips#RefreshSnippets()
+            \ | call VimNotify("Reloaded Snippets.", 'info', {'title': 'Ultisnips'})
+command! -nargs=0 RefreshUltiSnips         UltiSnipsRefreshSnippets
+
+augroup UltiSnipsAutoReload
+  autocmd!
+  autocmd BufWritePost *.snippets :UltiSnipsRefreshSnippets
+augroup END
+
+call CommandAlias('SnippetEdit', 'UltiSnipsEdit', v:true)
+call CommandAlias('EditSnippets', 'UltiSnipsEdit', v:true)
+
+" ---------------------------------------------------------------- }}}
+" vim-pandoc {{{
+
+if has_key(g:plugs, 'vim-pandoc')
+
+  " disable automatic folding
+  let g:pandoc#modules#disabled = ['folding']
+
+  " disable conceals
+  let g:pandoc#syntax#conceal#use = 0
+
+  " disable spell check
+  let g:pandoc#spell#enabled = 0
+
+  " Do not map <leader>{nr, rg, rb} by default
+  let g:pandoc#keyboard#use_default_mappings = 0
+
+endif
+
+" ---------------------------------------------------------------- }}}
+" vim-verdict {{{
+
+" cooperative mode required to make it work with LSP engines, YCM, etc.
+let g:Verdin#cooperativemode = 1
+
+" ---------------------------------------------------------------- }}}
+" echodoc.vim {{{
+let g:echodoc#enable_at_startup = 1
+
+" ---------------------------------------------------------------- }}}
+" semshi {{{
+
+" Disable diagonostics sign in favor of ALE, LSP, etc.
+let g:semshi#error_sign = 0
+
+" ---------------------------------------------------------------- }}}
+" ALE {{{
+" Note: This ALE configuration is legacy, and is not used any more
+" in favor of builtin LSP and null-ls.nvim)
+
+" Specify linters.
+" You may find the configuration file for each linter engine useful.
+"  (e.g. ~/.pylintrc for pylint)
+
+" python: pycodestyle was dropped.
+let g:ale_linters = {
+      \ 'python': ['pylint', 'mypy' ],
+      \}
+
+let g:ale_type_map = {
+      \ 'pycodestyle' : {'ES' : 'WS', 'E': 'W'}
+      \}
+
+" linter-specific settings
+let g:ale_python_mypy_options = '--ignore-missing-imports'
+
+" Also show which linter is showing the message
+let g:ale_echo_msg_format = '[%linter%] %code: %%s'
+
+" better error/warning sign
+let g:ale_sign_error = '✘'
+let g:ale_sign_warning = '⚠'
+hi ALEErrorSign    gui=bold guifg=#e6645f ctermfg=167
+hi ALEWarningSign  gui=bold guifg=#b1b14d ctermfg=143
+
+" no highlight (underline) on detected errors/warnings
+let g:ale_set_highlights = 0
+
+" :h airline-ale
+let g:airline#extensions#ale#enabled = 1
+let g:airline#extensions#ale#show_line_numbers = 0
+
+" Suppress a warning for the conflict with Neomake.
+" Neomake is used for job execution, not as a lint engine,
+" so it would be fine.
+let g:ale_emit_conflict_warnings = 0
+
+" ---------------------------------------------------------------- }}}
+" python (pymode, jedi) {{{
+
+" heavenshell/vim-pydocstring
+" Change default keymapping to <C-_> (default is <C-l>)
+nmap <silent> <C-_> <Plug>(pydocstring)
+
+" Disable unnecessary pymode features to speed up loading.
+let g:pymode_debug = 0
+let g:pymode_folding = 0
+
+" disable rope (terribly slow), in favor of jedi-vim or other LSP engine
+let g:pymode_rope = 0
+
+" prefer jedi's <leader>r (rename), instead of run
+" however, jedi resets all the highlight :( - why?
+let g:pymode_run = 0
+
+" Use ipython pdb for inserting breakpoints
+" one might need to run 'pip install ipdb'
+let g:pymode_breakpoint_cmd = 'import ipdb; ipdb.set_trace()'
+
+" show documentation: disable default keymap (K) if better plugins are present
+let g:pymode_doc_bind = '<leader>PK'
+
+" Hanging indent of 4 spaces, in which case there should be nothing after
+" the open parenthesis or bracket on the first line.
+" https://google.github.io/styleguide/pyguide.html#34-indentation
+let g:pymode_indent_hanging_width = 4
+
+" pymode lint (code checking):
+" disable in favor of ALE (but only if pylint exists) or built-in LSP
+if HasPlug('ale')
+  let s:py_linters_exists = executable('pylint')
+  if s:py_linters_exists
+    let g:pymode_lint = 0
+  else
+    autocmd VimEnter *.py echomsg
+          \ '[Warning] Please install `pylint` using pip.' .
+          \ ' As a fallback, pymode linter (slow and outdated) will be used for linting.'
+  endif
+endif
+
+if HasPlug('nvim-lspconfig')  " g:dotfiles_completion_backend == @lsp
+  let g:pymode_lint = 0
+endif
+
+" Check code on every save (not on the fly)
+let g:pymode_lint_on_write = 1
+let g:pymode_lint_unmodified = 1
+
+" Do NOT open quickfix window when any pymode_lint errors have been found
+let g:pymode_lint_cwindow = 0
+
+" Skip some errors and warnings
+" see also ~/.config/pycodestyle (for ALE)
+"  E401 : multiple imports on one line
+"  E501 : line too long
+let g:pymode_lint_ignore = ['E401', 'E501']
+
+
+" Deprecated: LEGACY jedi-vim support (without LSP)
+
+" Make jedi's completeopt not to include 'longest',
+" to prevent underscore prefix auto-completion (e.g. self.__)
+" @see jedi-vim issues #429
+let g:jedi#auto_vim_configuration = 0
+
+" Do not automatically add the 'import' statement for 'from ...'
+let g:jedi#smart_auto_mappings = 0
+
+" Turn off call signatures temporarily, due to an annoying bug
+" @see https://github.com/davidhalter/jedi-vim/issues/257
+let g:jedi#show_call_signatures = 0
+
+" jedi-vim opens buffer in the current tab (rather than a new tab)
+" when goto (e.g. goto definition) is performed
+let g:jedi#use_tabs_not_buffers = 0
+
+" window splits to open with; for now, it is disabled
+"let g:jedi#use_splits_not_buffers = 'bottom'
+"
+
+" ---------------------------------------------------------------- }}}
+" LaTeX {{{
+
+let g:vimtex_syntax_enabled = 1
+
+" Always prefer latex instead of plain, etc.
+let g:tex_flavor = 'latex'
+
+let g:LatexBox_Folding = 1
+
+" suppress version warning
+let g:vimtex_disable_version_warning = 1
+
+let g:vimtex_mappings_enabled = 1
+
+" Disable callback feature if vim lacks feature +clientserver
+if ! (has('clientserver') || has('nvim'))
+  let g:vimtex_latexmk_callback = 0
+
+  " see https://github.com/lervag/vimtex/issues/507
+  let g:vimtex_compiler_latexmk = {'callback' : 0}
+endif
+
+" in macOS, use Skim as the default LaTeX PDF viewer (for vimtex)
+" for :Vimtexview, move Skim's position to where the cursor currently points to.
+if has('mac')
+  let s:texshop_present = isdirectory('/Applications/TeX/TeXShop.app') || isdirectory('/Applications/TeXShop.app')
+  if executable('texshop-preview') && s:texshop_present
+    " ~/.dotfiles/bin/texshop-preview
+    let g:vimtex_view_general_viewer = 'texshop-preview'
+  else
+    " skim
+    let g:vimtex_view_general_viewer = '/Applications/Skim.app/Contents/SharedSupport/displayline'
+    let g:vimtex_view_general_options = '-r -g @line @pdf @tex'
+  endif
+endif
+
+augroup VimtexMappings
+  autocmd!
+  autocmd FileType tex nnoremap <buffer> <leader>V :VimtexTocOpen<CR>
+augroup END
+
+" ---------------------------------------------------------------- }}}
+" fugitive {{{
+
+let g:fugitive_legacy_commands = 0
+
+" Custom Fugitive Commands
+" GitThreeWayDiff: open a 3-way diff window among {HEAD, index, working copy}
+command! GitThreeWayDiff        call GitThreeWayDiff()
+function! GitThreeWayDiff() abort
+  diffoff!   " turn off diff for all windows
+  let current_win = win_getid()
+  aboveleft Gvdiff HEAD         " [left]   HEAD
+  call win_gotoid(current_win)
+  aboveleft Gvdiff              " [middle] stage/index
+  call win_gotoid(current_win)  " [right]  working copy
+endfunction
+
+" command aliases
+command! -nargs=* GCommit :Git commit -v<args>
+
+" Remove or replace some fugitive commands
+augroup FugitiveCustomizeCommands
+  autocmd CmdlineEnter * ++once silent! delcommand GDelete
+
+ " :G -> :GDiff + :Git
+  autocmd CmdlineEnter * ++once command! -nargs=0 G
+        \ execute 'GDiff' | execute 'Git'
+
+augroup END
+
+" fugitive key mappings
+nnoremap <leader>gd :Gvdiff<CR>
+nnoremap <leader>gD :GitThreeWayDiff<CR>
+nnoremap <leader>gs :Git<CR>
+nnoremap <leader>gw :Gwrite<CR>
+nnoremap <silent> <leader>gb :echo ':Git blame -w'<CR>:Git blame -w<CR>:call FugitiveResizeGblame()<CR>
+function! FugitiveResizeGblame() abort
+  if &ft == 'fugitiveblame' | vertical resize 10 | endif
+endfunction
+nnoremap <leader>gci :Git commit --verbose<CR>
+nnoremap <leader>gcA :Git commit --amend --verbose<CR>
+
+" on commit, type 'cA' to enter in amend mode
+au FileType gitcommit nnoremap <buffer> <silent>
+            \ cA :bd<CR>:<C-U>Git commit --verbose --amend<CR>
+
+" Git: more configuration and keymaps for fugitive index buffers
+augroup FugitiveAddon
+  autocmd!
+  " Fix window height to be 16
+  autocmd FileType fugitive    if !&winfixheight | resize 16 | setlocal winfixheight | endif
+
+  " [?] show help  / [ci] commit -v
+  autocmd FileType fugitive    nnoremap <buffer> <silent> ?  :<C-u>vertical help fugitive-maps<CR>:wincmd p<CR>
+  autocmd FileType fugitive    nmap     <buffer> <silent> g? ?
+  autocmd FileType fugitive    nmap     <buffer> ci          cvc
+  " [g=] Toggle inline diffs for all files
+  " [space] same as = (toggle inline diffs for the current file)
+  autocmd FileType fugitive    nmap     <buffer> g=          ggVG=zM
+  autocmd FileType fugitive    nmap     <buffer> <space>     =
+  autocmd FileType fugitive    nmap     <buffer> <tab>       =
+  " [,gd] diffvsplit
+  autocmd FileType fugitive    nmap     <buffer> <leader>gd  dv
+
+  " when git index is updated via hunk stage operation, reload fugitive buffers
+  if exists('*timer_start')  " 7.4.1578+
+    autocmd User GitGutterStage  call timer_start(0, function('ReloadFugitiveBlobs'))
+  endif
+augroup END
+
+function! ReloadFugitiveBlobs(...) abort
+  WinDo if bufname('%') =~ '^fugitive://' | :e | endif
+endfunction
+
+" highlights for fugitive
+hi fugitiveUntrackedHeading  gui=bold  guifg=#000087    guibg=Gold1
+hi fugitiveUntrackedSection  gui=bold  guifg=#bbbb00    guibg=NONE
+hi fugitiveUnstagedHeading   gui=bold  guifg=black      guibg=#d7875f
+hi fugitiveUnstagedSection   gui=bold  guifg=#af0000    guibg=NONE
+hi fugitiveStagedHeading     gui=bold  guifg=black      guibg=SeaGreen2
+hi fugitiveStagedSection     gui=bold  guifg=#009900    guibg=NONE
+hi fugitiveHeading           gui=bold                   guibg=NONE
+
+" fugitive://... buffers (index) should have better statusline;
+" display nothing but buffer/file names (would contain SHA, or ref, etc.)
+if has_key(g:plugs, 'vim-airline')
+  function! FugitiveAirlinePatch(...)
+    if bufname('%') =~ '^fugitive://'
+      let w:airline_section_b = airline#section#create(['branch'])
+      let w:airline_section_c = '%f'
+      let w:airline_section_z = ''     " no line numbers, etc.
+    endif
+  endfunction
+  try
+    call airline#remove_statusline_func('FugitiveAirlinePatch')
+    call airline#add_statusline_func('FugitiveAirlinePatch')
+  catch /E117/  " airline doesn't exist yet
+  endtry
+endif
+
+" ---------------------------------------------------------------- }}}
+" gitsigns.nvim {{{
+" :Gitsigns
+
+function! s:setup_gitsigns() abort
+lua << EOF
+require('gitsigns').setup {
+  signs = {
+    -- For highlights, see ~/.vim/colors/xoria256-wook.vim
+    add          = {hl = 'GitSignsAdd'   , text = '┃', numhl='GitSignsAddNr'   , linehl='GitSignsAddLn'},
+    change       = {hl = 'GitSignsChange', text = '┃', numhl='GitSignsChangeNr', linehl='GitSignsChangeLn'},
+    delete       = {hl = 'GitSignsDelete', text = '_', numhl='GitSignsDeleteNr', linehl='GitSignsDeleteLn'},
+    topdelete    = {hl = 'GitSignsDelete', text = '‾', numhl='GitSignsDeleteNr', linehl='GitSignsDeleteLn'},
+    changedelete = {hl = 'GitSignsChange', text = '┃', numhl='GitSignsChangeNr', linehl='GitSignsChangeLn'},
+  },
+  signcolumn = true,
+  current_line_blame_opts = {
+    delay = 150,
+    virt_text_pos = 'right_align',
+    ignore_whitespace = true,
+  },
+  on_attach = function(bufnr)
+    local function map(mode, lhs, rhs, opts)
+      opts = vim.tbl_extend('force', {noremap = true, silent = true}, opts or {})
+      vim.api.nvim_buf_set_keymap(bufnr, mode, lhs, rhs, opts)
+    end
+    -- Navigation
+    map('n', ']c', "&diff ? ']c' : '<cmd>Gitsigns next_hunk<CR>'", {expr=true})
+    map('n', '[c', "&diff ? '[c' : '<cmd>Gitsigns prev_hunk<CR>'", {expr=true})
+    -- Actions
+    map('n', '<leader>hs', '<cmd>Gitsigns stage_hunk<CR>')
+    map('n', '<leader>hr', '<cmd>Gitsigns reset_hunk<CR>')
+    map('v', '<leader>hs', '<cmd>Gitsigns stage_hunk<CR>')
+    map('v', '<leader>hr', '<cmd>Gitsigns reset_hunk<CR>')
+    map('n', '<leader>hS', '<cmd>Gitsigns stage_buffer<CR>')
+    map('n', '<leader>hu', '<cmd>Gitsigns undo_stage_hunk<CR>')
+    map('n', '<leader>hR', '<cmd>Gitsigns reset_buffer<CR>')
+    map('n', '<leader>hp', '<cmd>Gitsigns preview_hunk<CR>')
+    map('n', '<leader>hb', '<cmd>lua require"gitsigns".blame_line {full=true, ignore_whitespace=true}<CR>')
+    map('n', '<leader>tb', '<cmd>Gitsigns toggle_current_line_blame<CR>')
+    map('n', '<leader>hd', '<cmd>Gitsigns diffthis<CR>')                    -- Diff against stage
+    map('n', '<leader>hD', '<cmd>lua require"gitsigns".diffthis("~")<CR>')  -- Diff against HEAD
+    map('n', '<leader>td', '<cmd>Gitsigns toggle_deleted<CR>')
+    -- Text object
+    map('o', 'ih', ':<C-U>Gitsigns select_hunk<CR>')
+    map('x', 'ih', ':<C-U>Gitsigns select_hunk<CR>')
+
+    -- Additional keymappings (actions) other than the suggested defaults
+    map('n', '<leader>ha', '<cmd>Gitsigns stage_hunk<CR>')
+    map('v', '<leader>ha', '<cmd>Gitsigns stage_hunk<CR>')
+    map('n', '<leader>hh', '<cmd>Gitsigns toggle_linehl<CR>')
+    map('n', '<leader>hw', '<cmd>Gitsigns toggle_word_diff<CR>')
+  end
+}
+EOF
+endfunction
+
+if HasPlug('gitsigns.nvim')
+  autocmd User LazyInit  call s:setup_gitsigns()
+endif
+
+" ---------------------------------------------------------------- }}}
+" vim-gitgutter (legacy) {{{
+
+" For colors for gitgutter signs, see ~/.vim/colors/xoria256-wook.vim
+
+" Another alias for adding or staging hunk (similar as <leader>ga).
+" for other keys (e.g <leader>hu, <leader>hp), please see
+"  :help gitgutter-<Leader>
+
+if HasPlug('vim-gitgutter')
+  nmap <leader>ha  <Plug>(GitGutterStageHunk)
+  nmap <leader>hh  :GitGutterLineHighlightsToggle<CR>
+endif
+
+" ---------------------------------------------------------------- }}}
+" git-messenger {{{
+
+" map <C-O>/<C-I> to jumping to older and Older(recent) commits,
+" respectively (see git-messenger#3)
+augroup git_messenger_autocmd
+  autocmd!
+  autocmd FileType gitmessengerpopup nmap <buffer> <C-O> o
+  autocmd FileType gitmessengerpopup nmap <buffer> <C-I> O
+augroup END
+
+" Display content diff as well in the popup window
+let g:git_messenger_include_diff = 'current'
+
+" Use git blame -w (ignore-whitespaces).
+let g:git_messenger_extra_blame_args = '-w'
+
+" Use border for the popup window.
+if has('nvim-0.5.0')
+lua << EOF
+  vim.g.git_messenger_floating_win_opts = {
+    border = 'single',
+  }
+EOF
+endif
+
+" ---------------------------------------------------------------- }}}
+" vim-flog {{{
+" https://github.com/rbong/vim-flog/blob/master/EXAMPLES.md
+
+" Default arguments. See help :Flog and flog#get_internal_default_args()
+let s:flog_format_string = '%C(yellow)[%h]%Creset  %Cblue%ad%Creset %Cred%d%Creset %s  %Cgreen{%an}%Creset'
+let g:flog_permanent_default_arguments = {
+      \ 'date': 'short',
+      \ 'format': s:flog_format_string,
+      \ }
+
+hi flogHash  guifg=#ffd43b
+
+" ---------------------------------------------------------------- }}}
+" diffview.nvim {{{
+" Assumed fugitive is always available.
+
+if IsPlugInstalled('diffview.nvim')
+lua << EOF
+  require('diffview').setup {
+    default_args = {
+      DiffviewOpen = { '--untracked-files=no' },
+    }
+  }
+EOF
+  " :GHistory <files>
+  command! -nargs=* -complete=file GHistory   DiffviewFileHistory <args>
+  " :GDiff <revision>     to HEAD
+  command! -nargs=* -complete=customlist,DiffviewCmdCompletion  GDiff  DiffviewOpen <args>
+  " :GShow <revision>
+  command! -nargs=+ -complete=customlist,DiffviewCmdCompletion  GShow  DiffviewOpen <args>^1..<args>
+
+  " cmd completion functions for aliased commands.
+  function! DiffviewCmdCompletion(argLead, cmdLine, curPos)
+    return luaeval("require'diffview'.completion("
+          \ . "vim.fn.eval('a:argLead'),"
+          \ . "vim.fn.eval('a:cmdLine'),"
+          \ . "vim.fn.eval('a:curPos'))")
+  endfunction
+lua << EOF
+  local completers = require('diffview').completers
+  completers.GDiff = completers.DiffviewOpen
+  completers.GShow = completers.DiffviewOpen
+EOF
+endif
+
+" ---------------------------------------------------------------- }}}
+" gundo key mappings and options {{{
+let g:gundo_right = 1   " show at right
+nnoremap <leader>G :GundoToggle<CR>
+
+" ---------------------------------------------------------------- }}}
+" tagbar {{{
+
+nnoremap <leader>T :TagbarToggle<CR>
+
+" Do not display visibility symbols (+, -, ...) which are not pretty.
+let g:tagbar_show_visibility = 0
+
+
+" ---------------------------------------------------------------- }}}
+
+" }}}
+"""""""""""""""""""""""""""""""""""""""""
+" Extra Settings {{{
+"""""""""""""""""""""""""""""""""""""""""
+
+" Use local vimrc if available
+if filereadable(expand('~/.vimrc.local'))
+  source \~/.vimrc.local
+endif
+
+" }}}
+
+" vim: set ts=2 sts=2 sw=2 foldmethod=marker:

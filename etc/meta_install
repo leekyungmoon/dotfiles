@@ -1,3 +1,0 @@
-apt install wget vim curl zsh git tmux
-apt install python3-pip
-curl -fsSL https://raw.githubusercontent.com/leekyungmoon/dotfiles/master/etc/install | bash
