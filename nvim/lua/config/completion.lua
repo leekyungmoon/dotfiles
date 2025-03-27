@@ -75,19 +75,21 @@ M.setup_cmp = function()
       ['<C-n>'] = cmp.mapping.select_next_item({ behavior = SelectBehavior.Insert }),
       ['<C-p>'] = cmp.mapping.select_prev_item({ behavior = SelectBehavior.Insert }),
       ['<CR>'] = cmp.mapping.confirm({ select = false }),
-      ['<Tab>'] = { -- see GH-880, GH-897
-        i = function(fallback) -- see GH-231, GH-286
-          if cmp.visible() then cmp.select_next_item()
-          elseif has_words_before() then cmp.complete()
-          else fallback() end
-        end,
-      },
-      ['<S-Tab>'] = {
-        i = function(fallback)
-          if cmp.visible() then cmp.select_prev_item()
-          else fallback() end
-        end,
-      },
+      ['<Tab>']   = cmp.config.disable,
+      ['<S-Tab>'] = cmp.config.disable,
+      -- ['<Tab>'] = { -- see GH-880, GH-897
+      --   i = function(fallback) -- see GH-231, GH-286
+      --     if cmp.visible() then cmp.select_next_item()
+      --     elseif has_words_before() then cmp.complete()
+      --     else fallback() end
+      --   end,
+      -- },
+      -- ['<S-Tab>'] = {
+      --   i = function(fallback)
+      --     if cmp.visible() then cmp.select_prev_item()
+      --     else fallback() end
+      --   end,
+      -- },
     },
     ---@see cmp.FormattingConfig
     formatting = {

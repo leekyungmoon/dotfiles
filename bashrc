@@ -113,3 +113,4 @@ if [ -f /usr/local/etc/bash_completion ]; then source /usr/local/etc/bash_comple
 if [ -f "$HOME/.bashrc.local" ]; then
   source "$HOME/.bashrc.local"
 fi
+. "$HOME/.cargo/env"

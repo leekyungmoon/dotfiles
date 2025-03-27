@@ -291,3 +291,4 @@ path=(
   /bin
   /sbin
 )
+. "$HOME/.cargo/env"

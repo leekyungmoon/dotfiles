@@ -16,6 +16,8 @@ local PLUGIN_SPEC = {
   { import = "plugins.ide" },
   { import = "plugins.treesitter" },
   { import = "plugins.utilities" },
+  -- Copilot 플러그인 추가
+  { 'github/copilot.vim' },
 }
 if pcall(require, "plugins.local") then
   -- see ~/.config/nvim/lua/plugins/local.lua

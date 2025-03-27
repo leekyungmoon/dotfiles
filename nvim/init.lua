@@ -130,3 +130,16 @@ end
 if vim.env.NVIM_LUA_PROFILING then
   vim.api.nvim_create_autocmd('VimEnter', { pattern = '*', callback = _G._stop_profiling })
 end
+
+vim.opt.clipboard = "unnamedplus"
+vim.opt.tabstop = 2        -- 탭 문자를 2칸으로 설정
+vim.opt.shiftwidth = 2     -- 자동 들여쓰기 2칸으로 설정
+vim.opt.expandtab = true   -- 탭 대신 공백 문자 사용
+vim.opt.softtabstop = 2    -- 편집모드에서 탭 입력 시 2칸 사용
+
+-- DAP 설정 로딩
+_require 'config.dap'
+
+-- ShaDa 임시파일 관련 오류 방지
+set shada='100,<50,s10,h
+

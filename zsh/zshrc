@@ -229,14 +229,18 @@ fi
 # non-standard conda (e.g. mamba) would need to have a proper setup script to make conda work
 function _conda_initialize() {
 # >>> conda initialize >>>
-if [ -n "${CONDA_EXE}" ] && [[ "${CONDA_EXE}" == *conda ]]; then
-  ${CONDA_EXE} config --set auto_activate_base false
-  __conda_setup="$(${CONDA_EXE} 'shell.zsh' 'hook' 2> /dev/null)"
-  if [ $? -eq 0 ]; then
-      eval "$__conda_setup"
-  fi
-  unset __conda_setup
+# !! Contents within this block are managed by 'conda init' !!
+__conda_setup="$('/Users/comcom/miniconda3/bin/conda' 'shell.zsh' 'hook' 2> /dev/null)"
+if [ $? -eq 0 ]; then
+    eval "$__conda_setup"
+else
+    if [ -f "/Users/comcom/miniconda3/etc/profile.d/conda.sh" ]; then
+        . "/Users/comcom/miniconda3/etc/profile.d/conda.sh"
+    else
+        export PATH="/Users/comcom/miniconda3/bin:$PATH"
+    fi
 fi
+unset __conda_setup
 # <<< conda initialize <<<
 }
 # Note: conda initialize is slow (0.3 sec), so execute lazily
@@ -263,4 +267,42 @@ if [ -n "$ZSH_PROFILE_LOG" ]; then
   zprof >! "$ZSH_PROFILE_LOG"
 fi
 
-# vim: set ts=2 sts=2 sw=2:
+# alias python3 and pip3 to python and pip
+alias python=python3
+# alias conda=conda3
+alias pip=pip3
+
+conda activate walkerhill
+
+# export PATH="~/miniconda3/bin:$PATH"  # commented out by conda initialize
+
+# for tmux imgcat
+export TERM=xterm-256color
+
+
+
+# clipboard
+set clipboard=unnamedplus
+# source ~/.venvs/walkerhill/bin/activate  # commented out by conda initialize
+
+xhost +192.168.1.100
+
+# WalkerHill DB VPN related
+# 192.168.1.0/24 네트워크에 대해 라우팅 정보가 존재하고, 그 인터페이스가 ppp0인지 확인합니다.
+# if route -n get 192.168.1.0 2>/dev/null | grep -q 'interface: ppp0'; then
+#   echo "WalkerHill DB VPN: Route for 192.168.1.0/24 via ppp0 already exists. Skipping."
+# else
+#   echo "Adding route for 192.168.1.0/24 via ppp0..."
+#   sudo route add -net 192.168.1.0/24 -interface ppp0
+# fi
+
+
+SUDO_PASS="comcom8888"  # 실제 비밀번호로 교체하세요.
+
+if route -n get 192.168.1.0 2>/dev/null | grep -q 'interface: ppp0'; then
+  echo "WalkerHill DB VPN: Route for 192.168.1.0/24 via ppp0 already exists. Skipping."
+else
+  echo "Adding route for 192.168.1.0/24 via ppp0..."
+  echo $SUDO_PASS | sudo -S route add -net 192.168.1.0/24 -interface ppp0
+fi
+

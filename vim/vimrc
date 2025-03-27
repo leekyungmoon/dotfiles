@@ -105,6 +105,11 @@ endif
 " tab navigation
 set showtabline=2           " always show tab pannel
 
+" augroup ts_settings
+"   autocmd!
+"   autocmd BufRead,BufNewFile *.ts setlocal tabstop=2 shiftwidth=2 softtabstop=2
+" augroup END
+
 set scrolloff=3
 set sidescrolloff=3
 
@@ -2570,3 +2575,11 @@ endif
 " }}}
 
 " vim: set ts=2 sts=2 sw=2 foldmethod=marker:
+command! W w
+command! Q q
+command! Wq wq
+command! WQ wq
+command! Qa qa
+command! QA qa
+command! Wa wa
+command! WA wa
