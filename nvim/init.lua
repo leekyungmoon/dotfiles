@@ -141,5 +141,4 @@ vim.opt.softtabstop = 2    -- 편집모드에서 탭 입력 시 2칸 사용
 _require 'config.dap'
 
 -- ShaDa 임시파일 관련 오류 방지
-set shada='100,<50,s10,h
-
+vim.o.shada = "'100,<50,s10,h"
