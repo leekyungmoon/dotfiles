@@ -1,3 +1,45 @@
+# Troubleshooting Guide
+
+## Issue 1: Ruff Language Server Not Installed
+
+### Error Message:
+```
+Spawning language server with cmd: 'ruff-lsp' failed.
+The language server is either not installed.
+```
+
+### Solution:
+Install the missing Ruff language server by running:
+```bash
+pip install ruff-lsp
+```
+
+## Issue 2: Pyright Installation Failed in Mason
+
+### Error Message:
+```
+[mason-lspconfig.nvim] failed to install pyright.
+Installation logs are available in :Mason and...
+```
+
+### Solution:
+Force reinstallation of Pyright using Mason:
+
+1. Open Mason in Neovim:
+```vim
+:Mason
+```
+
+2. Run the forced installation command:
+```vim
+:MasonInstall --force pyright
+```
+
+### Additional Notes:
+- Check the logs provided by Mason if the installation continues to fail.
+- Ensure you have an active internet connection during installation.
+
+---
 
 # Dotfiles
 
