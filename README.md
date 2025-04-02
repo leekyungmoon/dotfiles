@@ -23,8 +23,7 @@ Installation logs are available in :Mason and...
 ```
 
 ### Solution:
-
-1. Run the forced installation command:
+Run the forced installation command:
 ```vim
 :MasonInstall --force pyright
 ```
