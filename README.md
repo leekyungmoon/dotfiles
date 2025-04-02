@@ -23,21 +23,11 @@ Installation logs are available in :Mason and...
 ```
 
 ### Solution:
-Force reinstallation of Pyright using Mason:
 
-1. Open Mason in Neovim:
-```vim
-:Mason
-```
-
-2. Run the forced installation command:
+1. Run the forced installation command:
 ```vim
 :MasonInstall --force pyright
 ```
-
-### Additional Notes:
-- Check the logs provided by Mason if the installation continues to fail.
-- Ensure you have an active internet connection during installation.
 
 ---
 
