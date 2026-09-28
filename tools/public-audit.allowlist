@@ -1,0 +1,18 @@
+# Accepted findings for tools/audit-public.py.
+#
+# One rule per line:   kind | path-glob | literal | reason
+#
+#   kind       finding kind (e.g. email, home-path, generic-secret) or "*"
+#   path-glob  fnmatch glob against the repository path ("*" crosses "/")
+#   literal    optional substring of the matched text; empty accepts any match
+#   reason     required; why publishing this is fine
+#
+# Never put source-machine strings (username, hostname, company domain, device
+# names), real emails or tokens here: those belong only in the private strings
+# file kept outside the repository.
+#
+# Pseudo paths: <commit-metadata> <tag-metadata> <ref> <commit> .gitmodules
+# The literal is matched against the matched text or its whole source line.
+
+email | <commit-metadata> | Co-Authored-By: Claude | AI co-author trailer; vendor noreply address, identifies no person
+generic-secret | tests/test-clipboard-helpers.sh | CLIPBOARD_CANARY_ | synthetic canary payload proving the clipboard helpers never log contents
