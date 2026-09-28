@@ -130,7 +130,7 @@ Applied by the installer on both 22.04 and 24.04 unless noted.
 | `Ctrl+W` | Close tab (GNOME Terminal) |
 | `Ctrl+Page_Up` / `Ctrl+Page_Down` | Previous / next tab |
 | `Ctrl+Shift+V` | Paste (GNOME Terminal) |
-| `Ctrl+Super+Left` / `Ctrl+Super+Right` | Previous / next tab (input-remapper, see below) |
+| `Ctrl+Super+Left` / `Ctrl+Super+Right` | Previous / next tab (input-remapper, see below; 24.04 only) |
 
 ### Windows
 
@@ -174,6 +174,10 @@ Dynamic workspaces, on the primary monitor only.
 
 
 ## input-remapper tab chord
+
+**Ubuntu 24.04 only.** input-remapper 1.4 on Ubuntu 22.04 cannot express
+this chord, so on 22.04 the installer reports it as not available and does
+not install the preset; use `Ctrl+Page_Up` / `Ctrl+Page_Down` there.
 
 While a **physical keyboard** holds `Ctrl` and either `Super` key:
 

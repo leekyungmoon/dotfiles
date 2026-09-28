@@ -44,11 +44,14 @@ error.
 3. Gets `~/.dotfiles`:
    - already a clean checkout of this repository → `git pull --ff-only`
      plus a submodule update;
-   - anything else → **moved aside** (never deleted) to
-     `~/.local/state/personal-dotfiles/backups/pre-install-<TS>/dotfiles`,
-     and the path is printed;
-   - then `git clone --recursive -j8` into `~/.dotfiles`. If the clone
-     fails, nothing else runs.
+   - otherwise it first runs `git clone --recursive -j8` into a temporary
+     sibling (`~/.dotfiles.new-<TS>-<PID>`). Only when that clone (and the
+     `DOTFILES_REF` checkout, if any) has succeeded is an existing
+     `~/.dotfiles` **moved aside** (never deleted) to
+     `~/.local/state/personal-dotfiles/backups/pre-install-<TS>/dotfiles`
+     (the path is printed) and the new clone moved into its place. If the
+     clone fails, the temporary sibling is removed, an existing
+     `~/.dotfiles` is left exactly as it was, and nothing else runs.
 4. Runs `cd ~/.dotfiles && python3 install.py` (reading from your terminal,
    so prompts work even under `curl | bash`), then prints `All Done!`.
 
@@ -87,9 +90,20 @@ tells you to clone there. It also refuses root and unsupported platforms.
 
 The installation script will clone the repository into `~/.dotfiles` and
 create symbolic links (e.g., `~/.zshrc` → `~/.dotfiles/zsh/zshrc`) for you.
+Because the rc files are links, anything that appends to them (`conda init`,
+an nvm/rustup installer, `p10k configure`) edits the checkout; keep
+machine-local lines in `~/.zshrc.local`, `~/.zshenv.local` or
+`~/.bashrc.local`, which are sourced when they exist.
+
 A few files that their programs rewrite (`~/.gitconfig`, the pudb and
 terminator configs, the systemd user units) are **copied** instead, so those
-programs never write into the checkout.
+programs never write into the checkout. **A copy that you or your apps
+changed is kept**: `dotfiles update`, `dotfiles repair` and `install.py`
+only rewrite a copy while it is still exactly what the installer wrote last
+time, and otherwise print `kept your local changes (use -f to overwrite)`.
+`python3 install.py -f` backs your version up and writes a fresh copy.
+`git config --global ...` therefore stays in `~/.gitconfig`; your identity
+belongs in `~/.gitconfig.secret` (see [After install](#-after-install)).
 
 **The one intentional difference from upstream:** if target files already
 exist (e.g. `~/.zshrc`, `~/.vim`), they are **backed up and replaced**
@@ -105,16 +119,18 @@ See [🛟 Recovery](#-recovery) below.
 
 `install.py` works through these sections, in order: *Checking platform*,
 *Installing packages*, *Creating symbolic links*, *Post actions* (tmux
-plugins, systemd user units, zsh/tmux smoke checks, login shell → zsh, git
-identity) and *GNOME settings*, and finishes with the follow-ups still left
-to you.
+plugins, systemd user units — the tmux-resurrect autosave timer is enabled
+**and started** right away, not only at your next login — zsh/tmux smoke
+checks, login shell → zsh (only after the smoke checks passed), git
+identity, AI CLI sign-in check) and *GNOME settings*, and finishes with the
+follow-ups still left to you.
 
 ### `install.py` options
 
 ```bash
 $ python3 install.py                   # install (the default)
 $ python3 install.py --dry-run         # show what would change, change nothing
-$ python3 install.py -f                # --force (like upstream)
+$ python3 install.py -f                # --force: also overwrite copies you changed (after a backup)
 $ python3 install.py --skip-vimplug    # do not prefill/update vim plugins
 $ python3 install.py --skip-zplug      # do not prefill/update zsh plugins
 $ python3 install.py --no-packages     # skip apt packages and pinned tools
@@ -126,12 +142,27 @@ $ python3 install.py --no-shell-change # do not change the login shell
 
 The installer intentionally leaves these to you:
 
-- **Log in to the AI CLIs** yourself:
+- **Sign in to the AI CLIs** yourself. Codex:
 
   ```bash
   codex login
-  claude login
   ```
+
+  Claude Code: start it and type `/login` at its prompt (`claude --help`
+  shows whether your build also has a non-interactive sign-in command):
+
+  ```bash
+  claude
+  ```
+
+  The installer only checks whether you are signed in (with each CLI's own
+  status command) and never reads or copies credentials.
+
+- **oh-my-codex** is installed from a pinned lockfile with
+  `npm ci --ignore-scripts`, so its npm lifecycle scripts never run; the
+  native helper its postinstall would download is fetched by the installer
+  from pinned, checksummed inputs instead. Run `omx setup` yourself when you
+  want it, and upgrade through `dotfiles update` rather than `omx update`.
 
 - **Git identity.** Like upstream, `install.py` asks for your name and email
   when `~/.gitconfig.secret` has none and a terminal is available.
@@ -159,12 +190,22 @@ $ dotfiles update --fast          # fast update mode: skip updating {vim,zsh} pl
 ```
 
 Like upstream, this runs in `~/.dotfiles`: `git fetch origin`, stashes local
-edits (only if the tree is dirty), `git merge --ff-only`,
+edits to tracked files (only if there are any), `git merge --ff-only`,
 `git submodule update --init --recursive`, `python3 install.py`, then puts
-your stash back. It ends with `Update complete!` and the changelog, or
+your edits back. It ends with `Update complete!` and the changelog, or
 `dotfiles is up-to-date`, or `installer has failed. Check the log.`
 A history that cannot fast-forward is not merged. `--skip-zplug` and
 `--skip-vimplug` skip one kind of plugin update.
+
+Only the stash entry that this update created is ever re-applied or
+dropped (it is identified by its commit id, never as "the newest stash"),
+so older stashes of yours are never touched. If your edits no longer apply
+cleanly on top of the new commit, the update still finishes, the checkout is
+reset to the new commit (when it was otherwise clean, so no conflict
+markers are left behind), your edits **stay in the stash**, the exact
+`git stash apply --index <id>` and `git stash drop` commands are printed,
+and `dotfiles update` exits with status 3 (or with the installer's status,
+if the install itself failed).
 
 That is also how changes travel between machines: edit in `~/.dotfiles`,
 commit and push to
@@ -217,8 +258,17 @@ $ python3 ~/.dotfiles/install.py gui-apply           # apply pending GNOME setti
       installation script. `python3 ~/.dotfiles/install.py status` shows the
       last run again: each phase is `PASS`, `FAIL`, `SKIPPED`,
       `PENDING_GUI`, `RELOGIN_REQUIRED` or `AUTH_REQUIRED`, with reasons.
-    - A failed run has already been rolled back; fix the reported cause and
-      run it again.
+    - What a failure undoes: the *Creating symbolic links* step is one
+      transaction, so if **it** fails (or the run is killed during it) every
+      managed path it touched is put back as it was (after a kill, by the
+      next run). Nothing else is rolled back: apt packages and pinned tools
+      installed before it stay installed, and when a later step fails
+      (post actions such as tmux plugins or the systemd units, the smoke
+      checks, the login shell, git identity, GNOME settings) the new
+      configs stay in place. Fix the reported cause and run it again, or
+      undo that run's config changes with
+      `python3 ~/.dotfiles/install.py restore --run <RUN_ID>`
+      (see [docs/RECOVERY.md](docs/RECOVERY.md)).
     - If you had your own `~/.zshrc`, `~/.vimrc`, `~/.vim`, etc., they were
       **backed up and replaced**, not deleted. Want one back? See
       [docs/RECOVERY.md](docs/RECOVERY.md#restore-a-single-config).
@@ -251,6 +301,9 @@ $ python3 ~/.dotfiles/install.py gui-apply           # apply pending GNOME setti
       `python3 ~/.dotfiles/install.py gui-apply`.
 
 - `Ctrl+Super+Left/Right` does not switch tabs?
+    - It is **Ubuntu 24.04 only**: input-remapper 1.4 on 22.04 cannot
+      express the chord, so on 22.04 the installer reports it as not
+      available and leaves it out.
     - input-remapper only acts on a **physical keyboard**; it does nothing
       over SSH, VNC or in a VM without a passed-through keyboard.
     - It needs its service running and permission to read input devices.
@@ -286,7 +339,9 @@ Modifications in this repository are released under the same MIT license.
   signed apt repository).
 - **Pinned tools** without sudo, into `~/.local/share/personal-dotfiles/tools`
   and linked from `~/.local/bin`: neovim, fzf, node, codex, claude-code,
-  oh-my-codex and a Nerd Font, each checked against a pinned SHA-256.
+  oh-my-codex (npm lifecycle scripts disabled) and a Nerd Font, each checked
+  against a pinned SHA-256. vim and neovim use this fzf from `$PATH`;
+  nothing is cloned into `~/.fzf`.
 - **Configs** linked from `~/.dotfiles`: zsh, bash, vim/neovim, tmux, git,
   terminal emulators, python tools, `pbcopy` / `pbpaste`, `dotfiles`.
 - **tmux plugins** at pinned commits, the tmux systemd user units, zsh as
@@ -318,7 +373,8 @@ Modifications in this repository are released under the same MIT license.
   Shell aliases: `tl` (ls), `tn` (new), `ta` (attach), `tk` (kill),
   `td` (detach) and `trn` (rename-session; not `tr`, which stays coreutils).
 - 💾 **tmux auto save / restore** with tmux-resurrect (Codex / Claude TUIs
-  included): saved every minute, restored at desktop login; snapshots live
+  included): saved every minute (the timer starts at install), restored at
+  desktop login; snapshots live
   in `~/.local/share/tmux/resurrect`.
   See [docs/tmux-auto-restore.ko.md](docs/tmux-auto-restore.ko.md).
 - 🐚 **zsh widgets**: `Ctrl+E` fuzzy directory picker, `Ctrl+S` git status
@@ -327,7 +383,8 @@ Modifications in this repository are released under the same MIT license.
   other terminal-wrapped commands on demand.
 - 🧭 **GNOME navigation** for windows, workspaces, monitors and
   applications, plus **`Ctrl+Super+Left` / `Ctrl+Super+Right`** to switch
-  tabs in Chrome and GNOME Terminal (via an input-remapper preset).
+  tabs in Chrome and GNOME Terminal (via an input-remapper preset;
+  Ubuntu 24.04 only).
   Applied immediately inside a GNOME session, otherwise at your next
   graphical login.
 
@@ -345,7 +402,9 @@ python3 ~/.dotfiles/install.py restore --baseline
 You can also restore the state from before a specific run
 (`restore --run <RUN_ID>`) or just one config (`--id <ID>`), and a restore
 refuses to clobber files you edited after installing unless you add
-`--force`. Backups live in `~/.local/state/personal-dotfiles/backups/`:
+`--force`. Restores cover the managed configs (and, for a full
+`--baseline`, the GNOME settings); they do not uninstall apt packages or
+pinned tools. Backups live in `~/.local/state/personal-dotfiles/backups/`:
 
 - `baseline/` — the very first original of every managed path;
 - `runs/<RUN_ID>/` — what each run replaced;

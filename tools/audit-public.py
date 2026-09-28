@@ -13,12 +13,29 @@ base commit:
   unrelated histories, tags.
 
 History reachable from the base is "upstream ancestry": it is already public
-and is not scanned for introduced content.
+and is not scanned for introduced content. Because of that the base itself is
+checked before anything is scanned: no audited ``--ref`` may be the base or
+an ancestor of it (that would exempt everything; a ref that does not descend
+from the base at all is scanned and reported as blocking), and when an
+upstream remote is configured (``--upstream-remote``, default ``upstream``)
+the base must be reachable from one of its remote-tracking refs, i.e. really
+published. Otherwise the audit stops with exit status 2.
+
+Binary and non-UTF-8 blobs are scanned too: as raw bytes (latin-1 and both
+UTF-16 alignments), gzip/bzip2/xz/zip/tar members are expanded up to a size
+cap, and non-ASCII private strings are searched for in their common byte
+encodings. A binary blob is still reported as ``binary-blob`` (blocking unless
+allowlisted), because formats with internal compression cannot be proven
+clean; anything that could not be expanded is ``binary-unscanned``.
 
 Source-machine strings (username, hostname, company domain, device names) are
 never hardcoded here. They are read at runtime from ``--private-strings FILE``
-(one string per line, kept outside the repository) and matched
-case-insensitively.
+(kept outside the repository), one per line, matched case-insensitively:
+
+    some-hostname        substring match anywhere
+    word:login           whole word only: not next to a letter or digit, so
+                         "word:kyle" flags "USER=kyle" but not the public
+                         handle "mkyle"
 
 Exit status: 0 when every finding is informational or accepted by the
 allowlist, 1 when anything else was found, 2 on usage or git errors.
@@ -38,18 +55,35 @@ paths ``<commit-metadata>``, ``<tag-metadata>``, ``<ref>``, ``<commit>`` and
 from __future__ import annotations
 
 import argparse
+import bz2
 import dataclasses
 import fnmatch
+import gzip
+import io
 import json
+import lzma
 import os
 import re
 import subprocess
 import sys
+import tarfile
+import typing
+import zipfile
+import zlib
 from pathlib import Path
 
 ZERO_SHA = "0" * 40
 DEFAULT_ALLOWLIST = Path(__file__).resolve().parent / "public-audit.allowlist"
 BINARY_SNIFF = 8000
+# Binary scanning limits: blobs above MAX_BINARY_SCAN bytes are not scanned
+# (reported as binary-unscanned); archives are expanded to at most
+# MAX_EXPANDED bytes and MAX_MEMBERS members in total, ARCHIVE_DEPTH deep.
+MAX_BINARY_SCAN = 64 * 1024 * 1024
+MAX_EXPANDED = 64 * 1024 * 1024
+MAX_MEMBERS = 10000
+ARCHIVE_DEPTH = 3
+# Legacy byte encodings a non-ASCII private string is also searched in.
+PRIVATE_BYTE_ENCODINGS = ("utf-8", "cp1252", "cp949", "shift_jis", "gb18030")
 
 SEVERITY_HIGH = "high"
 SEVERITY_MEDIUM = "medium"
@@ -128,21 +162,73 @@ TOKEN_PATTERNS: tuple[Pattern, ...] = (
             re.compile(r"\bglpat-[A-Za-z0-9_\-]{20,}")),
     Pattern("google-api-key", SEVERITY_HIGH,
             re.compile(r"\bAIza[0-9A-Za-z_\-]{35}")),
+    Pattern("huggingface-token", SEVERITY_HIGH,
+            re.compile(r"\bhf_[A-Za-z0-9]{30,}\b")),
+    Pattern("npm-token", SEVERITY_HIGH,
+            re.compile(r"\bnpm_[A-Za-z0-9]{36,}\b")),
+    Pattern("pypi-token", SEVERITY_HIGH,
+            re.compile(r"\bpypi-AgE[A-Za-z0-9_\-]{50,}")),
+    Pattern("stripe-key", SEVERITY_HIGH,
+            re.compile(r"\b[rs]k_(?:live|test)_[A-Za-z0-9]{16,}")),
+    Pattern("docker-token", SEVERITY_HIGH,
+            re.compile(r"\bdckr_pat_[A-Za-z0-9_\-]{20,}")),
+    Pattern("digitalocean-token", SEVERITY_HIGH,
+            re.compile(r"\bdo[opr]_v1_[a-f0-9]{64}\b")),
+    Pattern("slack-webhook", SEVERITY_HIGH,
+            re.compile(r"https://hooks\.slack\.com/services/T[A-Za-z0-9]+/"
+                       r"B[A-Za-z0-9]+/[A-Za-z0-9]+")),
+    Pattern("jwt", SEVERITY_HIGH,
+            re.compile(r"\beyJ[A-Za-z0-9_\-]{8,}\.eyJ[A-Za-z0-9_\-]{8,}\."
+                       r"[A-Za-z0-9_\-]{8,}")),
+    Pattern("bearer-token", SEVERITY_HIGH,
+            re.compile(r"(?i)\bBearer\s+([A-Za-z0-9._~+/\-]{16,}=*)"), group=1),
+    Pattern("basic-auth", SEVERITY_HIGH,
+            re.compile(r"(?i)\bAuthorization:\s*Basic\s+([A-Za-z0-9+/]{8,}={0,2})"),
+            group=1),
+    Pattern("url-credentials", SEVERITY_HIGH,
+            re.compile(r"\b[A-Za-z][A-Za-z0-9+.\-]*://[^/\s:@'\"<>]+:"
+                       r"([^/\s@'\"<>$({]{3,})@[A-Za-z0-9.\-\[\]]+"), group=1),
 )
 
+# Credential-looking assignments: `password = ...`, `export GITHUB_TOKEN=...`,
+# `"api_key": "..."`, `DB_PASSWORD: ...`. The key may carry any prefix or
+# suffix (GITHUB_TOKEN, DB_PASSWORD, client_secret_v2); the value is any run
+# of 8+ characters other than whitespace and quotes, then filtered by
+# _plausible_secret so references like $TOKEN or os.environ[...] pass.
+_SECRET_WORD = (r"(?:password|passwd|passphrase|secret|token|api[_-]?key"
+                r"|access[_-]?key|auth[_-]?key|private[_-]?key|credentials?)")
 _GENERIC_SECRET = re.compile(
-    r"(?i)\b(?:password|passwd|secret|token|api[_-]?key|access[_-]?key)\w*"
-    r"[\"']?\s*[:=]\s*[\"']?([A-Za-z0-9+/=_\-.]{16,})"
+    r"(?i)(?<![A-Za-z0-9])[A-Za-z0-9_]*?" + _SECRET_WORD + r"[A-Za-z0-9_]*"
+    r"[\"']?\s*(?::=|=>|[:=])\s*[\"'`]?([^\s\"'`]{8,})"
 )
+_PLACEHOLDER_SECRET = re.compile(
+    r"(?i)x{4,}|\*{4,}|\.{3}|<|>|your[_-]|example|placeholder|changeme"
+    r"|redacted|dummy|\bnone\b|\bnull\b|\btrue\b|\bfalse\b")
+_PRIVATE_IP = re.compile(
+    r"(?<![\w.])(?:10\.\d{1,3}|192\.168|172\.(?:1[6-9]|2\d|3[01]))"
+    r"\.\d{1,3}\.\d{1,3}(?![\w.])")
 _EMAIL = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9\-]+(?:\.[A-Za-z0-9\-]+)*\.[A-Za-z]{2,}")
-_HOME_PATH = re.compile(r"(?<![\w.])/(home|Users)/([A-Za-z][A-Za-z0-9._\-]*)")
+# /home/<name>, /Users/<name> (also WSL's /mnt/c/Users/<name>), C:\Users\<name>
+# and ~<name>/ paths. Group "root" is the prefix shown, "name" the user.
+_HOME_PATH = re.compile(r"(?:(?<![\w.])|(?<=/mnt/[A-Za-z]))"
+                        r"(?P<root>/(?:home|Users)/)(?P<name>[A-Za-z][A-Za-z0-9._\-]*)")
+_WIN_HOME_PATH = re.compile(r"(?<![A-Za-z0-9])(?P<root>[A-Za-z]:\\{1,2}Users\\{1,2})"
+                            r"(?P<name>[A-Za-z][A-Za-z0-9._\-]*)")
+_TILDE_HOME = re.compile(r"(?<![\w~/.:$\\-])(?P<root>~)(?P<name>[A-Za-z_][A-Za-z0-9_\-]*)"
+                         r"(?=/)")
+HOME_REGEXES = (_HOME_PATH, _WIN_HOME_PATH, _TILDE_HOME)
+# SSH remotes on these hosts are public forges; any other git@host: is named.
+PUBLIC_SSH_HOSTS = frozenset({
+    "github.com", "gitlab.com", "bitbucket.org", "ssh.github.com",
+    "codeberg.org", "git.sr.ht",
+})
 
 # Generic names that stand for "some user" rather than identifying anyone.
 HOME_PLACEHOLDERS = frozenset({
     "user", "username", "user-name", "user_name", "yourname", "your-name",
     "your_name", "you", "me", "name", "example", "foo", "bar", "someone",
     "somebody", "runner", "linuxbrew", "shared", "fixture-user", "test",
-    "tester", "alice", "bob",
+    "tester", "alice", "bob", "root",
 })
 
 # Domains reserved for documentation (RFC 2606) and non-identifying hosts.
@@ -187,6 +273,30 @@ def credential_path_reason(path: str) -> str | None:
     return None
 
 
+WORD_PREFIX = "word:"
+
+
+def private_regex(entry: str) -> re.Pattern[str]:
+    """The case-insensitive matcher for one private-strings entry.
+
+    ``word:<text>`` matches <text> only where it is not next to an ASCII
+    letter or digit, so a login that is part of a public handle can be
+    listed; anything else is a plain substring.
+    """
+    if entry.lower().startswith(WORD_PREFIX):
+        text = entry[len(WORD_PREFIX):]
+        return re.compile(r"(?<![A-Za-z0-9])" + re.escape(text) + r"(?![A-Za-z0-9])",
+                          re.IGNORECASE)
+    return re.compile(re.escape(entry), re.IGNORECASE)
+
+
+def private_text(entry: str) -> str:
+    """The string an entry stands for (without its ``word:`` prefix)."""
+    if entry.lower().startswith(WORD_PREFIX):
+        return entry[len(WORD_PREFIX):]
+    return entry
+
+
 def load_private_strings(path: Path | None, repo: Path) -> list[str]:
     if path is None:
         return []
@@ -201,10 +311,12 @@ def load_private_strings(path: Path | None, repo: Path) -> list[str]:
     except OSError as exc:
         raise AuditError(f"cannot read private strings file: {exc}") from exc
     values: list[str] = []
-    for line in text.splitlines():
+    for lineno, line in enumerate(text.splitlines(), 1):
         value = line.strip()
         if not value or value.startswith("#"):
             continue
+        if not private_text(value).strip():
+            raise AuditError(f"private strings line {lineno}: empty {WORD_PREFIX} entry")
         if value.lower() not in (v.lower() for v in values):
             values.append(value)
     return values
@@ -215,7 +327,7 @@ class Redactor:
 
     def __init__(self, private_strings: list[str]) -> None:
         self._private = [
-            (re.compile(re.escape(s), re.IGNORECASE), f"[PRIVATE-{i + 1}]")
+            (private_regex(s), f"[PRIVATE-{i + 1}]")
             for i, s in enumerate(private_strings)
         ]
 
@@ -234,14 +346,19 @@ class Redactor:
         text = _PRIVATE_KEY.sub("[PRIVATE-KEY-HEADER]", text)
         for pattern in TOKEN_PATTERNS:
             text = pattern.regex.sub(
-                lambda m: self.mask(m.group(0)), text)
+                lambda m, g=pattern.group: m.group(0)[: m.start(g) - m.start(0)]
+                + self.mask(m.group(g)) + m.group(0)[m.end(g) - m.start(0):], text)
         text = _GENERIC_SECRET.sub(
             lambda m: m.group(0)[: m.start(1) - m.start(0)] + self.mask(m.group(1)),
             text)
-        text = _EMAIL.sub(lambda m: _email_mask(m.group(0)), text)
-        text = _HOME_PATH.sub(
-            lambda m: m.group(0) if m.group(2).lower() in HOME_PLACEHOLDERS
-            else _home_mask(m), text)
+        text = _EMAIL.sub(lambda m: m.group(0)
+                          if m.group(0).lower() in {"git@" + h for h in PUBLIC_SSH_HOSTS}
+                          else _email_mask(m.group(0)), text)
+        text = _PRIVATE_IP.sub("[PRIVATE-IP]", text)
+        for regex in HOME_REGEXES:
+            text = regex.sub(
+                lambda m: m.group(0) if m.group("name").lower() in HOME_PLACEHOLDERS
+                else _home_mask(m), text)
         return self.scrub(text)
 
     def excerpt(self, line: str, start: int, end: int, replacement: str) -> str:
@@ -260,15 +377,34 @@ def _email_mask(email: str) -> str:
 
 
 def _home_mask(match: re.Match[str]) -> str:
-    return f"/{match.group(1)}/{match.group(2)[:1]}***"
+    return f"{match.group('root')}{match.group('name')[:1]}***"
+
+
+def _plausible_secret(value: str) -> bool:
+    """Whether a generic `key = value` right-hand side looks like a literal
+    secret rather than a reference, an expression or a placeholder."""
+    value = value.rstrip(";,)]}")
+    if len(value) < 8:
+        return False
+    if value[0] in "$%{<([@&*\\/~." or "://" in value:
+        return False  # variable, template, path or URL (URLs: url-credentials)
+    if any(t in value for t in ("${", "$(", "{{", "%(", "(", "[")):
+        return False  # expansion, call or subscript
+    if len(set(value.lower())) <= 2 or _PLACEHOLDER_SECRET.search(value):
+        return False
+    if not re.search(r"[A-Za-z]", value):
+        return False
+    # A letter plus a digit or a symbol; plain words and dotted/dashed
+    # identifiers (os.environ.get, some-config-name) are references.
+    # (Separators such as "," ";" ":" "|" alone mean a list, e.g. red,bold.)
+    return bool(re.search(r"[0-9]", value)
+                or re.search(r"[!@#%^&*+=?~]", value))
 
 
 class Scanner:
     def __init__(self, private_strings: list[str], redactor: Redactor) -> None:
         self.private_strings = private_strings
-        self._private_regex = [
-            re.compile(re.escape(s), re.IGNORECASE) for s in private_strings
-        ]
+        self._private_regex = [private_regex(s) for s in private_strings]
         self.redactor = redactor
 
     # Path-level checks --------------------------------------------------
@@ -290,12 +426,13 @@ class Scanner:
                     "private-string", SEVERITY_HIGH, where,
                     self.redactor.scrub(path), None,
                     f"path contains private string #{i + 1}", raw=path))
-        for m in _HOME_PATH.finditer(path):
-            if m.group(2).lower() not in HOME_PLACEHOLDERS:
-                findings.append(Finding(
-                    "home-path", SEVERITY_MEDIUM, where,
-                    self.redactor.scrub(path), None, "path names a home directory",
-                    raw=m.group(0)))
+        for regex in HOME_REGEXES:
+            for m in regex.finditer(path):
+                if m.group("name").lower() not in HOME_PLACEHOLDERS:
+                    findings.append(Finding(
+                        "home-path", SEVERITY_MEDIUM, where,
+                        self.redactor.scrub(path), None, "path names a home directory",
+                        raw=m.group(0)))
         return findings
 
     # Text checks -----------------------------------------------------------
@@ -305,6 +442,43 @@ class Scanner:
         for lineno, line in enumerate(text.splitlines(), start=1):
             findings.extend(self._scan_line(line, lineno, where, shown_path))
         return findings
+
+    def scan_private_bytes(self, data: bytes, where: str, path: str, *,
+                           binary: bool) -> list[Finding]:
+        """Non-ASCII private strings in their legacy byte encodings.
+
+        ASCII strings need no byte pass: the latin-1 and UTF-16 views of a
+        binary blob, and the lossy UTF-8 decode of a non-UTF-8 text blob,
+        keep ASCII intact. For a binary blob the latin-1 view already covers
+        cp1252, and the UTF-16 views cover UTF-16.
+        """
+        out: list[Finding] = []
+        shown_path = self.redactor.scrub(path)
+        for i, entry in enumerate(self.private_strings):
+            text = private_text(entry)
+            if text.isascii():
+                continue
+            seen: set[int] = set()
+            for encoding in PRIVATE_BYTE_ENCODINGS:
+                if binary and encoding == "cp1252":
+                    continue
+                forms = set()
+                for variant in (text, text.lower(), text.upper()):
+                    try:
+                        forms.add(variant.encode(encoding))
+                    except UnicodeEncodeError:
+                        pass
+                for form in forms:
+                    for m in re.finditer(re.escape(form), data):
+                        if m.start() in seen:
+                            continue
+                        seen.add(m.start())
+                        out.append(Finding(
+                            "private-string", SEVERITY_HIGH, where, shown_path,
+                            data.count(b"\n", 0, m.start()) + 1,
+                            f"[PRIVATE-{i + 1}] (as {encoding} bytes at offset "
+                            f"{m.start()})", raw=text, context=text))
+        return out
 
     def _add(self, out: list[Finding], kind: str, severity: str, where: str,
              path: str, lineno: int, line: str, start: int, end: int,
@@ -327,6 +501,8 @@ class Scanner:
             for m in pattern.regex.finditer(line):
                 s, e = m.span(pattern.group)
                 value = m.group(pattern.group)
+                if pattern.group and value[:1] == "$":
+                    continue
                 token_spans.append((s, e))
                 self._add(out, pattern.kind, pattern.severity, where, path, lineno,
                           line, s, e, self.redactor.mask(value), value)
@@ -335,7 +511,7 @@ class Scanner:
             value = m.group(1)
             if any(s < te and ts < e for ts, te in token_spans):
                 continue
-            if not (re.search(r"[0-9]", value) and re.search(r"[A-Za-z]", value)):
+            if not _plausible_secret(value):
                 continue
             self._add(out, "generic-secret", SEVERITY_MEDIUM, where, path, lineno,
                       line, s, e, self.redactor.mask(value), value)
@@ -343,23 +519,31 @@ class Scanner:
             for m in _EMAIL.finditer(line):
                 local, _, domain = m.group(0).lower().rpartition("@")
                 if local == "git":
-                    continue  # SSH remote syntax (git@host:owner/repo)
+                    # SSH remote syntax (git@host:owner/repo): only a host
+                    # other than a public forge is worth reporting.
+                    if domain not in PUBLIC_SSH_HOSTS:
+                        self._add(out, "ssh-remote-host", SEVERITY_MEDIUM, where,
+                                  path, lineno, line, m.start(), m.end(),
+                                  "git@" + domain[:1] + "***", m.group(0))
+                    continue
                 if domain in EMAIL_PLACEHOLDER_DOMAINS or domain.endswith(".example"):
                     continue
                 self._add(out, "email", SEVERITY_MEDIUM, where, path, lineno, line,
                           m.start(), m.end(), _email_mask(m.group(0)), m.group(0))
-        if "/home/" in line or "/Users/" in line:
-            for m in _HOME_PATH.finditer(line):
-                if m.group(2).lower() in HOME_PLACEHOLDERS:
-                    continue
-                self._add(out, "home-path", SEVERITY_MEDIUM, where, path, lineno,
-                          line, m.start(), m.end(), _home_mask(m), m.group(0))
-        lowered = line.lower()
-        for i, (value, regex) in enumerate(zip(self.private_strings,
-                                               self._private_regex)):
-            if value.lower() in lowered:
-                m = regex.search(line)
-                assert m is not None
+        if "/" in line or "~" in line or "\\" in line:
+            for regex in HOME_REGEXES:
+                for m in regex.finditer(line):
+                    if m.group("name").lower() in HOME_PLACEHOLDERS:
+                        continue
+                    self._add(out, "home-path", SEVERITY_MEDIUM, where, path, lineno,
+                              line, m.start(), m.end(), _home_mask(m), m.group(0))
+        if "." in line:
+            for m in _PRIVATE_IP.finditer(line):
+                self._add(out, "private-ip", SEVERITY_MEDIUM, where, path, lineno,
+                          line, m.start(), m.end(), "[PRIVATE-IP]", m.group(0))
+        for i, regex in enumerate(self._private_regex):
+            m = regex.search(line)
+            if m is not None:
                 self._add(out, "private-string", SEVERITY_HIGH, where, path, lineno,
                           line, m.start(), m.end(), f"[PRIVATE-{i + 1}]", m.group(0))
         return out
@@ -521,6 +705,99 @@ def _is_binary(data: bytes) -> bool:
     return b"\0" in data[:BINARY_SNIFF]
 
 
+def _binary_views(data: bytes) -> list[tuple[str, str]]:
+    """Text views of binary data that keep embedded strings matchable:
+    latin-1 (every byte one character, so ASCII/latin-1 text survives) and
+    UTF-16LE at both byte alignments (which also covers UTF-16BE)."""
+    views = [("bytes", data.decode("latin-1"))]
+    for offset in (0, 1):
+        chunk = data[offset:]
+        chunk = chunk[: len(chunk) - len(chunk) % 2]
+        views.append((f"utf-16@{offset}", chunk.decode("utf-16-le", "replace")))
+    return views
+
+
+class _Budget:
+    def __init__(self) -> None:
+        self.bytes = MAX_EXPANDED
+        self.members = MAX_MEMBERS
+
+    def take(self, size: int) -> bool:
+        if size > self.bytes or self.members <= 0:
+            return False
+        self.bytes -= size
+        self.members -= 1
+        return True
+
+
+def _read_capped(stream: typing.IO[bytes], budget: _Budget) -> bytes | None:
+    data = stream.read(budget.bytes + 1)
+    return data if budget.take(len(data)) else None
+
+
+def _archive_members(data: bytes, budget: _Budget
+                     ) -> tuple[list[tuple[str, bytes]], list[str]] | None:
+    """Expand a compressed stream or archive into (name, bytes) members.
+
+    Returns None when ``data`` is not a recognised container, otherwise the
+    members read within the budget plus a list of problems (anything that
+    could not be read: over budget, encrypted, corrupt, unsupported).
+    """
+    members: list[tuple[str, bytes]] = []
+    problems: list[str] = []
+    head = data[:8]
+    try:
+        if head.startswith((b"PK\x03\x04", b"PK\x05\x06")):
+            with zipfile.ZipFile(io.BytesIO(data)) as archive:
+                for info in archive.infolist():
+                    if info.is_dir():
+                        continue
+                    if info.flag_bits & 0x1:
+                        problems.append(f"encrypted zip member {info.filename}")
+                        continue
+                    with archive.open(info) as stream:
+                        content = _read_capped(stream, budget)
+                    if content is None:
+                        problems.append("zip expands beyond the scan limit")
+                        break
+                    members.append(("/" + info.filename.lstrip("/"), content))
+            return members, problems
+        if len(data) > 262 and data[257:262] == b"ustar":
+            payload = data
+        elif head.startswith(b"\x1f\x8b"):
+            payload = _read_capped(gzip.GzipFile(fileobj=io.BytesIO(data)), budget)
+        elif head.startswith(b"BZh"):
+            payload = _read_capped(bz2.BZ2File(io.BytesIO(data)), budget)
+        elif head.startswith(b"\xfd7zXZ\x00"):
+            payload = _read_capped(lzma.LZMAFile(io.BytesIO(data)), budget)
+        elif head.startswith((b"\x28\xb5\x2f\xfd", b"7z\xbc\xaf\x27\x1c", b"Rar!")):
+            return [], ["compressed format not supported (zstd/7z/rar)"]
+        else:
+            return None
+        if payload is None:
+            return [], ["decompresses beyond the scan limit"]
+        if len(payload) > 262 and payload[257:262] == b"ustar":
+            with tarfile.open(fileobj=io.BytesIO(payload), mode="r:") as archive:
+                for info in archive:
+                    if not info.isfile():
+                        if info.issym() or info.islnk():
+                            members.append(("/" + info.name.lstrip("/"),
+                                            info.linkname.encode("utf-8", "replace")))
+                        continue
+                    stream = archive.extractfile(info)
+                    content = _read_capped(stream, budget) if stream else b""
+                    if content is None:
+                        problems.append("tar expands beyond the scan limit")
+                        break
+                    members.append(("/" + info.name.lstrip("/"), content))
+            return members, problems
+        return [("<decompressed>", payload)], problems
+    except (OSError, EOFError, ValueError, lzma.LZMAError, zlib.error,
+            zipfile.BadZipFile, tarfile.TarError, RuntimeError) as exc:
+        problems.append(f"cannot expand ({type(exc).__name__})")
+        return members, problems
+
+
 def _parse_gitmodules(text: str) -> dict[str, dict[str, str]]:
     modules: dict[str, dict[str, str]] = {}
     current: str | None = None
@@ -549,8 +826,12 @@ _PUBLIC_GITHUB_URL = re.compile(
 
 class Audit:
     def __init__(self, repo: Path, base: str, refs: list[str],
-                 private_strings: list[str], allowlist: list[AllowRule]) -> None:
+                 private_strings: list[str], allowlist: list[AllowRule],
+                 upstream_remote: str = "upstream") -> None:
         self.git = Git(repo)
+        self.upstream_remote = upstream_remote
+        # Which remote-tracking ref proved the base is published, or None.
+        self.upstream_verified: str | None = None
         self.redactor = Redactor(private_strings)
         self.scanner = Scanner(private_strings, self.redactor)
         self.allowlist = allowlist
@@ -574,6 +855,55 @@ class Audit:
     def _short(self, sha: str) -> str:
         return sha[:12]
 
+    def _scan_content(self, data: bytes, where: str, path: str,
+                      budget: _Budget, depth: int = 0) -> list[Finding]:
+        """Every finding in one blob (or archive member), text or binary."""
+        found: list[Finding] = []
+        binary = _is_binary(data)
+        shown = self.redactor.scrub(path)
+        if binary and depth == 0:
+            found.append(Finding(
+                "binary-blob", SEVERITY_MEDIUM, where, shown, None,
+                f"binary content ({len(data)} bytes), scanned as raw bytes and "
+                "UTF-16; compressed data inside it cannot be proven clean: "
+                "review it and allowlist it with a reason", raw=path))
+        if binary and len(data) > MAX_BINARY_SCAN:
+            found.append(Finding(
+                "binary-unscanned", SEVERITY_MEDIUM, where, shown, None,
+                f"larger than the {MAX_BINARY_SCAN}-byte scan limit; not scanned",
+                raw=path))
+            return found
+        if binary:
+            for label, text in _binary_views(data):
+                for f in self.scanner.scan_text(text, where, path):
+                    f.excerpt_redacted = f"({label}) {f.excerpt_redacted}"
+                    found.append(f)
+            found += self.scanner.scan_private_bytes(data, where, path, binary=True)
+        else:
+            try:
+                text = data.decode("utf-8")
+            except UnicodeDecodeError:
+                text = None
+            found += self.scanner.scan_text(
+                text if text is not None else data.decode("utf-8", "replace"),
+                where, path)
+            if text is None:
+                found += self.scanner.scan_private_bytes(data, where, path,
+                                                         binary=False)
+        expanded = _archive_members(data, budget) if depth < ARCHIVE_DEPTH else None
+        if expanded is not None:
+            members, problems = expanded
+            for problem in problems:
+                found.append(Finding(
+                    "binary-unscanned", SEVERITY_MEDIUM, where, shown, None,
+                    problem, raw=path))
+            for name, content in members:
+                member_path = f"{path}!{name}"
+                found += self.scanner.scan_path(member_path, where)
+                found += self._scan_content(content, where, member_path, budget,
+                                            depth + 1)
+        return found
+
     def _scan_blob(self, mode: str, sha: str, path: str, where: str,
                    upstream_blobs: set[str]) -> None:
         for f in self.scanner.scan_path(path, where):
@@ -583,11 +913,7 @@ class Audit:
         cache_key = (sha, path)
         if cache_key not in self._scanned_blobs:
             data = self.git.blob(sha)
-            if _is_binary(data):
-                found: list[Finding] = []
-            else:
-                found = self.scanner.scan_text(
-                    data.decode("utf-8", "replace"), where, path)
+            found = self._scan_content(data, where, path, _Budget())
             if sha in upstream_blobs:
                 # Byte-identical to published upstream content.
                 for f in found:
@@ -629,6 +955,7 @@ class Audit:
             sha = self.git.rev(name)
             resolved.append((name, sha))
         self.stats["refs"] = len(resolved)
+        self._check_base(base, resolved)
 
         for name, sha in resolved:
             self._check_ref_ancestry(name, sha, base)
@@ -664,6 +991,63 @@ class Audit:
         self.stats["introduced_blobs"] = len(blobs)
 
         self._apply_allowlist()
+
+    def _check_base(self, base: str, resolved: list[tuple[str, str]]) -> None:
+        """Refuse a base that would exempt what is being published.
+
+        Everything reachable from the base counts as already public, so no
+        ref named with --ref may be the base or lie below it (with the
+        default refs at least one must descend from it), and, when an
+        upstream remote is configured, the base must be inside that remote's
+        published history. A ref that diverged from the base is scanned in
+        full and reported as a blocking ref-not-descending finding.
+        """
+        shown_base = self.redactor.scrub(self.base_name)
+        descending = [name for name, sha in resolved
+                      if sha != base and self.git.is_ancestor(base, sha)]
+        if self.ref_names:
+            for name, sha in resolved:
+                shown = self.redactor.scrub(name)
+                if sha == base:
+                    raise AuditError(
+                        f"--ref {shown} is the base {shown_base} itself: nothing "
+                        "would be scanned; pass the upstream commit as --base")
+                if self.git.is_ancestor(sha, base):
+                    raise AuditError(
+                        f"--ref {shown} is an ancestor of --base {shown_base}: "
+                        "its commits would count as upstream; pass the upstream "
+                        "commit as --base")
+                # A ref that diverged from the base is still scanned in full
+                # and reported as a blocking ref-not-descending finding.
+        elif not descending:
+            raise AuditError(
+                f"no ref descends from --base {shown_base}: nothing would be "
+                "scanned; pass the upstream commit as --base")
+
+        remote = self.upstream_remote
+        if not remote:
+            return
+        configured = self.git.run("config", "--get-regexp",
+                                  rf"^remote\.{re.escape(remote)}\.",
+                                  check=False).strip()
+        prefix = f"refs/remotes/{remote}/"
+        tracking = self.git.run("for-each-ref", "--format=%(refname)",
+                                prefix).decode().split()
+        if not configured and not tracking:
+            return  # no upstream remote: reported as not verified
+        if not tracking:
+            raise AuditError(
+                f"remote {remote!r} is configured but has no remote-tracking "
+                f"refs; run `git fetch {remote}` so --base can be verified")
+        containing = self.git.run("for-each-ref", "--format=%(refname)",
+                                  "--contains", base, prefix).decode().split()
+        if not containing:
+            raise AuditError(
+                f"--base {shown_base} is not in the published history of "
+                f"{remote!r} ({prefix}*): commits below it would be exempted "
+                "without being public; pass a published upstream commit")
+        named = [ref for ref in containing if not ref.endswith("/HEAD")]
+        self.upstream_verified = (named or containing)[0][len("refs/remotes/"):]
 
     def _default_refs(self) -> list[str]:
         out = self.git.run("for-each-ref", "--format=%(refname)",
@@ -769,10 +1153,13 @@ class Audit:
                     f"from upstream to {shown_url}", raw=url),
                     ("sm-changed", sub_path, url))
             elif upstream is None:
+                # Blocking: a github.com URL may still be a private repository.
                 self._emit(Finding(
-                    "submodule-added", SEVERITY_INFO, shown_ref, ".gitmodules", None,
+                    "submodule-added", SEVERITY_HIGH, shown_ref, ".gitmodules", None,
                     f"submodule {self.redactor.scrub(sub_path)} not present upstream: "
-                    f"{shown_url}", raw=url), ("sm-added", sub_path, url))
+                    f"{shown_url}; verify the repository is public, then allowlist "
+                    "it", raw=url, context=f"{sub_path} {url}"),
+                    ("sm-added", sub_path, url))
         for mode, _, gsha, path in tree:
             if mode != "160000":
                 continue
@@ -783,9 +1170,10 @@ class Audit:
                     "gitlink without a .gitmodules entry"), ("sm-unmapped", path))
             elif base_gitlinks.get(path) not in (None, gsha):
                 self._emit(Finding(
-                    "submodule-commit-changed", SEVERITY_INFO, shown_ref, shown, None,
+                    "submodule-commit-changed", SEVERITY_MEDIUM, shown_ref, shown, None,
                     f"gitlink moved to {self._short(gsha)}; verify it is published "
-                    "in the submodule's public repository"),
+                    "in the submodule's public repository, then allowlist it",
+                    raw=gsha, context=f"{path} {gsha}"),
                     ("sm-commit", path, gsha))
 
     def _apply_allowlist(self) -> None:
@@ -807,6 +1195,7 @@ class Audit:
             by_kind[f.kind] = by_kind.get(f.kind, 0) + 1
         return {
             **self.stats,
+            "upstream_verified": self.upstream_verified,
             "findings": len(self.findings),
             "blocking": len(self.blocking()),
             "accepted": sum(1 for f in self.findings if f.accepted),
@@ -836,6 +1225,11 @@ def render_human(audit: Audit) -> str:
     lines.append(
         f"upstream ancestry: {s['upstream_ancestry_commits']} commits "
         "(not scanned for introduced content)")
+    if s["upstream_verified"]:
+        lines.append(f"upstream: base is published in {s['upstream_verified']}")
+    else:
+        lines.append("upstream: NOT verified (no upstream remote configured; "
+                     "see --upstream-remote)")
     lines.append(
         f"findings={s['findings']} blocking={s['blocking']} "
         f"accepted={s['accepted']} info={s['info']}")
@@ -850,6 +1244,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                         help="upstream base commit the published refs build on")
     parser.add_argument("--ref", action="append", default=[],
                         help="ref to audit (repeatable; default: HEAD, branches, tags)")
+    parser.add_argument("--upstream-remote", default="upstream",
+                        help="remote whose remote-tracking refs must contain --base "
+                             "when it is configured (default: upstream; '' skips)")
     parser.add_argument("--private-strings", type=Path, default=None)
     parser.add_argument("--allowlist", type=Path, default=DEFAULT_ALLOWLIST)
     parser.add_argument("--json", action="store_true")
@@ -864,7 +1261,8 @@ def main(argv: list[str] | None = None) -> int:
             raise AuditError(f"{repo} is not a git repository")
         private = load_private_strings(args.private_strings, repo)
         allowlist = load_allowlist(args.allowlist)
-        audit = Audit(repo, args.base, args.ref, private, allowlist)
+        audit = Audit(repo, args.base, args.ref, private, allowlist,
+                      upstream_remote=args.upstream_remote)
         audit.run()
     except AuditError as exc:
         print(f"audit-public: error: {exc}", file=sys.stderr)

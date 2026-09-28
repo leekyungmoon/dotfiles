@@ -12,7 +12,7 @@
     "python_bytecode": "${XDG_CACHE_HOME:-$HOME/.cache}/nvim/pycache (UltiSnips python host)",
     "xdg_rule": "an XDG_* value that is unset or not absolute falls back to the default",
     "tools_bin": "${XDG_DATA_HOME:-$HOME/.local/share}/personal-dotfiles/bin (first on $PATH via zsh/zshenv)",
-    "nvim_python_host": "${XDG_DATA_HOME:-$HOME/.local/share}/personal-dotfiles/venvs/nvim/bin/python (g:python3_host_prog when present)",
+    "nvim_python_host": "python3 on PATH (/usr/bin/python3 with apt python3-pynvim), unless $PYTHON3_HOST_PROG is set; no virtualenv is created",
     "staging": "${XDG_DATA_HOME:-$HOME/.local/share}/personal-dotfiles/staging (scratch clones only)"
   },
   "scan": {
@@ -1164,10 +1164,12 @@
     {
       "id": "p10k-configure",
       "entrypoint": "user-invoked `p10k configure`",
-      "before": "writes ~/.p10k.zsh and, only after an interactive confirmation, appends a source line to ~/.zshrc; with ~/.zshrc linked to tracked zsh/zshrc that would edit tracked source",
-      "after": "covered by shell-rc-appenders: once ~/.zshrc is a machine-owned copy, an accepted append lands in that copy, never in tracked zsh/zshrc",
-      "status": "installer-delegation",
-      "owner": "integrator (manifests/managed-paths.json)"
+      "before": "writes ~/.p10k.zsh and, only after an interactive confirmation, appends a source line to ~/.zshrc",
+      "after": "unchanged. ~/.p10k.zsh lands in HOME, outside the checkout. ~/.zshrc is a symlink to tracked zsh/zshrc (upstream layout, see shell-rc-appenders), so an accepted append edits zsh/zshrc in ~/.dotfiles: decline it, or move the line to ~/.zshrc.local",
+      "status": "in-checkout-accepted",
+      "managed_paths": {
+        "zshrc": "symlink"
+      }
     },
     {
       "id": "fasd-data",
@@ -1178,11 +1180,10 @@
     },
     {
       "id": "fzf-clone",
-      "entrypoint": "legacy install.py post-action, vim-plug Plug 'junegunn/fzf' {'dir': '~/.fzf'}; formerly zshrc sourced ~/.fzf.zsh and prepended ~/.fzf/bin",
+      "entrypoint": "legacy install.py post-action, vim-plug Plug 'junegunn/fzf' {'dir': '~/.fzf'} and the lazy.nvim spec with dir='~/.fzf' + build './install --all'; formerly zshrc sourced ~/.fzf.zsh and prepended ~/.fzf/bin",
       "before": "~/.fzf clone plus `./install --all --no-update-rc` (writes ~/.fzf.zsh/~/.fzf.bash, never ~/.zshrc)",
-      "after": "zshrc evaluates `fzf --zsh` from the fzf on $PATH (the installer's pinned fzf, first on $PATH via zshenv) and no longer reads ~/.fzf; an existing ~/.fzf clone is left alone (outside the checkout)",
+      "after": "zshrc evaluates `fzf --zsh` from the fzf on $PATH (the installer's pinned fzf, first on $PATH via zshenv) and no longer reads ~/.fzf; vim-plug and lazy.nvim load junegunn/fzf as a plain plugin from the shared plugin root, with no build step, and its fzf#exec() finds the pinned binary on $PATH, so nvim no longer warns that ~/.fzf is missing; an existing ~/.fzf clone is left alone (outside the checkout)",
       "status": "outside-checkout",
-      "owner": "installer lane (bin/dotfiles, install.py, etc/*)",
       "checks": [
         {
           "file": "zsh/zshrc",
@@ -1198,6 +1199,17 @@
           "file": "zsh/zshenv",
           "require": [
             "personal-dotfiles/bin"
+          ]
+        },
+        {
+          "file": "nvim/lua/plugins/ui.lua",
+          "require": [
+            "Plug 'junegunn/fzf' \\{"
+          ],
+          "forbid": [
+            "~/\\.fzf",
+            "\\$HOME/\\.fzf",
+            "\\./install --all"
           ]
         }
       ]
@@ -1363,26 +1375,51 @@
     {
       "id": "dotfiles-update",
       "entrypoint": "bin/dotfiles update [--fast|--skip-zplug|--skip-vimplug]",
-      "before": "cd ~/.dotfiles; git fetch origin; git stash push; git merge --ff-only; python3 install.py; git stash pop (direct mutation of the live checkout)",
-      "after": "must delegate to the installer update transaction (staged fetch, verification, promotion, rollback)",
-      "status": "installer-delegation",
-      "owner": "installer lane (bin/dotfiles, install.py, etc/*)"
+      "before": "cd ~/.dotfiles; git fetch origin; git stash push; git merge --ff-only; python3 install.py; git stash pop (applied whatever stash was newest)",
+      "after": "upstream-style, in place in ~/.dotfiles (kept by decision): git fetch origin; tracked edits are stashed and the entry this run created is identified by the stash reflog; git merge --ff-only; git submodule update --init --recursive; python3 -B install.py; that entry is re-applied by commit id and dropped. If it conflicts, a checkout that was clean is reset to the updated commit, the entry stays in the stash, recovery steps are printed and the exit status is 3",
+      "status": "in-checkout-accepted",
+      "checks": [
+        {
+          "file": "bin/dotfiles",
+          "require": [
+            "git merge --ff-only",
+            "git stash apply --index -q \"\\$stash\""
+          ],
+          "forbid": [
+            "git stash pop"
+          ]
+        }
+      ]
     },
     {
       "id": "dotfiles-install",
       "entrypoint": "bin/dotfiles install <target> [--force]",
       "before": "runs ./etc/linux-locals.sh install_<target> with cwd ~/.dotfiles; writes ~/.local and ${TMPDIR:-/tmp}/$USER/linux-locals, not the checkout",
-      "after": "must delegate to the installer package phase for manifest-allowed targets only",
-      "status": "installer-delegation",
-      "owner": "installer lane (bin/dotfiles, install.py, etc/*)"
+      "after": "delegates to `install.py packages --only <tool>` for tools listed in manifests/tools.json; writes ~/.local/share/personal-dotfiles/tools and ~/.local/bin links, not the checkout",
+      "status": "redirected",
+      "checks": [
+        {
+          "file": "bin/dotfiles",
+          "require": [
+            "args = \\['packages', '--only', t\\]"
+          ]
+        }
+      ]
     },
     {
       "id": "dotfiles-repair",
       "entrypoint": "bin/dotfiles repair (referenced by zsh/zshrc and tmux/tmux.conf messages)",
-      "before": "does not exist yet",
-      "after": "must restore the installed generation's declared pins: checkout submodules (antidote, fasd, vim-plug) and the external TPM + tmux plugins, without upgrading",
-      "status": "installer-delegation",
-      "owner": "installer lane (bin/dotfiles, install.py, etc/*)"
+      "before": "did not exist upstream",
+      "after": "delegates to `install.py repair`, which reapplies this checkout like install without pulling: submodules at the checked-out pins (initialised if missing), managed paths, tmux plugins at pinned commits",
+      "status": "redirected",
+      "checks": [
+        {
+          "file": "bin/dotfiles",
+          "require": [
+            "args = \\['repair'\\]"
+          ]
+        }
+      ]
     },
     {
       "id": "legacy-install-py",
@@ -1410,10 +1447,9 @@
     {
       "id": "gitconfig-global-writes",
       "entrypoint": "`git config --global ...` (user.name/email, credential helpers, `gh auth setup-git`, IDEs, git-lfs install)",
-      "before": "~/.gitconfig -> <checkout>/git/gitconfig (link): every --global write edits the tracked file",
-      "after": "~/.gitconfig is a regular, machine-owned file installed from git/gitconfig.stub; it [include]s ~/.dotfiles/git/gitconfig, so --global writes land in the stub; identity goes to ~/.gitconfig.secret (included at the end of git/gitconfig)",
-      "status": "installer-delegation",
-      "owner": "integrator (manifests/managed-paths.json): gitconfig entry symlink git/gitconfig -> copy git/gitconfig.stub; install only when absent or still the old link, never overwrite a stub the user or tools edited",
+      "before": "~/.gitconfig -> <checkout>/git/gitconfig (link): every --global write edited the tracked file",
+      "after": "~/.gitconfig is a regular, machine-owned 'copy' of git/gitconfig.stub that [include]s ~/.dotfiles/git/gitconfig, so --global writes land in the copy; identity goes to ~/.gitconfig.secret (included at the end of git/gitconfig). A copy that changed since the installer last wrote it is kept on update/repair/install and reported as kept; `install.py -f` backs it up and writes a fresh copy",
+      "status": "redirected",
       "checks": [
         {
           "file": "git/gitconfig.stub",
@@ -1427,32 +1463,71 @@
           "require": [
             "path = ~/\\.gitconfig\\.secret"
           ]
+        },
+        {
+          "file": "installer/transaction.py",
+          "require": [
+            "force: bool = False",
+            "kept: list\\[str\\]"
+          ]
         }
-      ]
+      ],
+      "managed_paths": {
+        "gitconfig": "copy"
+      }
     },
     {
       "id": "shell-rc-appenders",
       "entrypoint": "tool installers and init commands that append to rc files: `conda init`, nvm/rustup/pixi/bun/uv installers, `p10k configure`, `fzf/install`, `broot --install`",
-      "before": "~/.zshrc, ~/.zshenv, ~/.zprofile, ~/.bashrc link to zsh/zshrc, zsh/zshenv, zsh/zprofile, bashrc: appends edit tracked source",
-      "after": "integrator installs these rc files as 'copy' entries (transaction backup/restore on update), so appends stay machine-local; local additions belong in ~/.zshrc.local / ~/.zshenv.local, which zshrc/zshenv source",
-      "status": "installer-delegation",
-      "owner": "integrator (manifests/managed-paths.json): zshrc, zshenv, zprofile, bashrc entries symlink -> copy"
+      "before": "~/.zshrc, ~/.zshenv, ~/.zprofile, ~/.bashrc link to zsh/zshrc, zsh/zshenv, zsh/zprofile, bashrc",
+      "after": "unchanged (upstream layout, kept by decision): the rc files stay symlinks into the checkout, so an appender edits tracked source in ~/.dotfiles. `git -C ~/.dotfiles status` shows it; `dotfiles update` stashes it around the fast-forward and re-applies it (on a conflict it stays in the stash). Machine-local lines belong in ~/.zshrc.local, ~/.zshenv.local and ~/.bashrc.local, which zshrc, zshenv and bashrc source",
+      "status": "in-checkout-accepted",
+      "managed_paths": {
+        "zshrc": "symlink",
+        "zshenv": "symlink",
+        "zprofile": "symlink",
+        "bashrc": "symlink"
+      },
+      "checks": [
+        {
+          "file": "zsh/zshrc",
+          "require": [
+            "source \"\\$\\{ZDOTDIR:-\\$HOME\\}/\\.zshrc\\.local\""
+          ]
+        },
+        {
+          "file": "zsh/zshenv",
+          "require": [
+            "source \"\\$HOME/\\.zshenv\\.local\""
+          ]
+        },
+        {
+          "file": "bashrc",
+          "require": [
+            "source \"\\$HOME/\\.bashrc\\.local\""
+          ]
+        }
+      ]
     },
     {
       "id": "pudb-config",
       "entrypoint": "pudb (preferences dialog; rewrites the file when saving settings or after a version change)",
-      "before": "~/.config/pudb/pudb.cfg -> <checkout>/config/pudb/pudb.cfg (link): rewrites edit tracked source",
-      "after": "integrator installs pudb.cfg as a 'copy' entry",
-      "status": "installer-delegation",
-      "owner": "integrator (manifests/managed-paths.json): pudb entry symlink -> copy"
+      "before": "~/.config/pudb/pudb.cfg -> <checkout>/config/pudb/pudb.cfg (link): rewrites edited tracked source",
+      "after": "~/.config/pudb/pudb.cfg is a 'copy' of config/pudb/pudb.cfg, so pudb's rewrites stay machine-local; a copy pudb changed is kept on update (install.py -f overwrites it after a backup)",
+      "status": "redirected",
+      "managed_paths": {
+        "pudb": "copy"
+      }
     },
     {
       "id": "terminator-config",
       "entrypoint": "Terminator Preferences dialog (saves ~/.config/terminator/config)",
-      "before": "~/.config/terminator -> <checkout>/config/terminator (directory link): saves edit tracked config/terminator/config",
-      "after": "integrator installs config/terminator/config as a 'copy' of the file (not a directory link)",
-      "status": "installer-delegation",
-      "owner": "integrator (manifests/managed-paths.json): terminator entry symlink(dir) -> copy {config}/terminator/config"
+      "before": "~/.config/terminator -> <checkout>/config/terminator (directory link): saves edited tracked config/terminator/config",
+      "after": "~/.config/terminator/config is a 'copy' of config/terminator/config (a file, not a directory link), so Preferences saves stay machine-local; a copy Terminator changed is kept on update (install.py -f overwrites it after a backup)",
+      "status": "redirected",
+      "managed_paths": {
+        "terminator-config": "copy"
+      }
     },
     {
       "id": "python-bytecode-checkout",

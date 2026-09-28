@@ -23,20 +23,11 @@ return {
   };
 
   -- FZF & Grep
+  -- Only the Vim plugin half of fzf, from the plugin root like any other
+  -- plugin (no build step): fzf#exec() uses the pinned, verified fzf binary
+  -- that the installer puts on $PATH, so no separate fzf clone is needed.
   Plug 'junegunn/fzf' {
     name = 'fzf',
-    dir = '~/.fzf',
-    enabled = (function()
-      if vim.fn.isdirectory(vim.fn.expand("$HOME/.fzf")) == 0 then
-        local msg = "~/.fzf not found. Please run `dotfiles update`"
-        vim.defer_fn(function()
-          vim.notify(msg, vim.log.levels.WARN, { title = "plugins.ui", markdown = true })
-        end, 100) -- nvim-notify might be not ready yet
-        return false
-      end
-      return true
-    end)(),
-    build = './install --all --no-update-rc',
     cmd = 'FZF', func = 'fzf#*',
   };
   Plug 'ibhagwan/fzf-lua' {

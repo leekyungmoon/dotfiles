@@ -31,6 +31,23 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 MANIFEST_PATH = REPO_ROOT / "manifests" / "runtime-references.json"
+MANAGED_PATHS = REPO_ROOT / "manifests" / "managed-paths.json"
+
+WRITER_STATUSES = {
+    "redirected", "outside-checkout", "installer-delegation",
+    "pending-owner-change", "open-question", "inert",
+    # writes into the checkout on purpose (upstream layout, a user decision);
+    # the entry must say how the change shows up and where local lines go
+    "in-checkout-accepted",
+}
+# Wording in a writer's after/owner text that claims how a managed path is
+# installed; such a writer must state the claim in "managed_paths" so it is
+# checked against managed-paths.json.
+_INSTALL_CLAIM = re.compile(
+    r"'(?:copy|symlink)'|\bcopy of\b|\bcopied\b|\bsymlinks? (?:into|to)\b"
+    r"|managed-paths\.json|\bstay symlinks\b")
+# A pending transition written as if it were the state ("symlink -> copy").
+_TRANSITION = re.compile(r"\b(?:symlink|link|copy)(?:\(dir\))?\s*->\s*(?:copy|symlink)\b")
 
 # Each kind of reference the audit looks for. A line may match several kinds;
 # each (line, kind) pair must be covered by its own manifest entry.
@@ -360,11 +377,58 @@ class RuntimeWriterAuditTests(unittest.TestCase):
                 ids.add(writer["id"])
                 for field in ("entrypoint", "before", "after", "status"):
                     self.assertTrue(str(writer.get(field, "")).strip(), field)
-                self.assertIn(writer["status"], {
-                    "redirected", "outside-checkout", "installer-delegation",
-                    "pending-owner-change", "open-question", "inert"})
+                self.assertIn(writer["status"], WRITER_STATUSES)
                 if writer["status"] in {"installer-delegation", "pending-owner-change"}:
                     self.assertTrue(writer.get("owner", "").strip(), "owner is required")
+
+    def test_managed_path_claims_match_manifest(self):
+        """What a writer says about how a path is installed is the truth.
+
+        Every "managed_paths" claim ({id: kind}) must match
+        manifests/managed-paths.json, a writer whose after/owner text talks
+        about how paths are installed must carry such claims, the text must
+        agree with them ('copy' appears exactly when a claimed kind is copy),
+        and no pending transition may be written as the current state.
+        """
+        with MANAGED_PATHS.open(encoding="utf-8") as handle:
+            kinds = {e["id"]: e["kind"] for e in json.load(handle)["entries"]}
+        claimed_any = False
+        for writer in self.manifest["writers"]:
+            text = " ".join(str(writer.get(k, "")) for k in ("after", "owner"))
+            claims = writer.get("managed_paths")
+            with self.subTest(writer=writer["id"]):
+                self.assertNotRegex(" ".join(str(writer.get(k, "")) for k in
+                                             ("before", "after", "owner", "notes")),
+                                    _TRANSITION, "state the current layout, not a "
+                                    "pending change")
+                if claims is None:
+                    self.assertNotRegex(text, _INSTALL_CLAIM,
+                                        "describes how paths are installed; add "
+                                        "managed_paths so it is checked")
+                    continue
+                claimed_any = True
+                self.assertIsInstance(claims, dict)
+                self.assertTrue(claims)
+                for entry_id, kind in claims.items():
+                    self.assertIn(entry_id, kinds, "unknown managed id")
+                    self.assertEqual(kinds[entry_id], kind,
+                                     f"{entry_id} is installed as {kinds[entry_id]!r}")
+                self.assertEqual("'copy'" in writer["after"],
+                                 "copy" in claims.values(),
+                                 "after text and managed_paths disagree about copies")
+        self.assertTrue(claimed_any)
+
+    def test_rc_files_are_documented_as_symlinks(self):
+        """TQ-6: the rc files are symlinks into the checkout; the inventory
+        must not claim appends to them stay machine-local copies."""
+        writers = {w["id"]: w for w in self.manifest["writers"]}
+        rc = writers["shell-rc-appenders"]
+        self.assertEqual(rc["status"], "in-checkout-accepted")
+        self.assertEqual(set(rc["managed_paths"]), {"zshrc", "zshenv", "zprofile", "bashrc"})
+        self.assertEqual(set(rc["managed_paths"].values()), {"symlink"})
+        copies = {i for w in self.manifest["writers"]
+                  for i, k in w.get("managed_paths", {}).items() if k == "copy"}
+        self.assertEqual(copies, {"gitconfig", "pudb", "terminator-config"})
 
     def test_writer_markers(self):
         for writer in self.manifest["writers"]:

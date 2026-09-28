@@ -35,6 +35,10 @@ These come from the package manifests (`manifests/packages.json`,
 | GNOME Shell | 42 | 46 |
 | python3 | 3.10 | 3.12 |
 | `Super+Ctrl+1..9` (open new app window) | not available, skipped as not-applicable | managed |
+| `Ctrl+Super+Left/Right` tab chord (input-remapper preset) | not available: input-remapper 1.4 cannot express it, so no preset is written; `status` shows it as `PENDING_GUI` (`input-remapper-1.4-cannot-express-intent`) and it is never retried | managed |
+
+On 22.04 the "input-remapper tabs" column therefore records whether the
+installer reports the chord as unavailable, not whether the chord works.
 
 ### tmux 3.2a on 22.04
 

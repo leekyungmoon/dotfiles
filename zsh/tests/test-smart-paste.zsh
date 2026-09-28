@@ -133,6 +133,12 @@ _zsh_highlight() {
 typeset test_root
 test_root=$(mktemp -d "${TMPDIR:-/tmp}/smart-paste.XXXXXXXX")
 trap 'rm -rf -- "$test_root"' EXIT HUP INT TERM
+# Hermetic: nothing below (including the `script`/`zsh -dfi` probe) may see
+# the runner's home directory or its per-user tool settings.
+export HOME=$test_root/home
+export XDG_CONFIG_HOME=$HOME/.config XDG_DATA_HOME=$HOME/.local/share
+export XDG_CACHE_HOME=$HOME/.cache XDG_STATE_HOME=$HOME/.local/state
+mkdir -p -- "$HOME"
 mkdir -p -- "$test_root/reviews"
 : >| "$test_root/reviews/ai-code-review.md"
 : >| "$test_root/existing-prefix"
@@ -280,22 +286,6 @@ assert_repair_widget_success() {
         print -u2 -r -- "  expected: ${(qqq)expected}"
         print -u2 -r -- "  actual:   ${(qqq)BUFFER}"
         print -u2 -r -- "  ZLE calls: ${(qqq)actual_calls}"
-        (( ++failures ))
-    fi
-}
-
-assert_raw_output_mode_false() {
-    local config=$HOME/.codex/config.toml
-    (( ++assertions ))
-
-    if ! command python3 -c \
-        'import pathlib, sys, tomllib
-p = pathlib.Path(sys.argv[1])
-d = tomllib.loads(p.read_text())
-if d.get("tui", {}).get("raw_output_mode") is not False:
-    raise SystemExit(1)' \
-        "$config"; then
-        print -u2 -r -- 'FAIL: tui.raw_output_mode must parse as false'
         (( ++failures ))
     fi
 }
@@ -502,7 +492,6 @@ for context in cont select vared; do
 done
 
 assert_interactive_install
-assert_raw_output_mode_false
 assert_delegate_failure_propagates 'delegate failure at empty primary prompt' \
     '' 0 start $'```sh\nprintf should-stay-raw\n```'
 assert_delegate_failure_propagates 'delegate failure at nonempty prompt' \
