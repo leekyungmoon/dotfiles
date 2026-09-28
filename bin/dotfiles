@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 '''
-   @wookayin's              ███████╗██╗██╗     ███████╗███████╗
+   @leekyungmoon's          ███████╗██╗██╗     ███████╗███████╗
    ██████╗  █████╗ ████████╗██╔════╝██║██║     ██╔════╝██╔════╝
    ██╔══██╗██╔══██╗╚══██╔══╝█████╗  ██║██║     █████╗  ███████╗
    ██║  ██║██║  ██║   ██║   ██╔══╝  ██║██║     ██╔══╝  ╚════██║
@@ -10,20 +10,34 @@
    ╚═════╝  ╚════╝    ╚═╝   ╚═╝     ╚═╝╚══════╝╚══════╝╚══════╝
 
 bin/dotfiles -- a command-line helper for managing dotfiles
-https://dotfiles.wook.kr
+https://github.com/leekyungmoon/dotfiles
 '''
 
 from __future__ import print_function
 
+import sys
+sys.dont_write_bytecode = True
+
 import functools
-import platform
 import subprocess
 import collections
+import json
+import os
 import os.path
-import sys
+
+
+def _colors_enabled():
+    if 'NO_COLOR' in os.environ:
+        return False
+    try:
+        return sys.stdout.isatty()
+    except (AttributeError, ValueError):
+        return False
 
 
 def _wrap_colors(ansicode):
+    if not _colors_enabled():
+        return (lambda msg: str(msg))
     return (lambda msg: ansicode + str(msg) + '\033[0m')
 GRAY   = _wrap_colors("\033[0;37m")
 WHITE  = _wrap_colors("\033[1;37m")
@@ -48,15 +62,49 @@ def add_argument(*args, **kwargs):
 
 ###############################################################################################
 
+GITHUB_URL = "https://github.com/leekyungmoon/dotfiles"
+
+
+def _dotfiles_dir():
+    return os.path.expanduser('~/.dotfiles')
+
+
+def _python():
+    return sys.executable or 'python3'
+
+
+def _installer(*args):
+    '''Delegate to ~/.dotfiles/install.py (bytecode off: nothing lands in the checkout).'''
+    dotfiles_dir = _dotfiles_dir()
+    return subprocess.call([_python(), '-B', os.path.join(dotfiles_dir, 'install.py')]
+                           + list(args), cwd=dotfiles_dir)
+
+
+def _unknown(argv):
+    if argv:
+        print(RED('Unknown arguments: ' + ' '.join(argv)))
+        return 2
+    return 0
+
+
 @add_argument('--fast', action='store_true', help='Skip all slow updates (zsh/vim plugins)')
 @add_argument('--skip-zplug', action='store_true', help='Skip updating zsh plugins (antidote)')
-@add_argument('--skip-vimplug', action='store_true', help='Skip updating vim plugins (vim-plug)')
+@add_argument('--skip-vimplug', action='store_true', help='Skip updating vim plugins (lazy.nvim)')
+@add_argument('--no-packages', action='store_true', help='Skip apt packages and pinned tools')
+@add_argument('--no-gui', action='store_true', help='Skip desktop (GNOME) settings')
+@add_argument('--no-shell-change', action='store_true', help='Do not run chsh')
 def update(fast=False,
            skip_zplug=False,
-           skip_vimplug=False):
+           skip_vimplug=False,
+           no_packages=False,
+           no_gui=False,
+           no_shell_change=False,
+           argv=()):
     '''Update the dotfiles from github.'''
 
-    dotfiles_dir = os.path.expanduser('~/.dotfiles')
+    if _unknown(argv):
+        return 2
+    dotfiles_dir = _dotfiles_dir()
 
     def _git_head():
         ret = subprocess.check_output('git rev-parse --short HEAD',
@@ -67,27 +115,34 @@ def update(fast=False,
 
     git_old_head = _git_head()
 
-    install_args = set()
-    if skip_zplug: install_args.add("--skip-zplug")
-    if skip_vimplug: install_args.add("--skip-vimplug")
-    if fast: install_args.update(["--skip-zplug", "--skip-vimplug"])
+    install_args = []
+    if skip_zplug or fast: install_args.append("--skip-zplug")
+    if skip_vimplug or fast: install_args.append("--skip-vimplug")
+    if no_packages: install_args.append("--no-packages")
+    if no_gui: install_args.append("--no-gui")
+    if no_shell_change: install_args.append("--no-shell-change")
     install_args = ' '.join(install_args)
 
-    # TODO: check if current branch is master
+    # Tracked local edits are stashed around the fast-forward and put back
+    # afterwards (untracked files are left alone); a diverged history is
+    # refused by --ff-only rather than merged or reset.
     action = '''#!/bin/bash
         set -e
         set -x
         ret=0
-        cd ~/.dotfiles
         git fetch origin
-        git stash push -m "DOTFILES_UPDATE"
+        stashed=0
+        if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
+            git stash push -m "DOTFILES_UPDATE" && stashed=1
+        fi
         git merge --ff-only && \
-            python3 install.py %s || { ret=$?; }
-        git stash list | grep "DOTFILES_UPDATE" && git stash pop --index -q
+            git submodule update --init --recursive && \
+            %s -B install.py %s || { ret=$?; }
+        if [ "$stashed" = 1 ]; then git stash pop --index -q; fi
         exit $ret;
-    ''' % install_args
+    ''' % (_python(), install_args)
 
-    ret = subprocess.call(['bash', '-c', action])
+    ret = subprocess.call(['bash', '-c', action], cwd=dotfiles_dir)
     git_new_head = _git_head()
 
     if ret != 0:
@@ -97,56 +152,71 @@ def update(fast=False,
     else:
         print(GREEN('[*] Update complete!'))
         print(WHITE('Changelog: {}..{}'.format(git_old_head, git_new_head)))
-        subprocess.call('git log --pretty=oneline --abbrev-commit {}..{}'\
+        sys.stdout.flush()
+        subprocess.call('git log --pretty=oneline --abbrev-commit {}..{}'
                         .format(git_old_head, git_new_head),
                         shell=True, cwd=dotfiles_dir)
+    return ret
 
 
-def open_github():
+def open_github(argv=()):
     '''Open the github repository in the web browser.'''
 
     import webbrowser
-    webbrowser.open("https://dotfiles.wook.kr", new=0)
+    try:
+        opened = webbrowser.open(GITHUB_URL, new=0)
+    except Exception:
+        opened = False
+    if not opened:
+        print(GITHUB_URL)
 
 
-@add_argument('target', nargs='*', help='target package to install, see ~/.dotfiles/etc/linux-locals.sh for list')
+def _available_packages():
+    '''Pinned tools from manifests/tools.json (installed without sudo).'''
+    path = os.path.join(_dotfiles_dir(), 'manifests', 'tools.json')
+    try:
+        with open(path) as f:
+            tools = json.load(f).get('tools', {})
+    except (OSError, ValueError, AttributeError):
+        return []
+    if isinstance(tools, dict):
+        return list(tools)
+    return [t.get('name') for t in tools if isinstance(t, dict) and t.get('name')]
+
+
+@add_argument('target', nargs='*', help='pinned tool to install, see ~/.dotfiles/manifests/tools.json for list')
 @add_argument('--force', action='store_true')
-def install_local(target, force, argv=[]):
+def install_local(target, force=False, argv=()):
     '''
-    Install local packages as specified in /etc/linux-locals.sh.
+    Install pinned tools from manifests/tools.json into ~/.local (without sudo).
     Available only in Linux.
     '''
 
-    if platform.system() != 'Linux':
+    if not sys.platform.startswith('linux'):
         print("Error: only available on linux systems.")
-        if platform.system() == 'Darwin':
-            print("On macOS, try " + YELLOW("brew install <package>")
-                  + " instead (https://brew.sh/)")
         sys.exit(1)
 
     if not isinstance(target, (list, tuple)):
         target = [target]
 
-    dotfiles_dir = os.path.expanduser('~/.dotfiles')
-
+    packages = _available_packages()
     if not target:
-        ret = subprocess.check_output('./etc/linux-locals.sh || true',
-                                      shell=True, cwd=dotfiles_dir)
-        if not isinstance(ret, str): ret = ret.decode()
         print("Available packages:")
-        packages = [l[8:] for l in ret.split() if l.startswith('install_')]
         print('\n'.join(['- {l}'.format(l=l) for l in packages]))
         return 1
+    if _unknown(argv):
+        return 2
+    unknown = [t for t in target if t not in packages]
+    if unknown:
+        print(RED('Unknown package(s), nothing was changed: ' + ', '.join(unknown)))
+        print('Available packages: ' + ', '.join(packages))
+        return 2
 
     for t in target:
-        ret = subprocess.call(
-            './etc/linux-locals.sh install_{target} {force_flag} {flag}'.format(
-                target=t,
-                force_flag='--force' if force else '',
-                flag=' '.join(argv)   # TODO: shlex (python 3+)
-            ),
-            shell=True, cwd=dotfiles_dir
-        )
+        args = ['packages', '--only', t]
+        if force:
+            args.append('--force')
+        ret = _installer(*args)
 
         if ret != 0: # error
             return ret
@@ -157,11 +227,72 @@ def install_local(target, force, argv=[]):
           WHITE("`exec zsh`") + \
           GREEN(" to reflect changes in PATH."))
 
+
+@add_argument('--json', action='store_true', help='Machine-readable output')
+def status(json=False, argv=()):
+    '''Show the installed generation, last run and drift (install.py status).'''
+
+    if _unknown(argv):
+        return 2
+    return _installer('status', *(['--json'] if json else []))
+
+
+@add_argument('--baseline', action='store_true', help='Restore the state before the first install')
+@add_argument('--run', metavar='RUN_ID', help='Restore the state before the given run')
+@add_argument('-f', '--force', action='store_true', help='Also restore paths changed since the last install')
+@add_argument('--id', dest='ids', action='append', metavar='ID', help='Only this managed entry (repeatable)')
+def restore(baseline=False, run=None, force=False, ids=None, argv=()):
+    '''Restore managed paths from the installer backups (install.py restore).'''
+
+    if _unknown(argv):
+        return 2
+    args = ['restore']
+    if baseline: args.append('--baseline')
+    if run: args += ['--run', run]
+    if force: args.append('--force')
+    for i in ids or []:
+        args += ['--id', i]
+    return _installer(*args)
+
+
+@add_argument('--skip-zplug', action='store_true', help='Skip updating zsh plugins')
+@add_argument('--skip-vimplug', action='store_true', help='Skip updating vim plugins')
+@add_argument('--no-packages', action='store_true', help='Skip apt packages and pinned tools')
+@add_argument('--no-gui', action='store_true', help='Skip desktop (GNOME) settings')
+@add_argument('--no-shell-change', action='store_true', help='Do not run chsh')
+def repair(skip_zplug=False, skip_vimplug=False, no_packages=False, no_gui=False,
+           no_shell_change=False, argv=()):
+    '''Reapply ~/.dotfiles without pulling (install.py repair).'''
+
+    if _unknown(argv):
+        return 2
+    args = ['repair']
+    if skip_zplug: args.append('--skip-zplug')
+    if skip_vimplug: args.append('--skip-vimplug')
+    if no_packages: args.append('--no-packages')
+    if no_gui: args.append('--no-gui')
+    if no_shell_change: args.append('--no-shell-change')
+    return _installer(*args)
+
+
+@add_argument('--autostart', action='store_true', help='Bounded login-time retry mode (used by the autostart entry)')
+def gui_apply(autostart=False, argv=()):
+    '''Apply pending GNOME settings now (install.py gui-apply).'''
+
+    if _unknown(argv):
+        return 2
+    return _installer('gui-apply', *(['--autostart'] if autostart else []))
+
+
 def main():
     COMMANDS = {
         'update': update,
         'github': open_github,
         'install' : install_local,
+        'status': status,
+        'restore': restore,
+        'repair': repair,
+        'gui-apply': gui_apply,
     }
     for fn in COMMANDS.values():
         fn.__doc__ = fn.__doc__.strip()
@@ -185,6 +316,9 @@ def main():
 
     kwargs = vars(args)
     command = kwargs.pop('command')
+    if command is None:
+        parser.print_help()
+        sys.exit(1)
     if unknown:
         kwargs['argv'] = unknown
     ret = COMMANDS[command](**kwargs)
