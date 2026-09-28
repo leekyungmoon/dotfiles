@@ -92,8 +92,8 @@ the install.
 
 ## Copies you changed are kept
 
-`~/.gitconfig`, `~/.config/pudb/pudb.cfg`, `~/.config/terminator/config`
-and the systemd user units are **copies**, not links. When one of them has
+`~/.gitconfig`, `~/.config/pudb/pudb.cfg` and the systemd user units are
+**copies**, not links. When one of them has
 drifted — `git config --global ...`, `gh auth setup-git`, an application
 saving its preferences, a hand edit — `dotfiles update`, `dotfiles repair`
 and `python3 ~/.dotfiles/install.py` leave it as it is and report

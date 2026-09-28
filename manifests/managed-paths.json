@@ -124,12 +124,11 @@
       "source": "config/ghostty"
     },
     {
-      "id": "terminator-config",
-      "dest": "{config}/terminator/config",
-      "kind": "copy",
-      "source": "config/terminator/config",
-      "mode": "0644",
-      "description": "copied: terminator rewrites its config file"
+      "id": "terminator",
+      "dest": "{config}/terminator",
+      "kind": "symlink",
+      "source": "config/terminator",
+      "description": "directory link, as upstream: an earlier upstream-style install already has exactly this link"
     },
     {
       "id": "pudb",

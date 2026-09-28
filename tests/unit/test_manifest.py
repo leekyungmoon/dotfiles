@@ -158,7 +158,7 @@ class ValidManifestTests(ManifestTestCase):
 
         manifest = mf.load_manifest(REPO_ROOT / "manifests" / "managed-paths.json")
         kinds = {e.id: e.kind for e in manifest.entries}
-        for entry_id in ("gitconfig", "terminator-config", "pudb"):
+        for entry_id in ("gitconfig", "pudb"):
             with self.subTest(entry_id=entry_id):
                 self.assertEqual(kinds.get(entry_id), "copy")
         for entry in manifest.entries:

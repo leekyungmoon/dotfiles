@@ -1041,6 +1041,14 @@
       "classification": "runtime-link",
       "purpose": "user-facing hint naming the restore command in the ~/.dotfiles checkout",
       "count": 1
+    },
+    {
+      "file": "install.py",
+      "line": "f\"`python3 ~/.dotfiles/install.py --{option.replace('_', '-')}` \"",
+      "kind": "link",
+      "classification": "runtime-link",
+      "purpose": "user-facing hint: how to install a skipped AI CLI later from the ~/.dotfiles checkout",
+      "count": 1
     }
   ],
   "writers": [
@@ -1523,10 +1531,10 @@
       "id": "terminator-config",
       "entrypoint": "Terminator Preferences dialog (saves ~/.config/terminator/config)",
       "before": "~/.config/terminator -> <checkout>/config/terminator (directory link): saves edited tracked config/terminator/config",
-      "after": "~/.config/terminator/config is a 'copy' of config/terminator/config (a file, not a directory link), so Preferences saves stay machine-local; a copy Terminator changed is kept on update (install.py -f overwrites it after a backup)",
-      "status": "redirected",
+      "after": "unchanged from upstream: ~/.config/terminator -> ~/.dotfiles/config/terminator (directory link), so Preferences saves edit the tracked config/terminator/config and show up in `git status` of ~/.dotfiles (dotfiles update stashes and re-applies them). Kept as upstream so an earlier upstream-style install, which already has this directory link, installs cleanly.",
+      "status": "in-checkout-accepted",
       "managed_paths": {
-        "terminator-config": "copy"
+        "terminator": "symlink"
       }
     },
     {

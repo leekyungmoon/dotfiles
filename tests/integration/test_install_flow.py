@@ -312,6 +312,60 @@ class InstallFlowTests(unittest.TestCase):
 
     # -- tests -----------------------------------------------------------------
 
+    # The symlinks upstream wookayin/dotfiles' install.py creates, relative to
+    # ~/.dotfiles (plug.vim is written through the ~/.vim link, as upstream does).
+    UPSTREAM_LINKS = {
+        ".bashrc": "bashrc", ".screenrc": "screenrc", ".vimrc": "vim/vimrc",
+        ".vim": "vim", ".config/nvim": "nvim", ".gitconfig": "git/gitconfig",
+        ".gitignore": "git/gitignore", ".zsh": "zsh", ".zlogin": "zsh/zlogin",
+        ".zlogout": "zsh/zlogout", ".zpreztorc": "zsh/zpreztorc",
+        ".zprofile": "zsh/zprofile", ".zshenv": "zsh/zshenv", ".zshrc": "zsh/zshrc",
+        ".local/bin/dotfiles": "bin/dotfiles", ".local/bin/fasd": "zsh/fasd/fasd",
+        ".Xmodmap": "Xmodmap", ".gtkrc-2.0": "gtkrc-2.0",
+        ".config/kitty": "config/kitty", ".config/alacritty": "config/alacritty",
+        ".config/wezterm": "config/wezterm", ".tmux": "tmux",
+        ".tmux.conf": "tmux/tmux.conf", ".config/terminator": "config/terminator",
+        ".config/pudb/pudb.cfg": "config/pudb/pudb.cfg",
+        ".pythonrc.py": "python/pythonrc.py", ".pylintrc": "python/pylintrc",
+        ".condarc": "python/condarc", ".config/pycodestyle": "python/pycodestyle",
+        ".config/ptpython/config.py": "python/ptpython.config.py",
+    }
+
+    def test_home_with_an_upstream_wookayin_install_is_overwritten(self):
+        # The first real machine had wookayin/dotfiles installed before: every
+        # upstream link now points into the new ~/.dotfiles. The install must
+        # take all of them over (backing up what it replaces), not refuse.
+        self.clone()
+        for rel, source in self.UPSTREAM_LINKS.items():
+            dest = self.home / rel
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.symlink_to(self.checkout / source)
+        fzf_home = self.home / ".fzf" / "bin"
+        fzf_home.mkdir(parents=True)
+        (fzf_home / "fzf").write_text("#!/bin/sh\n")
+        (self.home / ".local/bin/fzf").symlink_to(fzf_home / "fzf")
+        rc, out, _ = self.install()
+        self.assertEqual(rc, 0, out)
+        status = self.status()
+        transaction = next(p for p in status["phases"] if p["phase"] == "transaction")
+        self.assertEqual(transaction["status"], "PASS", out)
+        for entry in self.manifest:
+            if entry.get("condition") == "systemd-user":
+                continue  # no user manager in this harness: reported as skipped
+            dest = self.dest(entry)
+            with self.subTest(entry=entry["id"]):
+                if entry["kind"] == "symlink":
+                    self.assertTrue(dest.is_symlink(), entry["dest"])
+                    self.assertEqual(os.readlink(dest), str(self.checkout / entry["source"]))
+                elif entry["kind"] == "copy":
+                    self.assertFalse(dest.is_symlink(), entry["dest"])
+                    self.assertEqual(dest.read_bytes(),
+                                     (self.checkout / entry["source"]).read_bytes())
+        # Nothing was written into the checkout through an old link.
+        dirty = _git(self.git_env, "-C", str(self.checkout), "status", "--porcelain",
+                     "--untracked-files=no")
+        self.assertEqual(dirty, "", dirty)
+
     def test_empty_home_install(self):
         self.clone()
         rc, out, runner = self.install()

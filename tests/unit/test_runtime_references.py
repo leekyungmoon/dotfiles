@@ -428,7 +428,7 @@ class RuntimeWriterAuditTests(unittest.TestCase):
         self.assertEqual(set(rc["managed_paths"].values()), {"symlink"})
         copies = {i for w in self.manifest["writers"]
                   for i, k in w.get("managed_paths", {}).items() if k == "copy"}
-        self.assertEqual(copies, {"gitconfig", "pudb", "terminator-config"})
+        self.assertEqual(copies, {"gitconfig", "pudb"})
 
     def test_writer_markers(self):
         for writer in self.manifest["writers"]:
