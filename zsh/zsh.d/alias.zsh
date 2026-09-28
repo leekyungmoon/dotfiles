@@ -546,6 +546,21 @@ elif (( $+commands[pydf] )); then
     alias df="pydf"
 fi
 
+# Prezto aliases pbcopy/pbpaste to xclip whenever it is installed, even in a
+# Wayland-only or remote shell. This repository ships portable backend
+# selectors in bin/, so drop the alias shadowing and let PATH resolve them.
+# The root is derived from this file rather than hardcoded, so the helpers keep
+# working from any checkout location.
+_dotfiles_bin_dir=${0:A:h:h:h}/bin
+[[ -d "$_dotfiles_bin_dir" ]] || _dotfiles_bin_dir="$HOME/.dotfiles/bin"
+for _dotfiles_helper in pbcopy pbpaste; do
+    if [[ -x "$_dotfiles_bin_dir/$_dotfiles_helper" ]] \
+        && (( $+aliases[$_dotfiles_helper] )); then
+        unalias "$_dotfiles_helper"
+    fi
+done
+unset _dotfiles_bin_dir _dotfiles_helper
+
 function site-packages() {
     # print the path to the site packages from current python environment,
     # e.g. ~/.anaconda3/envs/XXX/lib/python3.6/site-packages/

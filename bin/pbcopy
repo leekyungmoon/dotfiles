@@ -1,13 +1,87 @@
 #!/bin/bash
-# pbcopy -- Copy contents from STDIN (excluding the last newline character) through OSC52 (works remotely over SSH).
-# Note: to make it work inside tmux, some config is needed. See https://github.com/tmux/tmux/wiki/Clipboard
+# pbcopy -- Copy STDIN to the clipboard.
+#
+# Prefers a verified local backend (Wayland, then X11, then macOS) and falls
+# back to OSC52 so a copy still works over SSH.  Inside tmux, OSC52 requires
+# set-clipboard; see https://github.com/tmux/tmux/wiki/Clipboard.
+#
+# Note that OSC52 is write-only: pbpaste deliberately has no matching fallback.
+#
+#   pbcopy              copy STDIN
+#   pbcopy --backend    print the backend that would be used, then exit
+#
+# The clipboard payload is never logged; only backend names reach stderr.
 
-# On a "local" machine with pbcopy (e.g. macOS), do not use osc52
-# This path is used by neovim's clipboard provider (pbcopy)
-if test -z "$SSH_TTY" && test -f /usr/bin/pbcopy; then
-  exec /usr/bin/pbcopy "$@"
+set -uo pipefail
+
+PBCOPY_PROBE_TIMEOUT=${PBCOPY_PROBE_TIMEOUT:-0.75}
+PBCOPY_KILL_GRACE=${PBCOPY_KILL_GRACE:-0.10}
+
+print_backend=0
+case ${1:-} in
+  --backend) print_backend=1 ;;
+  --help|-h)
+    sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'
+    exit 0
+    ;;
+  "") ;;
+  *)
+    printf 'pbcopy: unknown option: %s\n' "$1" >&2
+    exit 2
+    ;;
+esac
+
+run_bounded() {
+  local limit=$1; shift
+  timeout --kill-after="${PBCOPY_KILL_GRACE}" "${limit}" "$@"
+}
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+# wl-copy daemonizes, so it cannot probe itself. wl-paste ships in the same
+# package and answering --list-types proves the compositor is live.
+probe_wayland() {
+  [[ -n ${WAYLAND_DISPLAY:-} ]] || return 1
+  have wl-copy || return 1
+  have wl-paste || return 0
+  run_bounded "${PBCOPY_PROBE_TIMEOUT}" wl-paste --list-types >/dev/null 2>&1
+}
+
+probe_x11() {
+  [[ -n ${DISPLAY:-} ]] || return 1
+  have xclip || return 1
+  run_bounded "${PBCOPY_PROBE_TIMEOUT}" \
+    xclip -selection clipboard -out -target TARGETS >/dev/null 2>&1
+}
+
+backend=osc52
+if [[ -z ${SSH_TTY:-} ]]; then
+  # Keep the native macOS behavior used by Neovim's clipboard provider.
+  if [[ -x /usr/bin/pbcopy ]]; then
+    backend=macos
+  elif probe_wayland; then
+    backend=wayland
+  elif probe_x11; then
+    backend=x11
+  fi
 fi
 
-# Use OSC52 otherwise; it's usually a remote (SSH) machine.
+(( print_backend )) && { printf '%s\n' "${backend}"; exit 0; }
+
+case ${backend} in
+  macos) exec /usr/bin/pbcopy ;;
+  wayland)
+    # wl-copy reads stdin, then daemonizes to serve the selection. It keeps
+    # whatever stdout/stderr it inherited, so a caller reading our output
+    # would block until the selection is replaced. Detach those descriptors.
+    exec wl-copy >/dev/null 2>&1
+    ;;
+  x11)
+    # xclip keeps a serving process for the same reason.
+    exec xclip -selection clipboard -in >/dev/null 2>&1
+    ;;
+esac
+
+# Remote and headless shells copy through the terminal.
 printf "\033]52;c;%s\007" "$(perl -0777 -p0e 's/\n$//' | base64 | tr -d '\n')"
 #                            ^ remove the final EOL in the last line

@@ -1,0 +1,131 @@
+#!/bin/bash
+# pbpaste -- Read the clipboard through a verified local backend.
+#
+# Unlike pbcopy, this command has no remote fallback: OSC52 is write-only in
+# practice, so a terminal that can receive a copy cannot be assumed to answer a
+# read.  When no local backend is usable we fail fast with a clear message
+# instead of silently returning a stale tmux buffer as "the clipboard".
+#
+#   pbpaste                 read the OS clipboard (Wayland, then X11, then macOS)
+#   pbpaste --tmux-buffer   read the tmux paste buffer, explicitly requested
+#   pbpaste --backend       print the backend that would be used, then exit
+#
+# The clipboard payload is never logged; only backend names reach stderr.
+
+set -uo pipefail
+
+PBPASTE_PROBE_TIMEOUT=${PBPASTE_PROBE_TIMEOUT:-0.75}
+PBPASTE_READ_TIMEOUT=${PBPASTE_READ_TIMEOUT:-2}
+PBPASTE_KILL_GRACE=${PBPASTE_KILL_GRACE:-0.10}
+
+mode=clipboard
+print_backend=0
+
+while (( $# )); do
+  case $1 in
+    --tmux-buffer) mode=tmux-buffer ;;
+    --backend) print_backend=1 ;;
+    --help|-h)
+      sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'
+      exit 0
+      ;;
+    --) shift; break ;;
+    -*)
+      printf 'pbpaste: unknown option: %s\n' "$1" >&2
+      exit 2
+      ;;
+    *)
+      printf 'pbpaste: unexpected argument: %s\n' "$1" >&2
+      exit 2
+      ;;
+  esac
+  shift
+done
+
+run_bounded() {
+  local limit=$1; shift
+  timeout --kill-after="${PBPASTE_KILL_GRACE}" "${limit}" "$@"
+}
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+# A backend counts as usable only when it answers a bounded metadata probe.
+# Presence of the binary is not evidence of a live graphical session.
+probe_wayland() {
+  [[ -n ${WAYLAND_DISPLAY:-} ]] || return 1
+  have wl-paste || return 1
+  run_bounded "${PBPASTE_PROBE_TIMEOUT}" wl-paste --list-types >/dev/null 2>&1
+}
+
+probe_x11() {
+  [[ -n ${DISPLAY:-} ]] || return 1
+  have xclip || return 1
+  run_bounded "${PBPASTE_PROBE_TIMEOUT}" \
+    xclip -selection clipboard -out -target TARGETS >/dev/null 2>&1
+}
+
+probe_macos() {
+  [[ -z ${SSH_TTY:-} ]] || return 1
+  [[ -x /usr/bin/pbpaste ]]
+}
+
+if [[ ${mode} == tmux-buffer ]]; then
+  if [[ -z ${TMUX:-} ]] || ! have tmux; then
+    printf 'pbpaste: --tmux-buffer requires a tmux client\n' >&2
+    exit 1
+  fi
+  (( print_backend )) && { printf 'tmux-buffer\n'; exit 0; }
+  # show-buffer reproduces the buffer bytes; save-buffer to stdout adds nothing.
+  run_bounded "${PBPASTE_READ_TIMEOUT}" tmux save-buffer -
+  exit $?
+fi
+
+backend=""
+if probe_wayland; then
+  backend=wayland
+elif probe_x11; then
+  backend=x11
+elif probe_macos; then
+  backend=macos
+fi
+
+if [[ -z ${backend} ]]; then
+  (( print_backend )) && { printf 'none\n'; exit 1; }
+  {
+    printf 'pbpaste: no usable clipboard backend.\n'
+    if [[ -n ${SSH_TTY:-} ]]; then
+      printf '  This looks like an SSH session. pbcopy can still write through\n'
+      printf '  OSC52, but OSC52 does not provide clipboard reads, so there is\n'
+      printf '  nothing to paste from. Use "pbpaste --tmux-buffer" to read the\n'
+      printf '  tmux buffer explicitly, or run pbpaste on the local machine.\n'
+    else
+      printf '  Wanted wl-paste (WAYLAND_DISPLAY), xclip (DISPLAY) or\n'
+      printf '  /usr/bin/pbpaste, and none answered within %ss.\n' \
+        "${PBPASTE_PROBE_TIMEOUT}"
+    fi
+  } >&2
+  exit 1
+fi
+
+(( print_backend )) && { printf '%s\n' "${backend}"; exit 0; }
+
+case ${backend} in
+  wayland)
+    # --no-newline keeps the clipboard bytes exact; wl-paste otherwise appends
+    # a newline of its own.
+    run_bounded "${PBPASTE_READ_TIMEOUT}" wl-paste --no-newline
+    ;;
+  x11)
+    run_bounded "${PBPASTE_READ_TIMEOUT}" xclip -selection clipboard -out
+    ;;
+  macos)
+    exec /usr/bin/pbpaste
+    ;;
+esac
+
+status=$?
+if (( status == 124 || status == 137 )); then
+  printf 'pbpaste: %s backend timed out after %ss\n' \
+    "${backend}" "${PBPASTE_READ_TIMEOUT}" >&2
+fi
+exit ${status}
