@@ -24,6 +24,8 @@ import collections
 import json
 import os
 import os.path
+import shlex
+import tempfile
 
 
 def _colors_enabled():
@@ -63,6 +65,10 @@ def add_argument(*args, **kwargs):
 ###############################################################################################
 
 GITHUB_URL = "https://github.com/leekyungmoon/dotfiles"
+
+# `update` exit code when the update and install succeeded but the stashed
+# local edits could not be re-applied (they stay in the stash).
+STASH_CONFLICT_RC = 3
 
 
 def _dotfiles_dir():
@@ -126,23 +132,60 @@ def update(fast=False,
     # Tracked local edits are stashed around the fast-forward and put back
     # afterwards (untracked files are left alone); a diverged history is
     # refused by --ff-only rather than merged or reset.
-    action = '''#!/bin/bash
+    #
+    # Only the stash entry this run created is ever applied or dropped: a
+    # push that saves nothing (e.g. only dirty submodule content) still exits
+    # 0, so the entry is identified by the stash reflog growing, and it is
+    # applied by its commit id, never as "the newest stash". If it cannot be
+    # re-applied cleanly the checkout is reset to the updated commit, the
+    # entry is kept, and the recovery details go to the status file.
+    fd, status_path = tempfile.mkstemp(prefix='update-status-')
+    os.close(fd)
+    action = r"""#!/bin/bash
         set -e
         set -x
         ret=0
+        status_file=%s
+        _stash_ids() { if git rev-parse -q --verify refs/stash > /dev/null; then git log -g --format=%%H refs/stash; fi; }
         git fetch origin
         stashed=0
+        stash=""
         if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
+            before=$(_stash_ids | wc -l)
             git stash push -m "DOTFILES_UPDATE" && stashed=1
+            if [ "$(_stash_ids | wc -l)" -gt "$before" ]; then
+                stash=$(git rev-parse refs/stash)
+            else
+                stashed=0
+            fi
         fi
         git merge --ff-only && \
             git submodule update --init --recursive && \
             %s -B install.py %s || { ret=$?; }
-        if [ "$stashed" = 1 ]; then git stash pop --index -q; fi
+        if [ "$stashed" = 1 ]; then
+            n=0; found=0
+            for id in $(_stash_ids); do
+                if [ "$id" = "$stash" ]; then found=1; break; fi
+                n=$((n + 1))
+            done
+            clean=0
+            if [ -z "$(git status --porcelain --untracked-files=no --ignore-submodules=all)" ]; then clean=1; fi
+            if git stash apply --index -q "$stash"; then
+                if [ "$found" = 1 ]; then git stash drop -q "stash@{$n}"; fi
+            else
+                if [ "$clean" = 1 ]; then git reset --hard -q HEAD; fi
+                printf '%%s\n' "$PWD" "$stash" "stash@{$n}" "$clean" > "$status_file"
+            fi
+        fi
         exit $ret;
-    ''' % (_python(), install_args)
+    """ % (shlex.quote(status_path), _python(), install_args)
 
-    ret = subprocess.call(['bash', '-c', action], cwd=dotfiles_dir)
+    try:
+        ret = subprocess.call(['bash', '-c', action], cwd=dotfiles_dir)
+        with open(status_path) as f:
+            conflict = f.read().split('\n')
+    finally:
+        os.unlink(status_path)
     git_new_head = _git_head()
 
     if ret != 0:
@@ -156,6 +199,24 @@ def update(fast=False,
         subprocess.call('git log --pretty=oneline --abbrev-commit {}..{}'
                         .format(git_old_head, git_new_head),
                         shell=True, cwd=dotfiles_dir)
+    if len(conflict) >= 4:
+        checkout, sha, ref, clean = conflict[:4]
+        print(RED('[*] Your local edits could not be re-applied on top of {} '
+                  '(merge conflict).'.format(git_new_head)))
+        if clean == '1':
+            print('    {} was reset to {}, so no conflict markers were left behind.'
+                  .format(checkout, git_new_head))
+        else:
+            print('    Check `git status` in {}: conflicted files may contain '
+                  'conflict markers.'.format(checkout))
+        print('    Your edits are kept, unchanged, in {} ({}).'.format(ref, sha))
+        print('    To recover them, resolve the conflicts after:')
+        print('      cd {}'.format(shlex.quote(checkout)))
+        print('      git stash apply --index {}   # or without --index'.format(sha))
+        print('    and once you are done: git stash drop {}'.format(ref))
+        sys.stdout.flush()
+        if ret == 0:
+            ret = STASH_CONFLICT_RC
     return ret
 
 

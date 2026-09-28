@@ -45,7 +45,8 @@ class DotfilesCmdCase(unittest.TestCase):
         gitconfig = root / "gitconfig"
         gitconfig.write_text("[user]\n\tname = Fixture\n\temail = f@example.invalid\n"
                              "[init]\n\tdefaultBranch = main\n"
-                             "[advice]\n\tdetachedHead = false\n")
+                             "[advice]\n\tdetachedHead = false\n"
+                             "[protocol \"file\"]\n\tallow = always\n")
         self.env = {
             "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
             "HOME": str(self.home),
@@ -91,6 +92,23 @@ class DotfilesCmdCase(unittest.TestCase):
         self.git("-C", str(self.work), "commit", "--quiet", "-am", message)
         self.git("-C", str(self.work), "push", "--quiet", "origin", "HEAD:main")
         return self.head(self.work)
+
+    def add_submodule(self):
+        """Give upstream (and the clone) a submodule ``sub`` with a tracked file."""
+        sub = self.root / "subsrc"
+        self.git("init", "--quiet", str(sub))
+        (sub / "f").write_text("sub v1\n")
+        self.git("-C", str(sub), "add", "f")
+        self.git("-C", str(sub), "commit", "--quiet", "-m", "sub")
+        self.git("-C", str(self.work), "submodule", "--quiet", "add", str(sub), "sub")
+        self.git("-C", str(self.work), "commit", "--quiet", "-m", "add submodule")
+        self.git("-C", str(self.work), "push", "--quiet", "origin", "HEAD:main")
+        self.git("-C", str(self.dotfiles), "pull", "--quiet", "--ff-only")
+        self.git("-C", str(self.dotfiles), "submodule", "--quiet", "update", "--init")
+
+    def stash_list(self) -> list[str]:
+        out = self.git("-C", str(self.dotfiles), "stash", "list", "--format=%H %gs")
+        return out.splitlines()
 
     def dotfiles_cmd(self, *args, extra_env=None):
         env = dict(self.env, **(extra_env or {}))
@@ -281,6 +299,116 @@ class UpdateFlowTests(DotfilesCmdCase):
         self.assertIn("[*] installer has failed. Check the log.", completed.stdout.decode())
         self.assertEqual((self.dotfiles / "tracked.txt").read_text(), "local edit\n")
         self.assertEqual(self.git("-C", str(self.dotfiles), "stash", "list"), "")
+
+
+class UpdateStashIdentityTests(DotfilesCmdCase):
+    """Only the stash entry that this update created is applied and dropped."""
+
+    def make_user_stash(self):
+        (self.dotfiles / "tracked.txt").write_text("precious experiment\n")
+        self.git("-C", str(self.dotfiles), "stash", "push", "--quiet", "-m", "my-old-experiment")
+        entries = self.stash_list()
+        self.assertEqual(len(entries), 1)
+        self.assertEqual((self.dotfiles / "tracked.txt").read_text(), "original\n")
+        return entries[0]
+
+    def test_submodule_only_dirt_does_not_pop_an_older_user_stash(self):
+        self.add_submodule()
+        user_stash = self.make_user_stash()
+        (self.dotfiles / "sub" / "f").write_text("dirty submodule content\n")
+        # the reported case: status shows the submodule, stash push saves nothing
+        self.assertEqual(self.git("-C", str(self.dotfiles), "status", "--porcelain",
+                                  "--untracked-files=no"), "M sub")  # ' M sub', stripped
+        new = self.push_upstream()
+        completed = self.dotfiles_cmd("update")
+        out = completed.stdout.decode()
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("[*] Update complete!", out)
+        self.assertEqual(self.head(), new)
+        # the user's stash is untouched and nothing of it leaked into the tree
+        self.assertEqual(self.stash_list(), [user_stash])
+        self.assertEqual((self.dotfiles / "tracked.txt").read_text(), "original\n")
+        self.assertEqual((self.dotfiles / "sub" / "f").read_text(), "dirty submodule content\n")
+        self.assertNotIn("git stash apply", completed.stderr.decode())
+
+    def test_submodule_only_dirt_without_any_stash_is_a_successful_update(self):
+        self.add_submodule()
+        (self.dotfiles / "sub" / "f").write_text("dirty submodule content\n")
+        self.push_upstream()
+        completed = self.dotfiles_cmd("update")
+        out = completed.stdout.decode()
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("[*] Update complete!", out)
+        self.assertNotIn("installer has failed", out)
+        self.assertEqual(self.stash_list(), [])
+        self.assertEqual(len(self.calls()), 1)
+
+    def test_own_stash_is_restored_and_older_user_stash_kept(self):
+        user_stash = self.make_user_stash()
+        (self.dotfiles / "tracked.txt").write_text("local edit\n")
+        new = self.push_upstream()
+        completed = self.dotfiles_cmd("update")
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(self.head(), new)
+        self.assertEqual(self.calls()[0]["tracked"], "original\n")
+        self.assertEqual((self.dotfiles / "tracked.txt").read_text(), "local edit\n")
+        self.assertEqual(self.stash_list(), [user_stash])
+
+
+class UpdateStashConflictTests(DotfilesCmdCase):
+    """A local edit that conflicts with upstream never leaves conflict markers."""
+
+    def setUp(self):
+        super().setUp()
+        (self.dotfiles / "tracked.txt").write_text("my local edit\n")
+        self.new = self.push_upstream("tracked.txt", "upstream edit\n", "upstream edit")
+
+    def assert_clean_and_recoverable(self, completed):
+        out = completed.stdout.decode()
+        self.assertEqual(self.head(), self.new)
+        # the live file is the updated upstream version, without markers
+        self.assertEqual((self.dotfiles / "tracked.txt").read_text(), "upstream edit\n")
+        self.assertEqual(self.git("-C", str(self.dotfiles), "status", "--porcelain",
+                                  "--untracked-files=no"), "")
+        # the edit is kept in this update's stash entry, and the output says how
+        entries = self.stash_list()
+        self.assertEqual(len(entries), 1)
+        sha, label = entries[0].split(" ", 1)
+        self.assertIn("DOTFILES_UPDATE", label)
+        self.assertEqual(self.git("-C", str(self.dotfiles), "show", f"{sha}:tracked.txt"),
+                         "my local edit")
+        self.assertIn("could not be re-applied", out)
+        self.assertIn("no conflict markers were left behind", out)
+        self.assertIn(f"stash@{{0}} ({sha})", out)
+        self.assertIn(f"cd {self.dotfiles}", out)
+        self.assertIn(f"git stash apply --index {sha}", out)
+        self.assertIn("git stash drop stash@{0}", out)
+        return out
+
+    def test_conflicting_pop_restores_clean_tree_and_keeps_stash(self):
+        completed = self.dotfiles_cmd("update")
+        self.assertEqual(completed.returncode, 3, completed.stderr)
+        out = self.assert_clean_and_recoverable(completed)
+        self.assertNotIn("installer has failed", out)
+        self.assertIn("[*] Update complete!", out)
+        self.assertEqual(self.calls()[0]["tracked"], "upstream edit\n")
+
+    def test_conflict_and_installer_failure_are_both_reported(self):
+        completed = self.dotfiles_cmd("update", extra_env={"FAKE_INSTALL_RC": "5"})
+        self.assertEqual(completed.returncode, 5, completed.stderr)
+        out = self.assert_clean_and_recoverable(completed)
+        self.assertIn("[*] installer has failed. Check the log.", out)
+
+    def test_printed_recovery_brings_the_edit_back(self):
+        completed = self.dotfiles_cmd("update")
+        self.assertEqual(completed.returncode, 3, completed.stderr)
+        sha = self.stash_list()[0].split(" ", 1)[0]
+        apply = subprocess.run(["git", "-C", str(self.dotfiles), "stash", "apply", sha],
+                               env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.assertNotEqual(apply.returncode, 0)  # the conflict is now the user's to resolve
+        text = (self.dotfiles / "tracked.txt").read_text()
+        self.assertIn("my local edit", text)
+        self.assertIn("upstream edit", text)
 
 
 if __name__ == "__main__":

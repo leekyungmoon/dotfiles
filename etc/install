@@ -11,6 +11,8 @@
 # there. An existing ~/.dotfiles that is a clean clone of this repository is
 # fast-forwarded; anything else there is moved aside, never deleted, to
 #   ${XDG_STATE_HOME:-~/.local/state}/personal-dotfiles/backups/pre-install-<UTC>/dotfiles
+# but only after the new clone (made in a temporary sibling) has succeeded,
+# so a failed clone leaves the existing checkout where it was.
 #
 # Environment: DOTFILES_REPO_URL (clone source), DOTFILES_REF (branch, tag or
 # commit).
@@ -35,6 +37,9 @@ main() {
 EOF
 
   _die() { echo "ERROR: $*" >&2; exit 1; }
+  # A clone that did not make it into place is removed on any exit.
+  _pending_clone=""
+  trap '_discard_pending_clone' EXIT
 
   # Refuse root: everything is installed for (and owned by) your own user.
   # _DOTFILES_INSTALL_SIMULATE_ROOT can only add this refusal (tests).
@@ -122,24 +127,37 @@ EOF
         || _die "cannot fast-forward $dest (local commits?); resolve it there, then rerun."
     fi
     git -C "$dest" submodule update --init --recursive --jobs 8
-  elif [[ "$existing" == move ]]; then
-    (umask 077 && mkdir -p "$backup")
-    mv -- "$dest" "$backup/dotfiles"
-    { set +x; } 2> /dev/null
-    echo "Moved the existing $dest to $backup/dotfiles (nothing was deleted)."
-    set -x
-  fi
-
-  if [[ ! -e "$dest" ]]; then
+  else
+    # Clone and check out into a new sibling first; only a complete checkout
+    # replaces "$dest". Until then an existing "$dest" is not touched, and a
+    # failed clone leaves nothing behind but the error.
+    local fresh="${dest}.new-$(date -u +%Y%m%dT%H%M%SZ)-$$"
+    [[ ! -e "$fresh" && ! -L "$fresh" ]] || _die "$fresh already exists; remove it and rerun."
+    _pending_clone="$fresh"
     local clone_args=(--recursive -j8)
     if [[ -n "$ref" && ! "$ref" =~ ^[0-9a-f]{40}$ ]]; then clone_args+=(--branch "$ref"); fi
-    git clone "${clone_args[@]}" "$repo_url" "$dest" \
-      || _die "git clone of $repo_url failed; nothing was installed."
+    git clone "${clone_args[@]}" "$repo_url" "$fresh" \
+      || _die "git clone of $repo_url failed; nothing was installed.$(_left_alone "$dest")"
     if [[ "$ref" =~ ^[0-9a-f]{40}$ ]]; then
-      git -C "$dest" checkout --detach "$ref" \
-        && git -C "$dest" submodule update --init --recursive --jobs 8 \
-        || _die "cannot check out $ref in $dest."
+      git -C "$fresh" checkout --detach "$ref" \
+        && git -C "$fresh" submodule update --init --recursive --jobs 8 \
+        || _die "cannot check out $ref; nothing was installed.$(_left_alone "$dest")"
     fi
+    if [[ "$existing" == move ]]; then
+      (umask 077 && mkdir -p "$backup") \
+        && mv -- "$dest" "$backup/dotfiles" \
+        || _die "cannot move $dest to $backup/dotfiles; nothing was installed."
+      { set +x; } 2> /dev/null
+      echo "Moved the existing $dest to $backup/dotfiles (nothing was deleted)."
+      set -x
+    fi
+    if ! mv -T -- "$fresh" "$dest"; then
+      if [[ "$existing" == move ]] && mv -T -- "$backup/dotfiles" "$dest"; then
+        _die "cannot move the new clone into place; $dest was put back."
+      fi
+      _die "cannot move the new clone into place."
+    fi
+    _pending_clone=""
   fi
 
   cd "$dest"
@@ -151,6 +169,20 @@ EOF
 
   { set +x; } 2> /dev/null
   echo "All Done!"
+}
+
+# Remove the temporary sibling clone (only ever a path this run created).
+_discard_pending_clone() {
+  local fresh="${_pending_clone:-}"
+  _pending_clone=""
+  if [[ -n "$fresh" && "$fresh" == "${HOME}"/.*.new-* && ( -e "$fresh" || -L "$fresh" ) ]]; then
+    rm -rf -- "$fresh"
+  fi
+}
+
+# Suffix for error messages: say that an existing checkout was not touched.
+_left_alone() {
+  if [[ -e "$1" || -L "$1" ]]; then printf ' %s was left as it was.' "$1"; fi
 }
 
 # Compare clone URLs loosely: git@github.com:x/y(.git) == https://github.com/x/y

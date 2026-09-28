@@ -58,6 +58,19 @@ with open(sys.argv[1], "a") as log:
 
 FAKE_RECORDER = '#!/bin/sh\necho "{name} $*" >> "{log}"\nexit {rc}\n'
 
+# Fake ssh for GIT_SSH_COMMAND (GIT_SSH_VARIANT=simple: "<host> <command>"):
+# serves every git-upload-pack request from the local mirror.
+FAKE_SSH = r'''#!/bin/sh
+echo "ssh $*" >> "@LOG@"
+for last; do :; done
+case "$last" in
+  git-upload-pack*) exec git upload-pack "@MIRROR@" ;;
+esac
+exit 1
+'''
+
+DEFAULT_URL = "https://github.com/leekyungmoon/dotfiles.git"
+
 
 @unittest.skipUnless(_supported_host(), "etc/install only runs on Ubuntu 22.04/24.04")
 class EtcInstallTests(unittest.TestCase):
@@ -120,10 +133,12 @@ class EtcInstallTests(unittest.TestCase):
         self._case.cleanup()
 
     def run_piped(self, script: bytes | None = None, *, args=(), path=None, **extra):
+        """Run etc/install; an ``extra`` value of None removes that variable."""
         env = {"HOME": str(self.home), "PATH": path or f"{self.bin}:{os.environ['PATH']}",
                "GIT_CONFIG_GLOBAL": str(self.gitconfig), "GIT_CONFIG_NOSYSTEM": "1",
                "GIT_TERMINAL_PROMPT": "0", "LANG": "C", "TERM": "dumb",
                "DOTFILES_REPO_URL": str(self.mirror), **extra}
+        env = {k: v for k, v in env.items() if v is not None}
         body = ETC_INSTALL.read_bytes() if script is None else script
         argv = ["/bin/bash"] + (["-s", "--", *args] if args else [])
         return subprocess.run(argv, input=body, env=env, stdout=subprocess.PIPE,
@@ -146,6 +161,39 @@ class EtcInstallTests(unittest.TestCase):
     def backups(self) -> list[Path]:
         root = self.home / ".local/state/personal-dotfiles/backups"
         return sorted(root.glob("pre-install-*")) if root.exists() else []
+
+    def leftovers(self) -> list[str]:
+        """Temporary sibling clones left in HOME (there must never be any)."""
+        return sorted(p.name for p in self.home.iterdir() if ".new-" in p.name)
+
+    def assert_fresh_clone(self, completed):
+        self.assertEqual(completed.returncode, 0, completed.stderr.decode())
+        dotfiles = self.home / ".dotfiles"
+        self.assertTrue(dotfiles.is_dir() and not dotfiles.is_symlink())
+        self.assertEqual(self.git("-C", str(dotfiles), "rev-parse", "HEAD"),
+                         self.git("-C", str(self.source), "rev-parse", "HEAD"))
+        self.assertEqual(self.git("-C", str(dotfiles), "remote", "get-url", "origin"),
+                         str(self.mirror))
+        self.assertEqual(self.git("-C", str(dotfiles), "status", "--porcelain"), "")
+        self.assertEqual(len(self.installer_runs()), 1)
+        self.assertEqual(self.leftovers(), [])
+        backups = self.backups()
+        self.assertEqual(len(backups), 1)
+        moved = backups[0] / "dotfiles"
+        self.assertIn(f"Moved the existing {dotfiles} to {moved}", completed.stdout.decode())
+        return moved
+
+    def push_to_mirror(self, name="NEWS") -> str:
+        """Add an upstream commit to the class mirror (undone by addCleanup)."""
+        work = self.case / "work"
+        self.git("clone", "--quiet", str(self.mirror), str(work))
+        (work / name).write_text("new upstream commit\n")
+        self.git("-C", str(work), "add", name)
+        self.git("-C", str(work), "commit", "--quiet", "-m", "news")
+        self.git("-C", str(work), "push", "--quiet", "origin", "HEAD:main")
+        self.addCleanup(self.git, "-C", str(self.mirror), "update-ref", "refs/heads/main",
+                        self.git("-C", str(self.source), "rev-parse", "HEAD"))
+        return self.git("-C", str(work), "rev-parse", "HEAD")
 
     # -- tests -----------------------------------------------------------------
 
@@ -193,26 +241,114 @@ class EtcInstallTests(unittest.TestCase):
         self.assertTrue((old / ".git").is_dir())
         self.assertEqual(len(self.installer_runs()), 1)
 
-    def test_other_clone_or_dirty_clone_is_moved_aside(self):
+    def test_clone_with_other_origin_is_moved_aside(self):
         other = self.case / "other.git"
         subprocess.run(["git", "clone", "--quiet", "--bare", str(self.mirror), str(other)],
                        env=self.git_env(self.case), check=True)
         dotfiles = self.home / ".dotfiles"
         self.git("clone", "--quiet", str(other), str(dotfiles))
+        moved = self.assert_fresh_clone(self.run_piped())
+        self.assertEqual(self.git("-C", str(moved), "remote", "get-url", "origin"), str(other))
+
+    def test_dirty_clone_of_this_repository_is_moved_aside(self):
+        dotfiles = self.home / ".dotfiles"
+        self.git("clone", "--quiet", str(self.mirror), str(dotfiles))
+        (dotfiles / "install.py").write_text("# local edit\n")
+        moved = self.assert_fresh_clone(self.run_piped())
+        self.assertEqual((moved / "install.py").read_text(), "# local edit\n")
+        self.assertEqual(self.git("-C", str(moved), "remote", "get-url", "origin"),
+                         str(self.mirror))
+        # a second run finds a clean clone and moves nothing more
         completed = self.run_piped()
         self.assertEqual(completed.returncode, 0, completed.stderr.decode())
         self.assertEqual(len(self.backups()), 1)
-        self.assertEqual(self.git("-C", str(dotfiles), "remote", "get-url", "origin"),
-                         str(self.mirror))
 
-        # A clone of this repository with tracked edits is moved aside too.
-        (dotfiles / "install.py").write_text("# local edit\n")
-        completed = self.run_piped()
+    def test_regular_file_is_moved_aside(self):
+        (self.home / ".dotfiles").write_text("not a directory\n")
+        moved = self.assert_fresh_clone(self.run_piped())
+        self.assertTrue(moved.is_file() and not moved.is_symlink())
+        self.assertEqual(moved.read_text(), "not a directory\n")
+
+    def test_symlink_to_a_checkout_is_moved_aside_and_target_kept(self):
+        target = self.case / "elsewhere"
+        self.git("clone", "--quiet", str(self.mirror), str(target))
+        target_head = self.git("-C", str(target), "rev-parse", "HEAD")
+        (self.home / ".dotfiles").symlink_to(target)
+        moved = self.assert_fresh_clone(self.run_piped())
+        # the link itself was moved; the checkout it pointed to is untouched
+        self.assertTrue(moved.is_symlink())
+        self.assertEqual(os.readlink(moved), str(target))
+        self.assertEqual(self.git("-C", str(target), "rev-parse", "HEAD"), target_head)
+        self.assertEqual(self.git("-C", str(target), "status", "--porcelain"), "")
+
+    def test_broken_symlink_is_moved_aside(self):
+        missing = self.case / "gone"
+        (self.home / ".dotfiles").symlink_to(missing)
+        moved = self.assert_fresh_clone(self.run_piped())
+        self.assertTrue(moved.is_symlink())
+        self.assertEqual(os.readlink(moved), str(missing))
+        self.assertFalse(moved.exists())
+
+    def test_failed_clone_leaves_the_existing_checkout_in_place(self):
+        # The live checkout with a tracked edit (a 'move' case) and a managed
+        # link into it: a clone that fails must not take the checkout away.
+        dotfiles = self.home / ".dotfiles"
+        zshrc = self.home / ".zshrc"
+        cases = {
+            "missing branch": {"DOTFILES_REF": "no-such-branch"},
+            "missing commit": {"DOTFILES_REF": "0123456789abcdef0123456789abcdef01234567"},
+            "unreachable url": {"DOTFILES_REPO_URL": str(self.case / "missing.git")},
+        }
+        for name, extra in cases.items():
+            with self.subTest(name):
+                if not dotfiles.exists():
+                    self.git("clone", "--quiet", str(self.mirror), str(dotfiles))
+                    (dotfiles / "install.py").write_text("# local edit\n")
+                    zshrc.symlink_to(".dotfiles/install.py")
+                completed = self.run_piped(**extra)
+                err = completed.stderr.decode()
+                self.assertNotEqual(completed.returncode, 0)
+                self.assertIn("nothing was installed", err)
+                self.assertIn(f"{dotfiles} was left as it was.", err)
+                self.assertNotIn("Moved the existing", completed.stdout.decode())
+                self.assertNotIn(b"All Done!", completed.stdout)
+                self.assertTrue(dotfiles.is_dir())
+                self.assertEqual((dotfiles / "install.py").read_text(), "# local edit\n")
+                self.assertEqual(zshrc.read_text(), "# local edit\n")  # link still resolves
+                self.assertEqual(self.backups(), [])
+                self.assertEqual(self.leftovers(), [])
+                self.assertEqual(self.installer_runs(), [])
+
+    def test_clone_with_submodules_is_complete_after_the_rename(self):
+        env = self.git_env(self.case)
+        sub = self.case / "subsrc"
+        work = self.case / "with-sub"
+        mirror = self.case / "with-sub.git"
+        git_file = ["-c", "protocol.file.allow=always"]
+        subprocess.run(["git", "init", "--quiet", str(sub)], env=env, check=True)
+        (sub / "f").write_text("sub\n")
+        subprocess.run(["git", "-C", str(sub), "add", "f"], env=env, check=True)
+        subprocess.run(["git", "-C", str(sub), "commit", "--quiet", "-m", "sub"],
+                       env=env, check=True)
+        subprocess.run(["git", "clone", "--quiet", str(self.mirror), str(work)],
+                       env=env, check=True)
+        subprocess.run(["git", *git_file, "-C", str(work), "submodule", "--quiet", "add",
+                        str(sub), "plugins/sub"], env=env, check=True)
+        subprocess.run(["git", "-C", str(work), "commit", "--quiet", "-m", "sub"],
+                       env=env, check=True)
+        subprocess.run(["git", "clone", "--quiet", "--bare", str(work), str(mirror)],
+                       env=env, check=True)
+        (self.home / ".dotfiles").write_text("in the way\n")
+        completed = self.run_piped(DOTFILES_REPO_URL=str(mirror), GIT_CONFIG_COUNT="1",
+                                   GIT_CONFIG_KEY_0="protocol.file.allow",
+                                   GIT_CONFIG_VALUE_0="always")
         self.assertEqual(completed.returncode, 0, completed.stderr.decode())
-        backups = self.backups()
-        self.assertEqual(len(backups), 2)
-        self.assertEqual((backups[-1] / "dotfiles" / "install.py").read_text(),
-                         "# local edit\n")
+        dotfiles = self.home / ".dotfiles"
+        self.assertEqual((dotfiles / "plugins" / "sub" / "f").read_text(), "sub\n")
+        self.assertEqual(Path(self.git("-C", str(dotfiles / "plugins" / "sub"), "rev-parse",
+                                       "--show-toplevel")), dotfiles / "plugins" / "sub")
+        self.assertEqual(self.git("-C", str(dotfiles), "status", "--porcelain"), "")
+        self.assertEqual(self.leftovers(), [])
 
     def test_existing_clean_clone_is_pulled_not_moved(self):
         dotfiles = self.home / ".dotfiles"
@@ -237,12 +373,60 @@ class EtcInstallTests(unittest.TestCase):
             self.git("-C", str(work), "push", "--quiet", "--force", "origin",
                      f"{self.git('-C', str(self.source), 'rev-parse', 'HEAD')}:main")
 
+    def ssh_env(self) -> dict[str, str]:
+        """Serve ssh URLs from the mirror; route the default https URL there too,
+        so a wrongly classified checkout is re-cloned locally (and detected by
+        its backup) instead of reaching the network."""
+        ssh_log = self.case / "ssh.log"
+        fake_ssh = self.bin / "fake-ssh"
+        fake_ssh.write_text(FAKE_SSH.replace("@LOG@", str(ssh_log))
+                            .replace("@MIRROR@", str(self.mirror)))
+        fake_ssh.chmod(0o755)
+        return {"DOTFILES_REPO_URL": None, "GIT_SSH_COMMAND": str(fake_ssh),
+                "GIT_SSH_VARIANT": "simple", "GIT_CONFIG_COUNT": "1",
+                "GIT_CONFIG_KEY_0": f"url.{self.mirror}.insteadOf",
+                "GIT_CONFIG_VALUE_0": DEFAULT_URL}
+
     def test_ssh_spelling_of_origin_counts_as_this_repository(self):
         dotfiles = self.home / ".dotfiles"
+        new = self.push_to_mirror()
+        env = self.ssh_env()
+        ssh_log = self.case / "ssh.log"
+        for origin in ("git@github.com:leekyungmoon/dotfiles.git",
+                       "git@github.com:leekyungmoon/dotfiles",
+                       "ssh://git@github.com/leekyungmoon/dotfiles.git"):
+            with self.subTest(origin):
+                if dotfiles.exists():
+                    shutil.rmtree(dotfiles)
+                self.git("clone", "--quiet", str(self.mirror), str(dotfiles))
+                self.git("-C", str(dotfiles), "reset", "--quiet", "--hard", "HEAD~1")
+                self.git("-C", str(dotfiles), "remote", "set-url", "origin", origin)
+                ssh_log.unlink(missing_ok=True)
+                completed = self.run_piped(**env)
+                self.assertEqual(completed.returncode, 0, completed.stderr.decode())
+                self.assertEqual(self.backups(), [])
+                self.assertIn("pull --ff-only", completed.stderr.decode())
+                # fast-forwarded over the ssh URL, which stays the origin
+                self.assertEqual(self.git("-C", str(dotfiles), "rev-parse", "HEAD"), new)
+                self.assertEqual(self.git("-C", str(dotfiles), "config", "remote.origin.url"),
+                                 origin)
+                self.assertIn("git-upload-pack", ssh_log.read_text())
+                self.assertIn("github.com", ssh_log.read_text())
+
+    def test_ssh_origin_of_another_repository_is_moved_aside(self):
+        dotfiles = self.home / ".dotfiles"
         self.git("clone", "--quiet", str(self.mirror), str(dotfiles))
-        completed = self.run_piped(DOTFILES_REPO_URL=str(self.mirror) + "/")
+        self.git("-C", str(dotfiles), "remote", "set-url", "origin",
+                 "git@github.com:someone-else/dotfiles.git")
+        completed = self.run_piped(**self.ssh_env())
         self.assertEqual(completed.returncode, 0, completed.stderr.decode())
-        self.assertEqual(self.backups(), [])
+        backups = self.backups()
+        self.assertEqual(len(backups), 1)
+        self.assertEqual(self.git("-C", str(backups[0] / "dotfiles"), "remote", "get-url",
+                                  "origin"), "git@github.com:someone-else/dotfiles.git")
+        self.assertEqual(self.git("-C", str(dotfiles), "config", "remote.origin.url"),
+                         DEFAULT_URL)
+        self.assertEqual(self.leftovers(), [])
 
     def test_bad_url_stops_before_install_py(self):
         completed = self.run_piped(DOTFILES_REPO_URL=str(self.case / "missing.git"))
@@ -252,6 +436,8 @@ class EtcInstallTests(unittest.TestCase):
         self.assertEqual(self.installer_runs(), [])
         self.assertFalse(self.py_log.with_suffix(".log.argv").exists())
         self.assertFalse(os.path.lexists(self.home / ".dotfiles"))
+        self.assertEqual(self.leftovers(), [])
+        self.assertNotIn(b"was left as it was", completed.stderr)
         self.assertNotIn(b"All Done!", completed.stdout)
 
     def test_root_is_refused(self):
