@@ -22,6 +22,8 @@ vim.opt.shadafile = "NONE"
 
 -- Make plenary.nvim and ./lua always available for lua packages
 if not vim.tbl_contains(vim.tbl_map(function(p) return vim.endswith(p, "plenary.nvim") end, vim.opt.runtimepath:get()), true) then
-  vim.opt.runtimepath:append(vim.fn.expand("$HOME/.vim/plugged/plenary.nvim"))
+  local data_home = vim.env.XDG_DATA_HOME or ''
+  if data_home:sub(1, 1) ~= '/' then data_home = vim.fn.expand('~/.local/share') end
+  vim.opt.runtimepath:append(data_home .. "/vim/plugged/plenary.nvim")
 end
 package.path = 'lua/?.lua;' .. 'lua/?/init.lua;' .. package.path

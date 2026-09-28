@@ -9,6 +9,8 @@ return {
     -- branch = 'main',  -- Compatible with nvim 0.12+, no longer 'master'!
     commit = '90cd6580', -- the last nvim-treesitter version compatible with Nvim 0.11
     build = function(_)
+      -- Without a C compiler parsers cannot be built; keep the bundled ones, skip quietly.
+      if not require('config.treesitter').can_build_parsers() then return end
       -- Uses blocking call to wait until installation is complete.
       local MINUTE_MS = 1000
       require('nvim-treesitter').update():wait(1 * 60 * 1000)  -- 60 sec

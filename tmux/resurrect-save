@@ -29,14 +29,15 @@ if [[ ! -x $save_script ]]; then
     exit 1
 fi
 
-# Snapshot directory, resolved exactly like tmux-resurrect's helpers.sh.
+# Snapshot directory: tmux.conf always sets @resurrect-dir. Without it, use XDG
+# data. Unlike upstream's helpers.sh, never fall back to ~/.tmux/resurrect:
+# ~/.tmux links into the dotfiles checkout, and snapshots hold terminal
+# scrollback that must never land in the repository.
 state_dir=$(tmux show-option -gqv @resurrect-dir)
 if [[ -z $state_dir ]]; then
-    if [[ -d $HOME/.tmux/resurrect ]]; then
-        state_dir=$HOME/.tmux/resurrect
-    else
-        state_dir=${XDG_DATA_HOME:-$HOME/.local/share}/tmux/resurrect
-    fi
+    data_home=${XDG_DATA_HOME:-}
+    [[ $data_home == /* ]] || data_home=$HOME/.local/share
+    state_dir=$data_home/tmux/resurrect
 fi
 state_dir=${state_dir//'$HOME'/"$HOME"}
 if [[ $state_dir == *'$HOSTNAME'* ]]; then

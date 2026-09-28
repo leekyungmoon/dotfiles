@@ -1,8 +1,11 @@
 --- config.pynvim
 --- @return fun(): boolean
 
--- Set the g:python3_host_prog variable to the "current" python in $PATH.
--- pynvim package will be automatically installed if it was missing.
+-- Set the g:python3_host_prog variable: $PYTHON3_HOST_PROG, else the installer-managed
+-- venv ${XDG_DATA_HOME:-~/.local/share}/personal-dotfiles/venvs/nvim (with pynvim), else
+-- the "current" python in $PATH.
+-- pynvim is automatically installed if it was missing, but only into a virtualenv or conda
+-- env; never into the system/user site-packages (use `dotfiles repair` for the managed venv).
 
 -- This config must be sourced before any first call of has('python3'), py3eval, etc.
 -- Note: An invocation of has('python3'), py3, py3eval triggers provider#python3#Call()
@@ -33,6 +36,18 @@ end
 -- If the environment variable $PYTHON3_HOST_PROG is set, use that as the python rplugin host.
 if os.getenv('PYTHON3_HOST_PROG') then
   vim.g.python3_host_prog = os.getenv('PYTHON3_HOST_PROG')
+end
+
+-- The installer-managed venv for the python3 provider, when it exists.
+if vim.g.python3_host_prog == "" or not vim.g.python3_host_prog then
+  local data_home = os.getenv('XDG_DATA_HOME') or ''
+  if data_home:sub(1, 1) ~= '/' then  -- unset or relative: the XDG default
+    data_home = (os.getenv('HOME') or vim.fn.expand('~')) .. '/.local/share'
+  end
+  local venv_python = data_home .. '/personal-dotfiles/venvs/nvim/bin/python'
+  if vim.fn.executable(venv_python) > 0 then
+    vim.g.python3_host_prog = venv_python
+  end
 end
 
 -- By default, use python3 w.r.t. $PATH as the host python for neovim.
@@ -78,20 +93,17 @@ end
 
 local function determine_pip_args(pynvim_minimum_version)
   local pip_option = "--verbose --upgrade --force-reinstall "  -- force option is important
-  local has_mac = vim.fn.has('mac') > 0
-
-  if not has_mac then  -- for Linux
-    -- Use '--user' option when needed
-    local py_prefix = vim.fn.trim(vim.fn.system(
-      { vim.g.python3_host_prog, "-W", "ignore", "-c", "import sys; print(sys.prefix)" }
-    ))
-    if py_prefix == "/usr" or py_prefix == "/usr/local" then
-      pip_option = pip_option .. "--user "
-    end
-  end
-
   pip_option = pip_option .. "--timeout=1 --retries=1 "
   return pip_option .. "'pynvim >= " .. pynvim_minimum_version .. "'"
+end
+
+-- pip may only install into an isolated environment (a virtualenv/venv or a conda env),
+-- never into the system or --user site-packages of a system python.
+local function host_python_is_isolated()
+  local result = vim.system({ vim.g.python3_host_prog, "-W", "ignore", "-c",
+    "import os, sys; print(int(sys.prefix != getattr(sys, 'base_prefix', sys.prefix)" ..
+    " or os.path.isdir(os.path.join(sys.prefix, 'conda-meta'))))" }, { text = true }):wait(2000)
+  return result.code == 0 and vim.trim(result.stdout or '') == '1'
 end
 
 -- This works "synchronously", blocks until the pip command terminates
@@ -104,7 +116,7 @@ local function autoinstall_pynvim(skip_check)
     if not skip_check then
       notify_later(
         ("pynvim not installed for " .. vim.g.python3_host_prog .. "\n" ..
-        "please run `python3 -m pip install --upgrade pynvim` manually."),
+        "please install pynvim into a virtualenv and set $PYTHON3_HOST_PROG (or run `dotfiles repair`)."),
         vim.log.levels.ERROR)
     end
     return false  -- neovim < 0.10, give up and don't do anything fancy
@@ -136,6 +148,12 @@ local function autoinstall_pynvim(skip_check)
     )
   end
   local function run_pynvim_install()
+    if not host_python_is_isolated() then
+      notify_later(("`pynvim` cannot be imported by `%s`, which is not a virtualenv; " ..
+        "not installing it there. Run `dotfiles repair` to (re)create the managed venv, " ..
+        "or set $PYTHON3_HOST_PROG to a python that has pynvim."):format(vim.g.python3_host_prog))
+      return
+    end
     notify_later("`pynvim` cannot be imported. " ..
       "Automatically installing pynvim for: `" .. vim.g.python3_host_prog .. "` ...")
     vim.loop.sleep(100)

@@ -7,7 +7,31 @@
 
 FZF_DEFAULT_OPTS=""
 # Use tmux popup and reverse layout (prompt on the top) by default.
-FZF_DEFAULT_OPTS="$FZF_DEFAULT_OPTS --height=50% --tmux=center,80% --layout=reverse --border=rounded"
+# fzf --tmux needs tmux >= 3.3: on older servers (Ubuntu 22.04 ships 3.2a) the
+# popup options are rejected and *every* fzf call inside tmux would fail, so the
+# option is only added when the tmux in use is new enough. The version comes
+# from the tmux server's TERM_PROGRAM_VERSION inside tmux, else one `tmux -V`.
+function _fzf_tmux_popup_supported() {
+  local v="" MATCH MBEGIN MEND
+  local -a match mbegin mend
+  if [[ -n "$TMUX" && "$TERM_PROGRAM" == tmux ]]; then
+    v="$TERM_PROGRAM_VERSION"
+  fi
+  if [[ -z "$v" ]]; then
+    (( $+commands[tmux] )) || return 1
+    v="$(command tmux -V 2>/dev/null)" || return 1
+    v="${v##* }"
+  fi
+  v="${v#next-}"
+  [[ "$v" =~ '^([0-9]+)\.([0-9]+)' ]] || return 1
+  (( match[1] > 3 || (match[1] == 3 && match[2] >= 3) ))
+}
+FZF_DEFAULT_OPTS="$FZF_DEFAULT_OPTS --height=50%"
+if _fzf_tmux_popup_supported; then
+  FZF_DEFAULT_OPTS="$FZF_DEFAULT_OPTS --tmux=center,80%"
+fi
+unfunction _fzf_tmux_popup_supported
+FZF_DEFAULT_OPTS="$FZF_DEFAULT_OPTS --layout=reverse --border=rounded"
 # Color and appearances for fzf
 # background color: use brighter and more visible color.
 # marker: use yellow-ish color to make it more appearant

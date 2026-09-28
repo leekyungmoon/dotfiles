@@ -27,11 +27,20 @@ function _require(name)
   return require(name)
 end
 
+-- Plugin root of lazy.nvim, shared with vim-plug (see ~/.vim/plugins.vim, config/plugins.lua).
+-- Plugins are runtime state and live outside the dotfiles checkout (installer-owned source):
+-- ${XDG_DATA_HOME:-~/.local/share}/vim/plugged
+do
+  local data_home = vim.env.XDG_DATA_HOME or ''
+  if data_home:sub(1, 1) ~= '/' then data_home = vim.fn.expand('~/.local/share') end
+  vim.env.VIMPLUG = data_home .. '/vim/plugged'
+end
+
 -- Lua profiling startup time. Make sure lazy.nvim plugins are already installed.
 -- Use `NVIM_LUA_PROFILING=1 nvim` to enable.
 -- Use `NVIM_LUA_PROFILING=2 nvim` to include lazy-loaded plugins as well.
 if vim.env.NVIM_LUA_PROFILING then
-  package.path = string.format("%s;%s/lua/?.lua", package.path, vim.fn.expand("~/.vim/plugged/nvim-profiler"))
+  package.path = string.format("%s;%s/lua/?.lua", package.path, vim.env.VIMPLUG .. "/nvim-profiler")
   require('profiler').reload_builtin_modules()
   require('profiler').start()
   _G._stop_profiling = function()

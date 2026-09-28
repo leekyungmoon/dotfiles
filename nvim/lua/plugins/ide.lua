@@ -23,6 +23,11 @@ return {
   Plug 'SirVer/ultisnips' {
     cond = has_py3,  -- no rplugin, but need to check python version
     event = { 'InsertEnter', 'CmdlineEnter' },
+    config = function()
+      -- snippets import $DOTVIM/pythonx/px from the dotfiles checkout; write its bytecode
+      -- to the cache dir instead of a __pycache__ inside the checkout.
+      pcall(vim.cmd.py3, [[import sys, vim; sys.pycache_prefix = sys.pycache_prefix or vim.eval("stdpath('cache')") + '/pycache']])
+    end,
   };
 
   -- LSP (lazy loaded, see config/lsp.lua)

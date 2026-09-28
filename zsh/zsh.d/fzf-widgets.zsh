@@ -1,8 +1,8 @@
 # More fzf widgets
 # ================
 
-# This script should be sourced AFTER fzf.zsh
-# @seealso ~/.fzf/shell/key-bindings.zsh for fzf mappings (Ctrl-T, Alt-C, Ctrl-R, etc.)
+# This script should be sourced AFTER the fzf shell integration (`fzf --zsh`, see ~/.zshrc)
+# @seealso `fzf --zsh` (shell/key-bindings.zsh upstream) for fzf mappings (Ctrl-T, Alt-C, Ctrl-R, etc.)
 
 # More Shortcuts
 bindkey '^ ' fzf-file-widget          # Ctrl-SPACE, Ctrl-T
@@ -13,7 +13,7 @@ bindkey '^z' fzf-cd-widget
 
 
 # Advanced, customized <TAB> (^I) completion through fzf widgets
-# This overrides fzf's default tab binding widget (fzf-completion): see ~/.fzf/shell/completion.zsh
+# This overrides fzf's default tab binding widget (fzf-completion): see `fzf --zsh` (shell/completion.zsh upstream)
 zle -A 'fzf-completion' _orig_fzf-complete 2>/dev/null ||
   zle -A 'expand-or-complete' _orig_fzf-complete
 

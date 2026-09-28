@@ -150,6 +150,8 @@ function M.setup_highlight(lang, bufnr)
       M.try_recover_parser_errors(lang, err)
     end)
     return ok and true or false
+  elseif not M.can_build_parsers() then
+    return false  -- no C compiler: the parser cannot be installed; stay quiet
   else
     -- Maybe start later when parsers become available
     vim.notify_once(
@@ -187,6 +189,23 @@ M._reattach_after_install = {
 ---------------------------------------------------------------------------
 --- Treesitter Parsers (automatic installation and repair)
 ---------------------------------------------------------------------------
+
+local _can_build_parsers = nil
+
+---Whether treesitter parsers can be built (installed/updated) on this machine,
+---i.e. a C compiler is available ($CC, cc, gcc or clang). Without one only the
+---parsers bundled with neovim work, and automatic installs/repairs are skipped
+---quietly instead of failing (and notifying) on every file open.
+---@return boolean
+function M.can_build_parsers()
+  if _can_build_parsers == nil then
+    local cc = vim.env.CC
+    _can_build_parsers = (cc ~= nil and cc ~= '' and vim.fn.executable(cc) > 0)
+      or vim.fn.executable('cc') > 0 or vim.fn.executable('gcc') > 0
+      or vim.fn.executable('clang') > 0
+  end
+  return _can_build_parsers
+end
 
 M.parsers_to_install = vim.tbl_flatten {
   false and { -- regular (not applied; using minimal)
@@ -255,6 +274,10 @@ function M.ensure_parsers_installed(langs)
   if type(langs) == 'string' then langs = { langs } end
   vim.validate('langs', langs, 'table')
 
+  if not M.can_build_parsers() then
+    return  -- no C compiler: installing would only fail; bundled parsers still work
+  end
+
   if not M.is_v1() then
     -- TODO remove when dropping v0.x support
     local needs_install = vim.tbl_contains(vim.tbl_map(M.has_parser, langs), false)
@@ -310,6 +333,9 @@ function M.try_recover_parser_errors(lang, err)
   else
     return false  -- Do not handle any other general errors (e.g. parser does not exist)
   end
+
+  -- Reinstalling needs a C compiler; without one there is nothing to recover with.
+  if not M.can_build_parsers() then return false end
 
   -- This can be called more than once; run recovery process only once
   if _recover_requested then return false end

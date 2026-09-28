@@ -22,10 +22,11 @@ if pcall(require, "plugins.local") then
   table.insert(PLUGIN_SPEC, { import = "plugins.local" })
 end
 
--- `$VIMPLUG`: It is `$HOME/.vim/plugged`.
+-- `$VIMPLUG`: It is `${XDG_DATA_HOME:-~/.local/share}/vim/plugged`, set by init.lua.
 -- We do not use `vim.fn.stdpath("data") .. "/lazy"`
-local VIMPLUG = vim.fn.expand('$HOME/.vim/plugged')
-vim.env.VIMPLUG = VIMPLUG
+local VIMPLUG = assert(vim.env.VIMPLUG, "$VIMPLUG is not set; see ~/.config/nvim/init.lua")
+-- lazy-lock.json is runtime state too: keep it next to the plugins, not in ~/.config/nvim
+local LOCKFILE = vim.fs.dirname(VIMPLUG) .. "/lazy-lock.json"
 
 -- Bootstrap lazy.nvim plugin manager
 -- https://github.com/folke/lazy.nvim
@@ -89,6 +90,7 @@ require("vim.fs")
 -- @see $VIMPLUG/lazy.nvim/lua/lazy/core/config.lua
 require("lazy").setup(PLUGIN_SPEC, {
   root = VIMPLUG,
+  lockfile = LOCKFILE,
   defaults = {
     -- Plugins will be loaded as soon as lazy.setup()
     lazy = false,

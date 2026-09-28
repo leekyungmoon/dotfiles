@@ -1803,9 +1803,9 @@ endfunction
 command! -complete=dir -nargs=* F        call FzfSmart(<q-args>)
 if has('nvim') || v:version >= 800
   call CommandAlias('FC', 'F ~/.dotfiles/', v:true)
-  call CommandAlias('FP', 'F ~/.dotfiles/vim/plugged/<C-R>=EatWhitespace()<CR>', v:true)
-  call CommandAlias('FPlug', 'F ~/.dotfiles/vim/plugged/<C-R>=EatWhitespace()<CR>', v:true)
-  call CommandAlias('Fplug', 'F ~/.dotfiles/vim/plugged/<C-R>=EatWhitespace()<CR>', v:false)
+  call CommandAlias('FP', 'F $VIMPLUG/<C-R>=EatWhitespace()<CR>', v:true)
+  call CommandAlias('FPlug', 'F $VIMPLUG/<C-R>=EatWhitespace()<CR>', v:true)
+  call CommandAlias('Fplug', 'F $VIMPLUG/<C-R>=EatWhitespace()<CR>', v:false)
   call CommandAlias('Flua', expand("F $VIMRUNTIME/lua"), v:true)
 endif
 

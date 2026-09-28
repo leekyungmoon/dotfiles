@@ -42,6 +42,19 @@ function tmux-attach() {
   tmux switch-client -t "$target"
 }
 
+function tmux-popup-supported() {
+  # fzf --tmux (and its display-popup options) needs tmux >= 3.3; 3.2a (Ubuntu
+  # 22.04) rejects them. Ask the server when inside tmux, else the tmux binary.
+  local v=""
+  if [[ -n "${TMUX:-}" ]]; then
+    v="$(tmux display-message -p '#{version}' 2>/dev/null)" || v=""
+  fi
+  [[ -n "$v" ]] || v="$(tmux -V 2>/dev/null)" || return 1
+  v="${v##* }"; v="${v#next-}"
+  [[ "$v" =~ ^([0-9]+)\.([0-9]+) ]] || return 1
+  (( BASH_REMATCH[1] > 3 || (BASH_REMATCH[1] == 3 && BASH_REMATCH[2] >= 3) ))
+}
+
 function tmux-attach-main() {
   # The main entrypoint allows fuzzy matching
   local query="${1:-}"
@@ -60,10 +73,22 @@ function tmux-attach-main() {
   fi
 
   if [[ -z "$chosen" ]]; then
+    local -a popup=(--no-tmux)
+    if [[ -n "${TMUX:-}" ]]; then
+      if tmux-popup-supported; then
+        popup=(--tmux='60%')
+      elif [[ ! -t 0 || ! -t 1 ]] && [[ -z "${TMUX_ATTACH_IN_POPUP:-}" ]]; then
+        # tmux < 3.3 and no terminal (e.g. run-shell from a key binding):
+        # run this picker again as plain fzf inside a display-popup (tmux 3.2+).
+        local self
+        self="$(printf '%q ' env TMUX_ATTACH_IN_POPUP=1 "$0" "$@")"
+        exec tmux display-popup -E -w 60% -h 60% "$self"
+      fi
+    fi
     chosen=$(
       tmux list-sessions 2>/dev/null |
       fzf --query "$query" --delimiter=':' --nth=1 --accept-nth=1 --color 'fg:dim,nth:regular' \
-        --tmux='60%' --prompt 'tmux attach: '
+        "${popup[@]}" --prompt 'tmux attach: '
     ) || return $?
   fi
   tmux-attach "$chosen"

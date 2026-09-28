@@ -1,0 +1,17 @@
+# ~/.gitconfig -- a small regular file owned by this machine, not a link.
+#
+# The shared settings live in the dotfiles checkout and are included below.
+# `git config --global ...` writes into THIS file, so the tracked
+# ~/.dotfiles/git/gitconfig is never modified by tools.
+#
+# Keep your identity and other private settings in ~/.gitconfig.secret
+# (not tracked; included at the end of ~/.dotfiles/git/gitconfig), e.g.:
+#
+#   git config --file ~/.gitconfig.secret user.name "Your Name"
+#   git config --file ~/.gitconfig.secret user.email "you@example.com"
+#
+# Later settings win: `git config --global` appends after the [include]
+# below, so values it writes override the shared ones.
+
+[include]
+	path = ~/.dotfiles/git/gitconfig

@@ -154,6 +154,19 @@ prepend_path "$HOME/.dotfiles/bin"
 # Let ~/.local/bin take the most, biggest precedence
 prepend_path "$HOME/.local/bin"
 
+# ... except for the installer-owned, pinned tools (fzf, nvim, node, ...):
+# ${XDG_DATA_HOME:-$HOME/.local/share}/personal-dotfiles/bin always comes first,
+# even when an inherited $PATH already carries it further back.
+# (an unset or relative XDG_DATA_HOME falls back to the XDG default)
+() {
+  local data="${XDG_DATA_HOME:-}"
+  [[ "$data" == /* ]] || data="$HOME/.local/share"
+  local tools_bin="$data/personal-dotfiles/bin"
+  if [[ -d "$tools_bin" ]]; then
+    path=( "$tools_bin" ${path:#$tools_bin} )
+  fi
+}
+
 # conda (miniforge3, miniconda3)
 function _try_conda_base() {
   local conda_base="$1"
