@@ -39,7 +39,8 @@ EOF
   _die() { echo "ERROR: $*" >&2; exit 1; }
   # A clone that did not make it into place is removed on any exit.
   _pending_clone=""
-  trap '_discard_pending_clone' EXIT
+  # Stop tracing first, so the cleanup does not echo its own internals.
+  trap '{ set +x; } 2> /dev/null; _discard_pending_clone' EXIT
 
   # Refuse root: everything is installed for (and owned by) your own user.
   # _DOTFILES_INSTALL_SIMULATE_ROOT can only add this refusal (tests).

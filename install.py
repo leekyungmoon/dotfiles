@@ -74,6 +74,9 @@ class Options:
     no_gui: bool = False
     no_shell_change: bool = False
     dry_run: bool = False
+    # Tri-state: True/False from --[no-]claude-code / --[no-]codex, None = ask.
+    claude_code: bool | None = None
+    codex: bool | None = None
 
 
 @dataclasses.dataclass
@@ -111,6 +114,11 @@ def _install_flags(p: argparse.ArgumentParser) -> None:
                    help="do not run chsh to make zsh the login shell")
     p.add_argument("--dry-run", action="store_true",
                    help="report what would change without changing anything")
+    p.add_argument("--claude-code", action=argparse.BooleanOptionalAction, default=None,
+                   help="install Claude Code without asking (--no-claude-code: skip it)")
+    p.add_argument("--codex", action=argparse.BooleanOptionalAction, default=None,
+                   help="install the Codex CLI and oh-my-codex without asking "
+                        "(--no-codex: skip them)")
     p.add_argument("--allow-any-location", action="store_true",
                    help=argparse.SUPPRESS)
 
@@ -168,9 +176,91 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return build_parser().parse_args(argv)
 
 
+_TRISTATE = ("claude_code", "codex")
+
+
 def options_from(args: argparse.Namespace) -> Options:
-    return Options(**{f.name: bool(getattr(args, f.name, False))
-                      for f in dataclasses.fields(Options)})
+    values = {}
+    for field in dataclasses.fields(Options):
+        value = getattr(args, field.name, None if field.name in _TRISTATE else False)
+        values[field.name] = value if field.name in _TRISTATE and value is None else bool(value)
+    return Options(**values)
+
+
+# --- optional AI CLIs ----------------------------------------------------------
+
+# (option name, tool id in manifests/tools.json, label, tools that come with it)
+AI_CLIS = (
+    ("claude_code", "claude-code", "Claude Code", ()),
+    ("codex", "codex", "Codex CLI", ("oh-my-codex",)),
+)
+
+
+def _choices_path(target) -> Path:
+    return target.state_root / "choices.json"
+
+
+def _load_choices(target) -> dict:
+    try:
+        data = json.loads(_choices_path(target).read_text("utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _save_choices(target, choices: dict) -> None:
+    path = _choices_path(target)
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    tmp = path.with_name(path.name + ".tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        json.dump(choices, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+    os.replace(tmp, path)
+
+
+def _yes(answer: str | None, default: bool = True) -> bool:
+    answer = (answer or "").strip().lower()
+    if not answer:
+        return default
+    return answer in ("y", "yes")
+
+
+def ai_cli_exclusions(ctx: Context, opts: Options, *, record: bool = True) -> list[str]:
+    """Ask once per AI CLI whether to install it; return the tool ids to skip.
+
+    A --[no-]claude-code / --[no-]codex flag wins, then the answer given on an
+    earlier run (so `dotfiles update` does not ask again), then a Y/n question
+    on the terminal. Without a terminal and without an earlier answer the CLI
+    is installed, as before. Declining never uninstalls anything.
+    """
+
+    choices = _load_choices(ctx.target)
+    changed = False
+    exclude: list[str] = []
+    for option, tool_id, label, companions in AI_CLIS:
+        wanted = getattr(opts, option, None)
+        if wanted is not None:
+            if choices.get(tool_id) != wanted:
+                choices[tool_id], changed = wanted, True
+        elif isinstance(choices.get(tool_id), bool):
+            wanted = choices[tool_id]
+        elif ctx.prompt is not None:
+            wanted = _yes(ctx.prompt(f"Install {label}? [Y/n] "))
+            choices[tool_id], changed = wanted, True
+        else:
+            wanted = True
+        if not wanted:
+            exclude += [tool_id, *companions]
+            ui.log_target(label, ui.GRAY("skipped (your choice; "
+                                         f"`python3 ~/.dotfiles/install.py --{option.replace('_', '-')}` "
+                                         "installs it later)"))
+    if changed and record:
+        try:
+            _save_choices(ctx.target, choices)
+        except OSError as exc:
+            ui.log(ui.YELLOW(f"could not remember the AI CLI choices: {exc}"))
+    return exclude
 
 
 # --- seams --------------------------------------------------------------------
@@ -188,15 +278,23 @@ def load_seam(module_name: str, function_name: str):
     return function if callable(function) else None
 
 
-def packages_phase(ctx: Context, *, disabled: bool, dry_run: bool) -> PhaseResult:
+def packages_phase(ctx: Context, *, disabled: bool, dry_run: bool,
+                   exclude: list[str] | None = None) -> PhaseResult:
     if disabled:
         return PhaseResult("packages", SKIPPED, ["--no-packages"])
     run = load_seam("packages", "run_packages_phase")
     if run is None:
         return PhaseResult("packages", SKIPPED, ["packages-phase-not-available"])
+    kwargs = {"dry_run": dry_run}
+    if exclude:
+        try:
+            if "exclude" in inspect.signature(run).parameters:
+                kwargs["exclude"] = list(exclude)
+        except (TypeError, ValueError):
+            pass
     try:
         return PhaseResult.coerce(
-            run(ctx.target, ctx.platform, ctx.runner, dry_run=dry_run), "packages")
+            run(ctx.target, ctx.platform, ctx.runner, **kwargs), "packages")
     except Exception as exc:
         return PhaseResult("packages", FAIL, [f"{type(exc).__name__}: {exc}"])
 
@@ -611,8 +709,9 @@ def run_pipeline(ctx: Context, command: str, opts: Options) -> int:
         return finish(ctx, command, results, closing=True)
 
     ui.section("Installing packages")
+    exclude = [] if opts.no_packages else ai_cli_exclusions(ctx, opts)
     packages_result = _report(results, packages_phase(
-        ctx, disabled=opts.no_packages, dry_run=False))
+        ctx, disabled=opts.no_packages, dry_run=False, exclude=exclude))
     if packages_result.status == FAIL:
         return finish(ctx, command, results, closing=True)
 
@@ -661,7 +760,8 @@ def dry_run_install(ctx: Context, opts: Options | None = None) -> int:
     ui.section("Checking platform")
     results = [preflight_phase(ctx)]
     ui.section("Installing packages")
-    results.append(packages_phase(ctx, disabled=opts.no_packages, dry_run=True))
+    results.append(packages_phase(ctx, disabled=opts.no_packages, dry_run=True,
+                                  exclude=ai_cli_exclusions(ctx, opts, record=False)))
     ui.section("Creating symbolic links")
     checkout = Path(ctx.repo_root)
     try:

@@ -1036,7 +1036,8 @@ class UiTests(unittest.TestCase):
 
     def test_completion_lines(self):
         ui.configure(enabled=False)
-        ok = phases.completion_lines([PhaseResult("packages", "PASS"),
+        ok = phases.completion_lines([PhaseResult("packages", "PASS", [],
+                                                  {"tools_selected": ["codex", "claude-code"]}),
                                       PhaseResult("login-shell", "RELOGIN_REQUIRED"),
                                       PhaseResult("gui", "PENDING_GUI", ["no session"])])
         text = "\n".join(ok)
@@ -1044,9 +1045,83 @@ class UiTests(unittest.TestCase):
         self.assertIn("codex login", text)
         self.assertIn("Log out and back in", text)
         self.assertIn("no session", text)
+        # A CLI the user declined is not listed in the sign-in reminder.
+        claude_only = "\n".join(phases.completion_lines([PhaseResult(
+            "packages", "PASS", [], {"tools_selected": ["node", "claude-code"]})]))
+        self.assertIn("claude", claude_only)
+        self.assertNotIn("codex login", claude_only)
+        neither = "\n".join(phases.completion_lines([PhaseResult(
+            "packages", "PASS", [], {"tools_selected": ["node", "neovim"]})]))
+        self.assertNotIn("Sign in to the AI CLIs", neither)
         bad = "\n".join(phases.completion_lines([PhaseResult("smoke", "FAIL", ["zsh"])]))
         self.assertIn("You have   1 warnings or errors", bad)
         self.assertNotIn("codex login", bad)
+
+
+class AiCliChoiceTests(unittest.TestCase):
+    """Claude Code and the Codex CLI are each asked about once, separately."""
+
+    def setUp(self):
+        ui.configure(enabled=False)
+        self._tmp = tempfile.TemporaryDirectory()
+        home = Path(self._tmp.name)
+        self.target = Target(uid=os.getuid(), gid=os.getgid(), username="fixture",
+                             home=home, data_home=home / ".local/share",
+                             state_home=home / ".local/state", config_home=home / ".config",
+                             cache_home=home / ".cache")
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def run_choices(self, answers=None, **flags):
+        asked = []
+
+        def prompt(question):
+            asked.append(question)
+            return answers.pop(0) if answers else ""
+
+        ctx = install.Context(target=self.target, platform=None, runner=None, env={},
+                              run_id="r", prompt=prompt if answers is not None else None)
+        with redirect_stdout(io.StringIO()):
+            exclude = install.ai_cli_exclusions(ctx, install.Options(**flags))
+        return exclude, asked
+
+    def test_asks_each_cli_separately(self):
+        exclude, asked = self.run_choices(["y", "n"])
+        self.assertEqual(asked, ["Install Claude Code? [Y/n] ", "Install Codex CLI? [Y/n] "])
+        self.assertEqual(exclude, ["codex", "oh-my-codex"])
+
+    def test_declining_claude_keeps_codex(self):
+        exclude, _ = self.run_choices(["no", "yes"])
+        self.assertEqual(exclude, ["claude-code"])
+
+    def test_enter_means_yes(self):
+        exclude, _ = self.run_choices(["", ""])
+        self.assertEqual(exclude, [])
+
+    def test_answers_are_remembered_for_updates(self):
+        self.run_choices(["n", "y"])
+        exclude, asked = self.run_choices(["y", "y"])
+        self.assertEqual(asked, [])
+        self.assertEqual(exclude, ["claude-code"])
+        mode = (self.target.state_root / "choices.json").stat().st_mode & 0o777
+        self.assertEqual(mode, 0o600)
+
+    def test_flags_win_over_questions_and_memory(self):
+        self.run_choices(["n", "n"])
+        exclude, asked = self.run_choices(["n", "n"], claude_code=True, codex=True)
+        self.assertEqual(asked, [])
+        self.assertEqual(exclude, [])
+
+    def test_no_terminal_and_no_memory_installs_both(self):
+        exclude, asked = self.run_choices(None)
+        self.assertEqual((exclude, asked), ([], []))
+
+    def test_cli_flags_parse_tristate(self):
+        args = install.build_parser().parse_args(["install", "--no-codex"])
+        opts = install.options_from(args)
+        self.assertIsNone(opts.claude_code)
+        self.assertIs(opts.codex, False)
 
 
 if __name__ == "__main__":

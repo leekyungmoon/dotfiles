@@ -816,8 +816,13 @@ def completion_lines(results: list[PhaseResult]) -> list[str]:
             follow.append("Sign in if you have not yet (not verifiable here): "
                           + ", ".join(hints[n] for n in unverified) + ".")
     elif packages is not None and packages.status != SKIPPED:
-        follow.append("Sign in to the AI CLIs if you have not yet: `codex login`, "
-                      "and `claude` (then /login).")
+        selected = packages.details.get("tools_selected") or []
+        signins = [hint for tool, hint in (("codex", "`codex login`"),
+                                           ("claude-code", "`claude` (then /login)"))
+                   if tool in selected]
+        if signins:
+            follow.append("Sign in to the AI CLIs if you have not yet: "
+                          + ", and ".join(signins) + ".")
     for result in results:
         if result.status == AUTH_REQUIRED:
             follow.append(f"{result.phase} needs sign-in: " + "; ".join(result.reasons))

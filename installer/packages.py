@@ -1021,7 +1021,8 @@ _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 # --- phase -------------------------------------------------------------------
 
 def _select(pkg_manifest: dict, tools_manifest: dict, groups: Iterable[str],
-            only: Iterable[str] | None) -> tuple[list[str], list[str]]:
+            only: Iterable[str] | None,
+            exclude: Iterable[str] | None = None) -> tuple[list[str], list[str]]:
     group_ids = [g["id"] for g in pkg_manifest["groups"]]
     tools = tools_manifest["tools"]
     if only:
@@ -1046,7 +1047,11 @@ def _select(pkg_manifest: dict, tools_manifest: dict, groups: Iterable[str],
         dep = tools[tool_id].get("install", {}).get("requires_tool")
         if dep and dep not in chosen:
             chosen.append(dep)
-    ordered = [t for t in tools if t in chosen]
+    skipped = set(exclude or ())
+    unknown = sorted(skipped - set(tools))
+    if unknown:
+        raise PackagesError(f"cannot exclude unknown tool(s): {', '.join(unknown)}")
+    ordered = [t for t in tools if t in chosen and t not in skipped]
     return sel_groups, ordered
 
 
@@ -1072,6 +1077,7 @@ def run_packages_phase(
     groups: Iterable[str] = DEFAULT_GROUPS,
     fetch: FetchFn | None = None,
     only: Iterable[str] | None = None,
+    exclude: Iterable[str] | None = None,
     manifest_dir: Path | None = None,
     log: Callable[[str], None] | None = None,
 ) -> dict:
@@ -1084,7 +1090,7 @@ def run_packages_phase(
         return {"phase": PHASE, "status": FAIL, "reasons": [str(exc)], "details": details}
     try:
         pkg_manifest, tools_manifest = load_manifests(manifest_dir)
-        sel_groups, sel_tools = _select(pkg_manifest, tools_manifest, groups, only)
+        sel_groups, sel_tools = _select(pkg_manifest, tools_manifest, groups, only, exclude)
     except (OSError, ValueError, KeyError, PackagesError) as exc:
         return {"phase": PHASE, "status": FAIL, "reasons": [f"manifests: {exc}"], "details": details}
     ctx = _Ctx(target, platform, runner, fetch or downloads.fetch, dry_run, tools_manifest, log)
