@@ -61,6 +61,8 @@ SUBCOMMANDS = ("install", "status", "restore", "repair", "gui-apply", "packages"
 LOCATED_COMMANDS = ("install", "repair", "gui-apply", "packages")
 # Entries managed by the pre-release layout that promoted a staged checkout.
 LEGACY_IDS = ("repo", "dotfiles-compat")
+# ~/.local/bin links requested by the packages phase (installer/packages.py).
+TOOL_LINK_PREFIX = "tool-link-"
 
 
 @dataclasses.dataclass
@@ -95,8 +97,8 @@ class Context:
 
 def _install_flags(p: argparse.ArgumentParser) -> None:
     p.add_argument("-f", "--force", action="store_true", default=False,
-                   help="accepted like upstream; managed targets are always "
-                        "replaced after an exact backup")
+                   help="also overwrite managed copied files you changed "
+                        "locally (every replaced target is backed up first)")
     p.add_argument("--skip-vimplug", action="store_true",
                    help="do not install or update neovim plugins")
     p.add_argument("--skip-zplug", action="store_true",
@@ -215,8 +217,14 @@ def gui_phase(ctx: Context, *, disabled: bool, autostart: bool = False) -> Phase
 
 
 def extra_desired_entries(ctx: Context, packages_result: PhaseResult | None,
-                          *, no_gui: bool) -> tuple[list, list[str]]:
+                          *, no_gui: bool, packages_complete: bool | None = None
+                          ) -> tuple[list, list[str]]:
     """Transaction entries contributed by the packages and gui modules.
+
+    Only a packages run over every tool (``packages_complete``; by default a
+    run that neither was skipped nor failed) decides which ~/.local/bin tool
+    links exist. After a skipped (--no-packages), failed or partial (--only)
+    run the links installed before are kept instead of being retired.
 
     Returns ``(entries, warnings)``; a gui autostart entry that cannot be
     built is a warning (the GNOME section reports the gui state), while a
@@ -229,6 +237,17 @@ def extra_desired_entries(ctx: Context, packages_result: PhaseResult | None,
         link_requests = load_seam("packages", "link_requests")
         if link_requests is not None:
             extra += list(link_requests(packages_result.details))
+    if packages_complete is None:
+        packages_complete = (packages_result is not None
+                             and packages_result.status not in (SKIPPED, FAIL))
+    if not packages_complete:
+        fresh = {e.id for e in extra}
+        extra += [e for e in previous_tool_links(ctx) if e.id not in fresh]
+    # --no-gui skips applying desktop settings, but an autostart entry that an
+    # earlier run installed stays managed instead of being retired.
+    if no_gui:
+        autostart_id = _gui_autostart_id()
+        no_gui = not (autostart_id is not None and autostart_id in _managed_entries(ctx))
     if not no_gui:
         autostart = load_seam("gui", "autostart_desired_entry")
         if autostart is not None:
@@ -241,6 +260,34 @@ def extra_desired_entries(ctx: Context, packages_result: PhaseResult | None,
                 if entry is not None:
                     extra.append(entry)
     return extra, warnings
+
+
+def _managed_entries(ctx: Context) -> dict:
+    from installer import transaction
+
+    try:
+        entries = transaction.load_status(ctx.target).get("entries") or {}
+    except Exception:
+        return {}
+    return entries if isinstance(entries, dict) else {}
+
+
+def previous_tool_links(ctx: Context) -> list:
+    """The ~/.local/bin tool links the last transaction installed, as entries."""
+
+    from installer.transaction import DesiredEntry
+
+    kept = []
+    for entry_id, entry in sorted(_managed_entries(ctx).items()):
+        if not entry_id.startswith(TOOL_LINK_PREFIX) or not isinstance(entry, dict):
+            continue
+        installed = entry.get("installed") or {}
+        link_text = installed.get("link_text")
+        if installed.get("kind") != "symlink" or not link_text or not entry.get("dest"):
+            continue
+        kept.append(DesiredEntry(entry_id, Path(entry["dest"]), "symlink",
+                                 link_text=link_text))
+    return kept
 
 
 # --- location -------------------------------------------------------------------
@@ -328,11 +375,44 @@ def _backup_location(target: plat.Target, run_id: str, entry_id: str) -> Path | 
     return None
 
 
+def kept_local_changes(applied, desired: list) -> list[tuple[str, str]]:
+    """``(id, dest)`` of copies the transaction kept because the user changed them.
+
+    ``ApplyResult.kept`` lists their ids. Read defensively: items may also be
+    dests, ``(id, dest)`` pairs or ``{"id", "dest"}`` dicts, and older
+    transactions have no such field.
+    """
+
+    raw = getattr(applied, "kept", None)
+    if raw is None:
+        raw = getattr(applied, "drifted_kept", None)
+    dests = {d.id: str(d.dest) for d in desired}
+    by_dest = {str(d.dest): d.id for d in desired}
+    kept = []
+    for item in raw or []:
+        if isinstance(item, dict):
+            entry_id, dest = item.get("id"), item.get("dest")
+        elif isinstance(item, (tuple, list)) and len(item) == 2:
+            entry_id, dest = item
+        else:
+            entry_id, dest = str(item), None
+        if entry_id not in dests and str(entry_id or dest) in by_dest:
+            entry_id = by_dest[str(entry_id or dest)]
+        dest = dest if dest is not None else dests.get(entry_id)
+        kept.append((str(entry_id or dest), str(dest or entry_id)))
+    return kept
+
+
 def report_entries(ctx: Context, desired: list, befores: dict, applied,
                    sources: dict) -> None:
     changed = set(applied.changed)
+    kept = dict(kept_local_changes(applied, desired))
+    forced = set(getattr(applied, "forced", None) or [])
     for entry in sorted(desired, key=lambda d: str(d.dest)):
         dest = entry.dest
+        if entry.id in kept:
+            ui.log_target(dest, ui.YELLOW("kept your local changes (use -f to overwrite)"))
+            continue
         if entry.id not in changed:
             ui.log_target(dest, ui.GREEN("already up-to-date"))
             continue
@@ -351,7 +431,9 @@ def report_entries(ctx: Context, desired: list, befores: dict, applied,
             if entry.kind == "absent":
                 ui.log_target(dest, ui.YELLOW(f"backed up to {where}, removed"))
             else:
-                ui.log_target(dest, ui.YELLOW(f"backed up to {where}, replaced")
+                note = " (your local changes were overwritten: -f)" \
+                    if entry.id in forced else ""
+                ui.log_target(dest, ui.YELLOW(f"backed up to {where}, replaced{note}")
                               + " " + ui.GREEN(f"({what})"))
         elif entry.kind == "absent":
             ui.log_target(dest, ui.GRAY("already absent"))
@@ -363,11 +445,13 @@ def report_entries(ctx: Context, desired: list, befores: dict, applied,
         ui.log_target(entry_id, ui.YELLOW("no longer managed but changed since; left as is"))
 
 
-def transaction_phase(ctx: Context, *, extra_entries: list | None = None
-                      ) -> tuple[PhaseResult, bool]:
+def transaction_phase(ctx: Context, *, extra_entries: list | None = None,
+                      force: bool = False) -> tuple[PhaseResult, bool]:
     """Apply the managed paths from the checkout.
 
     Returns the result and whether systemd-user entries were applied.
+    ``force`` (``-f``) lets the transaction overwrite copied files the user
+    changed, when the transaction supports keeping them.
     """
 
     from installer import manifest as manifest_mod
@@ -399,6 +483,28 @@ def transaction_phase(ctx: Context, *, extra_entries: list | None = None
     desired = transaction.entries_from_manifest(resolved, ctx.target,
                                                 systemd_user=systemd_ok)
     desired += list(extra_entries or [])
+    return _apply_entries(ctx, desired, resolved=resolved, skipped=skipped,
+                          systemd_ok=systemd_ok, manifest_path=manifest_path,
+                          force=force)
+
+
+def _apply_kwargs(tx, generation: dict, force: bool) -> dict:
+    kwargs = {"generation": generation}
+    try:
+        parameters = inspect.signature(tx.apply).parameters
+    except (TypeError, ValueError):
+        parameters = {}
+    if "force" in parameters:
+        kwargs["force"] = bool(force)
+    return kwargs
+
+
+def _apply_entries(ctx: Context, desired: list, *, resolved: list, skipped: list,
+                   systemd_ok: bool, manifest_path: Path | None,
+                   force: bool = False) -> tuple[PhaseResult, bool]:
+    from installer import transaction
+
+    checkout = Path(ctx.repo_root)
     sources = {e.id: str(e.source) for e in resolved if e.kind == "copy"}
     try:
         info = repo.checkout_info(ctx.runner, checkout)
@@ -407,7 +513,7 @@ def transaction_phase(ctx: Context, *, extra_entries: list | None = None
         commit, origin, branch = None, None, None
     generation = {
         "commit": commit,
-        "manifest_sha256": _manifest_sha(manifest_path),
+        "manifest_sha256": _manifest_sha(manifest_path) if manifest_path else None,
         "origin": origin,
         "ref": branch,
         "checkout": str(checkout),
@@ -420,7 +526,7 @@ def transaction_phase(ctx: Context, *, extra_entries: list | None = None
             befores[entry.id] = None
     try:
         with transaction.Transaction(ctx.target, ctx.run_id) as tx:
-            applied = tx.apply(desired, generation=generation)
+            applied = tx.apply(desired, **_apply_kwargs(tx, generation, force))
     except transaction.ConcurrentRunError as exc:
         ui.log(ui.RED(f"another install is running: {exc}"))
         return PhaseResult("transaction", FAIL,
@@ -433,6 +539,21 @@ def transaction_phase(ctx: Context, *, extra_entries: list | None = None
     report_entries(ctx, desired, befores, applied, sources)
     details = {"commit": commit, "result": phases.jsonable(applied)}
     reasons = []
+    # An interrupted earlier run was rolled back first; anything the user had
+    # changed at those paths in the meantime was saved, not discarded.
+    for item in getattr(applied, "recovery_saved", None) or []:
+        if isinstance(item, dict) and item.get("dest"):
+            ui.log_target(item["dest"], ui.YELLOW(
+                "changed after an interrupted run; your version was saved to "
+                f"{item.get('saved_to')} before rolling back"))
+            reasons.append(f"recovered interrupted run {item.get('run_id')}: saved "
+                           f"{item['dest']} to {item.get('saved_to')}")
+    kept = kept_local_changes(applied, desired)
+    if kept:
+        details["kept_local_changes"] = [entry_id for entry_id, _ in kept]
+        reasons.append("kept your local changes to "
+                       + ", ".join(entry_id for entry_id, _ in kept)
+                       + " (use -f to overwrite)")
     if skipped:
         details["skipped_ids"] = skipped
         reasons.append("systemd-user entries skipped: no systemd user manager")
@@ -504,7 +625,8 @@ def run_pipeline(ctx: Context, command: str, opts: Options) -> int:
         return finish(ctx, command, results, closing=True)
     for warning in warnings:
         ui.log(ui.YELLOW(warning))
-    tx_result, systemd_applied = transaction_phase(ctx, extra_entries=extra)
+    tx_result, systemd_applied = transaction_phase(ctx, extra_entries=extra,
+                                                   force=opts.force)
     tx_result.reasons.extend(warnings)
     if _report(results, tx_result).status == FAIL:
         return finish(ctx, command, results, closing=True)
@@ -515,12 +637,15 @@ def run_pipeline(ctx: Context, command: str, opts: Options) -> int:
         ctx.target, ctx.runner, repo_root=Path(ctx.repo_root), run_id=ctx.run_id,
         systemd_units_applied=systemd_applied, env=child_env,
         skip_zplug=opts.skip_zplug, skip_vimplug=opts.skip_vimplug))
-    _report(results, phases.smoke_phase(ctx.target, ctx.runner, ctx.env))
+    smoke = _report(results, phases.smoke_phase(ctx.target, ctx.runner, ctx.env))
+    # The login shell changes only after the smoke checks passed.
     _report(results, phases.login_shell_phase(
         ctx.target, ctx.runner, current_shell=ctx.current_shell,
-        allow_change=not opts.no_shell_change, interactive=ctx.interactive))
+        allow_change=not opts.no_shell_change, interactive=ctx.interactive,
+        checks_passed=smoke.status == PASS))
     _report(results, phases.git_identity_phase(ctx.target, ctx.runner,
                                                prompt=ctx.prompt))
+    _report(results, phases.auth_phase(ctx.target, ctx.runner, ctx.env))
 
     ui.section("GNOME settings")
     _report(results, gui_phase(ctx, disabled=opts.no_gui))
@@ -698,9 +823,58 @@ def cmd_packages(ctx: Context, only: list[str], dry_run: bool,
     kwargs = {"dry_run": dry_run, "only": list(only)}
     if force and "force" in parameters:
         kwargs["force"] = True
-    result = PhaseResult.coerce(
-        run(ctx.target, ctx.platform, ctx.runner, **kwargs), "packages")
-    return finish(ctx, "packages", [result], merge=True)
+    try:
+        result = PhaseResult.coerce(
+            run(ctx.target, ctx.platform, ctx.runner, **kwargs), "packages")
+    except Exception as exc:
+        result = PhaseResult("packages", FAIL, [f"{type(exc).__name__}: {exc}"])
+    results = [result]
+    if not dry_run and result.details.get("links"):
+        results.append(tool_links_phase(ctx, result, force=force))
+    return finish(ctx, "packages", results, merge=True)
+
+
+def tool_links_phase(ctx: Context, packages_result: PhaseResult, *,
+                     force: bool = False) -> PhaseResult:
+    """Own the ~/.local/bin links of ``dotfiles install <tool>``.
+
+    The links go through the transaction together with everything it already
+    manages, so nothing else is retired: an installed home reapplies its
+    managed paths plus the previous tool links (and the gui autostart entry
+    when it was managed); a home that was never installed gets the links only.
+    """
+
+    ui.section("Creating symbolic links")
+    managed = _managed_entries(ctx)
+    try:
+        # The gui autostart entry is kept only when it is already managed.
+        autostart_id = _gui_autostart_id()
+        gui_managed = autostart_id is not None and autostart_id in managed
+        extra, warnings = extra_desired_entries(ctx, packages_result,
+                                                no_gui=not gui_managed,
+                                                packages_complete=False)
+    except Exception as exc:
+        return PhaseResult("transaction", FAIL,
+                           [f"extra entries: {type(exc).__name__}: {exc}"])
+    for warning in warnings:
+        ui.log(ui.YELLOW(warning))
+    # --force here means "reinstall the tool"; it never forces unrelated
+    # copied configs the user changed, so the transaction runs unforced.
+    if managed:
+        result, _ = transaction_phase(ctx, extra_entries=extra, force=False)
+    else:
+        result, _ = _apply_entries(ctx, extra, resolved=[], skipped=[],
+                                   systemd_ok=False, manifest_path=None, force=False)
+    result.reasons.extend(warnings)
+    return result
+
+
+def _gui_autostart_id() -> str | None:
+    try:
+        from installer import gui
+    except Exception:
+        return None
+    return getattr(gui, "AUTOSTART_ENTRY_ID", None)
 
 
 def _open_tty(mode: str):

@@ -148,6 +148,24 @@ class ValidManifestTests(ManifestTestCase):
                 self.skipTest(f"submodules not checked out here: {exc}")
             raise
 
+    def test_rewritten_configs_are_copies(self):
+        """Configs that git or their programs rewrite must stay ``copy``.
+
+        Only copies get the transaction's keep-local-edits rule, and a symlink
+        would let ``git config --global`` or the program write into the
+        checkout instead.
+        """
+
+        manifest = mf.load_manifest(REPO_ROOT / "manifests" / "managed-paths.json")
+        kinds = {e.id: e.kind for e in manifest.entries}
+        for entry_id in ("gitconfig", "terminator-config", "pudb"):
+            with self.subTest(entry_id=entry_id):
+                self.assertEqual(kinds.get(entry_id), "copy")
+        for entry in manifest.entries:
+            if entry.dest.startswith("{config}/systemd/user/") and entry.source:
+                with self.subTest(entry_id=entry.id):
+                    self.assertEqual(entry.kind, "copy")
+
 
 class RejectionTests(ManifestTestCase):
     def test_malformed_json(self):

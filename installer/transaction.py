@@ -13,6 +13,12 @@ every rule here errs on the side of keeping data:
   starts, so an exception rolls the run back in reverse order and a crash is
   rolled back by the next run that takes the lock.
 * ``state.json`` is the commit point: once it names the run, the run stands.
+* A copied file (``kind="file"``) that changed since the installer last wrote
+  it belongs to the user or to the program that rewrote it: :meth:`apply`
+  keeps it and reports it in ``ApplyResult.kept`` unless ``force`` is given.
+* Crash recovery never discards an object it did not write: if a target is
+  neither what the crashed run found nor what it wrote, it is copied into
+  ``backups/recovery/`` before the old state is put back.
 
 Snapshots use ``lstat`` and never follow a leaf symlink. Nothing here logs or
 journals file contents; only hashes, modes and link texts.
@@ -445,6 +451,17 @@ class _Step:
 
 @dataclasses.dataclass
 class ApplyResult:
+    """What :meth:`Transaction.apply` did.
+
+    ``drifted`` lists *retired* entries left alone because they changed after
+    the installer wrote them. ``kept`` lists still-managed copied files
+    (``kind="file"``) that changed since the last install and were therefore
+    kept as they are; ``forced`` lists those that were backed up and
+    overwritten anyway because ``force`` was given (they are also in
+    ``changed``). ``recovery_saved`` describes objects that crash recovery
+    found in an unexpected state and copied aside before rolling back.
+    """
+
     run_id: str
     changed: list[str]
     unchanged: list[str]
@@ -452,6 +469,9 @@ class ApplyResult:
     drifted: list[str]
     baseline_added: list[str]
     backup_dir: Path | None
+    kept: list[str] = dataclasses.field(default_factory=list)
+    forced: list[str] = dataclasses.field(default_factory=list)
+    recovery_saved: list[dict] = dataclasses.field(default_factory=list)
 
     def to_dict(self) -> dict:
         payload = dataclasses.asdict(self)
@@ -467,6 +487,7 @@ class RestoreResult:
     unchanged: list[str]
     forced: list[str]
     backup_dir: Path | None
+    recovery_saved: list[dict] = dataclasses.field(default_factory=list)
 
     def to_dict(self) -> dict:
         payload = dataclasses.asdict(self)
@@ -485,6 +506,7 @@ def _layout(state_root: Path) -> dict[str, Path]:
         "backups": state_root / "backups",
         "baseline": state_root / "backups" / "baseline",
         "runs": state_root / "backups" / "runs",
+        "recovery": state_root / "backups" / "recovery",
     }
 
 
@@ -534,6 +556,9 @@ class Transaction:
         self._journal: dict | None = None
         self._rolling_back = False
         self.recovered: list[str] = []
+        # Objects an undo found in neither the recorded "before" nor the
+        # recorded "desired" state, copied aside before being replaced.
+        self.recovery_saved: list[dict] = []
 
     # -- context -----------------------------------------------------------
 
@@ -697,6 +722,11 @@ class Transaction:
             os.rename(dest, staged)
         current = snapshot(dest)
         if current != before:
+            if current != desired and current.kind != "absent":
+                # Neither what the run found nor what it wrote: somebody
+                # changed the target after the swap (typically after a
+                # crash, before this recovery). Keep a verified copy.
+                self._save_unexpected(record, run_id, dest, current)
             if before.kind == "absent":
                 _remove_atomically(dest, run_id)
             else:
@@ -717,6 +747,44 @@ class Transaction:
                 os.rmdir(parent)
             except OSError:
                 pass
+
+    def _save_unexpected(
+        self, record: dict, run_id: str, dest: Path, current: ObjectState
+    ) -> None:
+        recovery = self._paths["recovery"]
+        root = recovery / self.run_id / run_id
+        for directory in (recovery, recovery / self.run_id, root):
+            try:
+                os.mkdir(directory, 0o700)
+            except FileExistsError:
+                pass
+        folder = root / record["id"]
+        os.mkdir(folder, 0o700)
+        saved = folder / "object"
+        _copy_object(dest, saved)
+        if snapshot(saved) != current:
+            raise TransactionError(
+                f"could not save the unexpected current state of {dest}; "
+                "left it in place"
+            )
+        _write_json(
+            folder / "meta.json",
+            {
+                "schema": SCHEMA,
+                "id": record["id"],
+                "dest": str(dest),
+                "state": current.to_json(),
+                "interrupted_run": run_id,
+                "recovery_run": self.run_id,
+                "saved": _utc_now(),
+            },
+        )
+        _fsync_dir(folder)
+        _fsync_dir(root)
+        record["unexpected_saved"] = str(saved)
+        self.recovery_saved.append(
+            {"id": record["id"], "dest": str(dest), "saved_to": str(saved), "run_id": run_id}
+        )
 
     # -- validation ----------------------------------------------------------
 
@@ -1025,7 +1093,21 @@ class Transaction:
 
     # -- apply -----------------------------------------------------------------
 
-    def apply(self, desired: list[DesiredEntry], *, generation: dict) -> ApplyResult:
+    def apply(
+        self, desired: list[DesiredEntry], *, generation: dict, force: bool = False
+    ) -> ApplyResult:
+        """Bring every desired entry into place.
+
+        A ``kind="file"`` entry (a copied config) is written on its first
+        install and whenever the live file still equals what the installer
+        recorded last time. If it changed since then (``git config --global``,
+        an application saving its settings, a hand edit) it is kept and
+        listed in ``ApplyResult.kept``; ``force=True`` backs it up and
+        overwrites it instead (listed in ``ApplyResult.forced``). A deleted
+        copy is simply written again. Symlinks, directories and removals are
+        always brought into place (after a backup).
+        """
+
         self._require_entered()
         desired = list(desired)
         self._validate_desired(desired)
@@ -1111,10 +1193,27 @@ class Transaction:
 
             changed: list[str] = []
             unchanged: list[str] = []
+            kept: list[str] = []
+            forced: list[str] = []
+            kept_records: dict[str, dict] = {}
             for d in desired:
-                if befores[d.id] == wanted[d.id]:
+                before = befores[d.id]
+                if before == wanted[d.id]:
                     unchanged.append(d.id)
                     continue
+                if d.kind == "file" and before.kind != "absent":
+                    record = prev_entries.get(d.id) or prev_entries.get(adopt.get(d.id, ""))
+                    if record is not None and record.get("dest") == str(d.dest):
+                        installed = ObjectState.from_json(record["state"])
+                        if before != installed:
+                            if not force:
+                                kept.append(d.id)
+                                kept_records[d.id] = {
+                                    "dest": str(d.dest),
+                                    "state": installed.to_json(),
+                                }
+                                continue
+                            forced.append(d.id)
                 changed.append(d.id)
                 action = {"symlink": "symlink", "file": "file", "dir": "dir", "absent": "absent"}[d.kind]
                 steps.append(
@@ -1133,7 +1232,12 @@ class Transaction:
             def new_state() -> dict:
                 entries = {k: v for k, v in prev_entries.items() if k not in retired_ids}
                 for d in desired:
-                    entries[d.id] = {"dest": str(d.dest), "state": wanted[d.id].to_json()}
+                    # A kept copy keeps the state the installer last wrote,
+                    # so it stays "changed locally" until the user resolves it.
+                    entries[d.id] = kept_records.get(d.id) or {
+                        "dest": str(d.dest),
+                        "state": wanted[d.id].to_json(),
+                    }
                 return self._state_payload(entries, generation, "apply")
 
             self._run_steps(steps, new_state)
@@ -1146,6 +1250,9 @@ class Transaction:
                 drifted=drifted,
                 baseline_added=baseline_added,
                 backup_dir=backup_dir if steps else None,
+                kept=kept,
+                forced=forced,
+                recovery_saved=list(self.recovery_saved),
             )
 
         return self._guarded(body)  # type: ignore[return-value]
@@ -1257,6 +1364,7 @@ class Transaction:
                 unchanged=unchanged,
                 forced=sorted(drifted),
                 backup_dir=(self._paths["runs"] / self.run_id) if steps else None,
+                recovery_saved=list(self.recovery_saved),
             )
 
         return self._guarded(body)  # type: ignore[return-value]

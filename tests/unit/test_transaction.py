@@ -579,7 +579,11 @@ class FailureInjectionTests(unittest.TestCase):
                     run_apply(case.target, desired, fault=FaultAt(name, nth, exc=Crash))
                 with Transaction(case.target, tx.new_run_id()) as t:
                     recovered = list(t.recovered)
+                    # Nobody touched the targets after the crash, so
+                    # recovery has nothing unexpected to set aside.
+                    self.assertEqual(t.recovery_saved, [])
                 self.assertEqual(home_state(case.target), before)
+                self.assertFalse((case.target.state_root / "backups" / "recovery").exists())
                 self.assertFalse((case.target.state_root / "state.json").exists())
                 self.assertEqual(
                     [p.name for p in (case.target.state_root / "backups" / "baseline").iterdir()], []
@@ -927,6 +931,230 @@ class DirectoryPromotionTests(HomeCase):
         self.assertIsNotNone(result.backup_dir)
         tx.restore(self.target, which="baseline")
         self.assertEqual(snapshot(live), original)
+
+
+def backup_object(target, backup_dir: Path, entry_id: str) -> Path:
+    """The saved object for ``entry_id`` in a run, following baseline refs."""
+
+    meta = json.loads((backup_dir / entry_id / "meta.json").read_text())
+    if meta["payload"] == "baseline":
+        return target.state_root / "backups" / "baseline" / entry_id / "object"
+    return backup_dir / entry_id / "object"
+
+
+STUB = (REPO_ROOT / "git" / "gitconfig.stub").read_bytes()
+
+
+class CopiedFileDriftTests(HomeCase):
+    """DS-1: a copied config that a program or the user changed is kept."""
+
+    def gitconfig(self, content: bytes = STUB) -> DesiredEntry:
+        return DesiredEntry("gitconfig", self.home / ".gitconfig", "file",
+                            content=content, mode=0o644)
+
+    def others(self) -> list[DesiredEntry]:
+        return [DesiredEntry("zshrc", self.home / ".zshrc", "symlink",
+                             link_text=self.link("zsh/zshrc"))]
+
+    def recorded(self, entry_id: str) -> ObjectState:
+        state = json.loads((self.target.state_root / "state.json").read_text())
+        return ObjectState.from_json(state["entries"][entry_id]["state"])
+
+    def test_git_config_global_edit_survives_rerun(self):
+        git = shutil.which("git")
+        if git is None:
+            self.skipTest("git is not installed")
+        import subprocess
+
+        (self.home / ".gitconfig").write_text("[user]\n\tname = Before Install\n")
+        first = run_apply(self.target, [self.gitconfig(), *self.others()])
+        self.assertIn("gitconfig", first.changed)  # first install overwrites
+        self.assertEqual(backup_object(self.target, first.backup_dir, "gitconfig").read_text(),
+                         "[user]\n\tname = Before Install\n")
+        env = {"HOME": str(self.home), "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+               "GIT_CONFIG_NOSYSTEM": "1", "XDG_CONFIG_HOME": str(self.home / ".config")}
+        for key, value in (("core.editor", "nano"), ("credential.helper", "store")):
+            subprocess.run([git, "config", "--global", key, value], env=env, check=True)
+        edited = (self.home / ".gitconfig").read_bytes()
+        self.assertIn(b"nano", edited)
+
+        second = run_apply(self.target, [self.gitconfig(), *self.others()])
+        self.assertEqual(second.kept, ["gitconfig"])
+        self.assertEqual(second.changed, [])
+        self.assertNotIn("gitconfig", second.unchanged)
+        self.assertIsNone(second.backup_dir)
+        self.assertEqual((self.home / ".gitconfig").read_bytes(), edited)
+        out = subprocess.run([git, "config", "--global", "core.editor"], env=env,
+                             check=True, capture_output=True, text=True).stdout
+        self.assertEqual(out.strip(), "nano")
+        # Still reported on later runs, and status shows the local change.
+        third = run_apply(self.target, [self.gitconfig(), *self.others()])
+        self.assertEqual(third.kept, ["gitconfig"])
+        self.assertEqual(tx.load_status(self.target)["drifted"], ["gitconfig"])
+
+    def test_force_backs_up_and_overwrites_local_edit(self):
+        run_apply(self.target, [self.gitconfig()])
+        with open(self.home / ".gitconfig", "ab") as handle:
+            handle.write(b"[alias]\n\tlol = log --graph --oneline\n")
+        edited = snapshot(self.home / ".gitconfig")
+        with Transaction(self.target, tx.new_run_id()) as t:
+            result = t.apply([self.gitconfig()], generation=GEN, force=True)
+        self.assertEqual(result.forced, ["gitconfig"])
+        self.assertEqual(result.changed, ["gitconfig"])
+        self.assertEqual(result.kept, [])
+        self.assertEqual((self.home / ".gitconfig").read_bytes(), STUB)
+        self.assertEqual(
+            snapshot(backup_object(self.target, result.backup_dir, "gitconfig")), edited
+        )
+        self.assertEqual(self.recorded("gitconfig"), snapshot(self.home / ".gitconfig"))
+
+    def test_unedited_copy_follows_repo_updates(self):
+        run_apply(self.target, [self.gitconfig(b"v1\n")])
+        second = run_apply(self.target, [self.gitconfig(b"v2\n")])
+        self.assertEqual(second.changed, ["gitconfig"])
+        self.assertEqual((self.home / ".gitconfig").read_bytes(), b"v2\n")
+        # An edited copy is kept even when the repository version moves on,
+        # and the recorded state stays what the installer last wrote.
+        (self.home / ".gitconfig").write_bytes(b"v2\nmine\n")
+        third = run_apply(self.target, [self.gitconfig(b"v3\n")])
+        self.assertEqual(third.kept, ["gitconfig"])
+        self.assertEqual((self.home / ".gitconfig").read_bytes(), b"v2\nmine\n")
+        self.assertEqual(self.recorded("gitconfig").sha256,
+                         __import__("hashlib").sha256(b"v2\n").hexdigest())
+        # Undoing the edit hands the file back to the installer.
+        (self.home / ".gitconfig").write_bytes(b"v2\n")
+        fourth = run_apply(self.target, [self.gitconfig(b"v3\n")])
+        self.assertEqual(fourth.changed, ["gitconfig"])
+        self.assertEqual((self.home / ".gitconfig").read_bytes(), b"v3\n")
+
+    def test_mode_change_and_type_change_are_local_changes(self):
+        run_apply(self.target, [self.gitconfig()])
+        os.chmod(self.home / ".gitconfig", 0o600)
+        self.assertEqual(run_apply(self.target, [self.gitconfig()]).kept, ["gitconfig"])
+        os.unlink(self.home / ".gitconfig")
+        own = self.tmp / "my-gitconfig"
+        own.write_text("mine")
+        os.symlink(own, self.home / ".gitconfig")
+        self.assertEqual(run_apply(self.target, [self.gitconfig()]).kept, ["gitconfig"])
+        self.assertEqual(os.readlink(self.home / ".gitconfig"), str(own))
+
+    def test_deleted_copy_is_written_again(self):
+        run_apply(self.target, [self.gitconfig()])
+        os.unlink(self.home / ".gitconfig")
+        result = run_apply(self.target, [self.gitconfig()])
+        self.assertEqual(result.changed, ["gitconfig"])
+        self.assertEqual(result.kept, [])
+        self.assertEqual((self.home / ".gitconfig").read_bytes(), STUB)
+
+    def test_edited_symlink_target_is_still_replaced(self):
+        run_apply(self.target, self.others())
+        os.unlink(self.home / ".zshrc")
+        (self.home / ".zshrc").write_text("mine\n")
+        result = run_apply(self.target, self.others())
+        self.assertEqual(result.changed, ["zshrc"])
+        self.assertEqual(result.kept, [])
+        self.assertTrue(os.path.islink(self.home / ".zshrc"))
+
+    def test_renamed_id_at_same_dest_keeps_local_edit(self):
+        unit = self.home / ".config" / "systemd" / "user" / "x.service"
+        run_apply(self.target, [DesiredEntry("old-unit", unit, "file", content=b"a\n")])
+        unit.write_bytes(b"a\nedited\n")
+        result = run_apply(self.target, [DesiredEntry("new-unit", unit, "file", content=b"b\n")])
+        self.assertEqual(result.kept, ["new-unit"])
+        self.assertEqual(unit.read_bytes(), b"a\nedited\n")
+
+    def test_every_manifest_copy_keeps_program_edits(self):
+        """gitconfig, terminator, pudb and the systemd copies, end to end."""
+
+        import dataclasses as dc
+
+        from installer import manifest as manifest_mod
+
+        loaded = manifest_mod.load_manifest(REPO_ROOT / "manifests" / "managed-paths.json")
+        copies = tuple(e for e in loaded.entries if e.kind == "copy")
+        self.assertGreaterEqual(len(copies), 3)
+        subset = dc.replace(loaded, entries=copies)
+        resolved = manifest_mod.resolve(subset, self.target, REPO_ROOT)
+        desired = tx.entries_from_manifest(resolved, self.target)
+        self.assertEqual(len(desired), len(copies))
+        first = run_apply(self.target, desired)
+        self.assertEqual(sorted(first.changed), sorted(d.id for d in desired))
+        edited = {}
+        for d in desired:
+            with open(d.dest, "ab") as handle:
+                handle.write(b"\n# saved by the program\n")
+            edited[d.id] = snapshot(d.dest)
+        second = run_apply(self.target, desired)
+        self.assertEqual(sorted(second.kept), sorted(d.id for d in desired))
+        self.assertEqual(second.changed, [])
+        for d in desired:
+            self.assertEqual(snapshot(d.dest), edited[d.id], d.id)
+
+
+class CrashRecoveryEditTests(HomeCase):
+    """DS-4: an edit made between a crash and recovery is saved, not lost."""
+
+    def crash_then_edit(self, dest: Path, desired: DesiredEntry, edit: bytes):
+        with self.assertRaises(Crash):
+            run_apply(self.target, [desired], fault=FaultAt(f"swapped:{desired.id}", exc=Crash))
+        self.assertEqual(dest.read_bytes(), desired.content)
+        with open(dest, "ab") as handle:
+            handle.write(edit)
+        return snapshot(dest)
+
+    def test_edit_after_crash_saved_before_rollback(self):
+        dest = self.home / ".gitconfig"
+        dest.write_bytes(b"[user]\n\tname = Orig\n")
+        original = snapshot(dest)
+        desired = DesiredEntry("gitconfig", dest, "file", content=STUB, mode=0o644)
+        edit = b"[alias]\n\tlol = log --graph --oneline\n"
+        edited = self.crash_then_edit(dest, desired, edit)
+
+        with Transaction(self.target, tx.new_run_id()) as t:
+            self.assertEqual(len(t.recovered), 1)
+            saved = list(t.recovery_saved)
+            result = t.apply([desired], generation=GEN)
+        self.assertEqual(len(saved), 1)
+        self.assertEqual(saved[0]["id"], "gitconfig")
+        self.assertEqual(saved[0]["dest"], str(dest))
+        self.assertEqual(saved[0]["run_id"], t.recovered[0])
+        saved_path = Path(saved[0]["saved_to"])
+        self.assertTrue(saved_path.is_relative_to(self.target.state_root / "backups" / "recovery"))
+        self.assertEqual(snapshot(saved_path), edited)
+        self.assertIn(edit, saved_path.read_bytes())
+        meta = json.loads((saved_path.parent / "meta.json").read_text())
+        self.assertEqual(ObjectState.from_json(meta["state"]), edited)
+        self.assertEqual(stat.S_IMODE(os.lstat(saved_path.parent).st_mode), 0o700)
+        self.assertEqual(result.recovery_saved, saved)
+        # Rollback still returned the pre-crash object, which the rerun
+        # then backed up and replaced as on a first install.
+        self.assertEqual(
+            snapshot(backup_object(self.target, result.backup_dir, "gitconfig")), original
+        )
+        self.assertEqual(dest.read_bytes(), STUB)
+        entry = journal(self.target, t.recovered[0])["steps"][0]
+        self.assertEqual(entry["unexpected_saved"], str(saved_path))
+
+    def test_new_file_edited_after_crash_saved_before_removal(self):
+        dest = self.home / ".config" / "pudb" / "pudb.cfg"
+        desired = DesiredEntry("pudb", dest, "file", content=b"[pudb]\n", mode=0o644)
+        edited = self.crash_then_edit(dest, desired, b"theme = dark\n")
+        with Transaction(self.target, tx.new_run_id()) as t:
+            saved = list(t.recovery_saved)
+        self.assertFalse(os.path.lexists(dest))  # the crashed run created it
+        self.assertEqual(len(saved), 1)
+        self.assertEqual(snapshot(Path(saved[0]["saved_to"])), edited)
+
+    def test_unsaveable_object_left_in_place(self):
+        dest = self.home / ".gitconfig"
+        dest.write_bytes(b"orig\n")
+        desired = DesiredEntry("gitconfig", dest, "file", content=STUB, mode=0o644)
+        edited = self.crash_then_edit(dest, desired, b"mine\n")
+        with mock.patch.object(tx, "_copy_object", side_effect=OSError("disk full")):
+            with self.assertRaises(TransactionError):
+                with Transaction(self.target, tx.new_run_id()):
+                    pass
+        self.assertEqual(snapshot(dest), edited)
 
 
 class DurabilityTests(HomeCase):

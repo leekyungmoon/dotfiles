@@ -1,8 +1,14 @@
 # ~/.gitconfig -- a small regular file owned by this machine, not a link.
 #
 # The shared settings live in the dotfiles checkout and are included below.
-# `git config --global ...` writes into THIS file, so the tracked
+# `git config --global ...` (and tools such as `gh auth setup-git` or
+# `git lfs install`) write into THIS file, so the tracked
 # ~/.dotfiles/git/gitconfig is never modified by tools.
+#
+# Those settings are kept: `dotfiles update`, `dotfiles repair` and
+# `python3 install.py` only rewrite this file while it is still exactly what
+# the installer wrote last time, and report "kept your changes" otherwise.
+# `python3 install.py --force` backs your version up and writes a fresh copy.
 #
 # Keep your identity and other private settings in ~/.gitconfig.secret
 # (not tracked; included at the end of ~/.dotfiles/git/gitconfig), e.g.:

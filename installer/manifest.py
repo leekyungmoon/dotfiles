@@ -5,6 +5,13 @@ itself, points at missing sources, reaches out of the owner's home through a
 symlinked parent or tries to take over a broad root (``~/.config`` itself,
 ``~/.local/share`` ...) is rejected with :class:`ManifestError` before the
 transaction touches anything.
+
+Kinds: ``symlink`` / ``link`` put a link in place (always replaced after a
+backup), ``remove`` makes sure a path is absent, and ``copy`` installs a
+regular file for configs that their programs rewrite. The transaction writes
+a copy on its first install and whenever it still equals what was installed
+last time; a copy the user or a program changed since is kept and reported
+unless the install is forced (see ``installer.transaction``).
 """
 
 from __future__ import annotations

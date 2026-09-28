@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import io
 import json
 import os
@@ -350,6 +351,407 @@ class LoginShellTests(TempHome):
                       out.getvalue())
 
 
+class AccountRunner(ScriptedRunner):
+    """ScriptedRunner that also answers ``passwd -S`` with a status letter."""
+
+    def __init__(self, password, sudo_rc=0, chsh_rc=0):
+        super().__init__(which={"zsh": "/usr/bin/zsh", "sudo": "/usr/bin/sudo"})
+        self.password, self.sudo_rc, self.chsh_rc = password, sudo_rc, chsh_rc
+
+    def run(self, argv, *, timeout, check=True, env=None, input=None, cwd=None,
+            read_only=False):
+        argv = [str(a) for a in argv]
+        self.calls.append(argv)
+        if argv == ["passwd", "-S"]:
+            out = f"fixture {self.password} 2026-01-01 0 99999 7 -1\n".encode()
+            return subprocess.CompletedProcess(argv, 0, out, b"")
+        if argv == ["sudo", "-n", "true"]:
+            return subprocess.CompletedProcess(argv, self.sudo_rc, b"", b"")
+        if argv[:3] == ["sudo", "-n", "chsh"]:
+            return subprocess.CompletedProcess(argv, self.chsh_rc, b"", b"denied")
+        raise AssertionError(argv)
+
+
+class LoginShellGateTests(TempHome):
+    def phase(self, runner, **kw):
+        chsh = []
+
+        def interactive(argv):
+            chsh.append(argv)
+            return 0
+
+        with redirect_stdout(io.StringIO()) as out:
+            r = phases.login_shell_phase(self.target, runner, current_shell="/bin/bash",
+                                         allow_change=True, interactive=interactive,
+                                         **kw)
+        return r, chsh, out.getvalue()
+
+    def test_failed_smoke_leaves_the_login_shell(self):
+        # REQ-7: chsh only after the smoke checks passed.
+        runner = AccountRunner("P")
+        r, chsh, out = self.phase(runner, checks_passed=False)
+        self.assertEqual(r.status, "SKIPPED")
+        self.assertEqual(chsh, [])
+        self.assertEqual(runner.calls, [])
+        self.assertIn("smoke-failed", r.reasons[0])
+        self.assertIn("chsh -s", r.details["command"])
+        text = "\n".join(phases.completion_lines([r]))
+        self.assertIn("zsh is not your login shell yet", text)
+        self.assertIn("chsh -s", text)
+
+    def test_password_account_uses_plain_chsh(self):
+        r, chsh, out = self.phase(AccountRunner("P"))
+        self.assertEqual(r.status, "RELOGIN_REQUIRED")
+        self.assertEqual(len(chsh), 1)
+        self.assertEqual(chsh[0][:2], ["chsh", "-s"])
+        self.assertIn("Please type your password", out)
+
+    def test_locked_account_with_passwordless_sudo_uses_sudo(self):
+        # PLAT-4: cloud-init users have a locked password and NOPASSWD sudo.
+        runner = AccountRunner("L")
+        r, chsh, out = self.phase(runner)
+        self.assertEqual(r.status, "RELOGIN_REQUIRED")
+        self.assertEqual(chsh, [])
+        self.assertEqual(runner.calls[-1][:4], ["sudo", "-n", "chsh", "-s"])
+        self.assertEqual(runner.calls[-1][-1], "fixture")
+        self.assertNotIn("Please type your password", out)
+
+    def test_locked_account_without_sudo_gets_the_sudo_remedy(self):
+        runner = AccountRunner("L", sudo_rc=1)
+        r, chsh, out = self.phase(runner)
+        self.assertEqual(chsh, [])  # a chsh prompt could never succeed
+        self.assertNotEqual(r.status, "FAIL")
+        self.assertIn("sudo chsh -s", r.reasons[0])
+        self.assertTrue(r.reasons[0].endswith(" fixture"))
+        self.assertFalse(any(c[:3] == ["sudo", "-n", "chsh"] for c in runner.calls))
+
+    def test_sudo_chsh_failure_names_the_remedy(self):
+        r, _, _ = self.phase(AccountRunner("NP", chsh_rc=1))
+        self.assertEqual(r.status, "FAIL")
+        self.assertIn("sudo chsh -s", r.reasons[0])
+
+    def test_plain_chsh_failure_mentions_the_sudo_form(self):
+        runner = AccountRunner("P")
+        with redirect_stdout(io.StringIO()):
+            r = phases.login_shell_phase(self.target, runner, current_shell="/bin/bash",
+                                         allow_change=True, interactive=lambda a: 1)
+        self.assertEqual(r.status, "FAIL")
+        self.assertIn("chsh -s", r.reasons[0])
+        self.assertIn("sudo chsh -s", r.reasons[0])
+
+    def test_pipeline_skips_chsh_after_failed_smoke(self):
+        # REQ-7 through run_pipeline: smoke FAIL must not reach chsh.
+        ctx = self.ctx()
+        ctx.current_shell = "/bin/bash"
+        ctx.interactive = lambda argv: self.fail(f"chsh ran: {argv}")
+        passed = lambda name: PhaseResult(name, "PASS")  # noqa: E731
+        with mock.patch.object(install, "preflight_phase", return_value=passed("preflight")), \
+                mock.patch.object(install, "packages_phase",
+                                  return_value=PhaseResult("packages", "SKIPPED")), \
+                mock.patch.object(install, "extra_desired_entries", return_value=([], [])), \
+                mock.patch.object(install, "transaction_phase",
+                                  return_value=(passed("transaction"), False)), \
+                mock.patch.object(phases, "post_install_phase",
+                                  return_value=passed("post-install")), \
+                mock.patch.object(phases, "smoke_phase", return_value=PhaseResult(
+                    "smoke", "FAIL", ["zsh -i -c exit returned 1"])), \
+                mock.patch.object(phases, "git_identity_phase",
+                                  return_value=passed("git-identity")), \
+                mock.patch.object(phases, "auth_phase", create=True,
+                                  return_value=PhaseResult("auth", "SKIPPED")), \
+                mock.patch.object(install, "gui_phase",
+                                  return_value=PhaseResult("gui", "SKIPPED")), \
+                redirect_stdout(io.StringIO()):
+            rc = install.run_pipeline(ctx, "install", install.Options())
+        self.assertEqual(rc, 1)
+        status = {p["phase"]: p for p in phases.read_status(self.target)["phases"]}
+        self.assertEqual(status["login-shell"]["status"], "SKIPPED")
+        self.assertIn("smoke-failed", status["login-shell"]["reasons"][0])
+
+
+class AuthTests(TempHome):
+    class CliRunner(ScriptedRunner):
+        def __init__(self, answers):
+            super().__init__()
+            self.answers = answers
+
+        def run(self, argv, *, timeout, check=True, env=None, input=None, cwd=None,
+                read_only=False):
+            argv = [str(a) for a in argv]
+            self.calls.append(argv)
+            self.envs = getattr(self, "envs", []) + [env]
+            rc, out, err = self.answers[(Path(argv[0]).name, *argv[1:])]
+            return subprocess.CompletedProcess(argv, rc, out, err)
+
+    CODEX_HELP = b"Manage login\n\nCommands:\n  status  Show login status\n  help  x\n"
+    CLAUDE_HELP = (b"Usage: claude auth [options] [command]\n\nCommands:\n"
+                   b"  login [options]   Sign in\n  status [options]  Show status\n")
+
+    def install_cli(self, *names):
+        bin_dir = self.home / ".local" / "bin"
+        bin_dir.mkdir(parents=True, exist_ok=True)
+        for name in names:
+            (bin_dir / name).write_text("#!/bin/sh\nexit 99\n")
+            os.chmod(bin_dir / name, 0o755)
+
+    def test_not_signed_in_is_auth_required(self):
+        # REQ-14: AUTH_REQUIRED is produced from the tools' own status commands.
+        self.install_cli("codex", "claude")
+        runner = self.CliRunner({
+            ("codex", "login", "--help"): (0, self.CODEX_HELP, b""),
+            ("codex", "login", "status"): (1, b"", b"Not logged in\n"),
+            ("claude", "auth", "--help"): (0, self.CLAUDE_HELP, b""),
+            ("claude", "auth", "status", "--json"):
+                (1, b'{"loggedIn": false, "authMethod": "none"}', b""),
+        })
+        r = phases.auth_phase(self.target, runner, {"PATH": "/usr/bin"})
+        self.assertEqual(r.status, "AUTH_REQUIRED")
+        self.assertEqual(r.details, {"codex": "not-signed-in", "claude": "not-signed-in"})
+        self.assertTrue(any("codex login" in reason for reason in r.reasons))
+        self.assertTrue(any("claude auth login" in reason for reason in r.reasons))
+        self.assertTrue(all(e["HOME"] == str(self.home) for e in runner.envs))
+        self.assertEqual(phases.exit_code([r]), 0)
+        text = "\n".join(phases.completion_lines([PhaseResult("packages", "PASS"), r]))
+        self.assertIn("auth needs sign-in", text)
+        summary = phases.format_summary([r])
+        self.assertIn("auth           AUTH_REQUIRED", summary)
+
+    def test_signed_in_passes_and_account_details_are_not_kept(self):
+        self.install_cli("codex", "claude")
+        runner = self.CliRunner({
+            ("codex", "login", "--help"): (0, self.CODEX_HELP, b""),
+            ("codex", "login", "status"): (0, b"Logged in as someone\n", b""),
+            ("claude", "auth", "--help"): (0, self.CLAUDE_HELP, b""),
+            ("claude", "auth", "status", "--json"):
+                (0, b'{"loggedIn": true, "email": "someone@example.invalid"}', b""),
+        })
+        r = phases.auth_phase(self.target, runner, {})
+        self.assertEqual(r.status, "PASS")
+        self.assertNotIn("example.invalid", json.dumps(r.to_dict()))
+        self.assertNotIn("someone", json.dumps(r.to_dict()))
+        text = "\n".join(phases.completion_lines([PhaseResult("packages", "PASS"), r]))
+        self.assertNotIn("Sign in", text)
+
+    def test_unverifiable_tools_do_not_claim_either_way(self):
+        self.install_cli("codex", "claude")
+        runner = self.CliRunner({
+            ("codex", "login", "--help"): (0, b"Commands:\n  help  x\n", b""),
+            ("claude", "auth", "--help"): (1, b"", b"unknown command"),
+        })
+        r = phases.auth_phase(self.target, runner, {})
+        self.assertEqual(r.status, "SKIPPED")
+        self.assertEqual(r.details, {"codex": "unverified", "claude": "unverified"})
+        self.assertEqual(len(runner.calls), 2)  # no status call without a listing
+        text = "\n".join(phases.completion_lines([r]))
+        self.assertIn("not verifiable here", text)
+        self.assertIn("codex login", text)
+
+    def test_nothing_installed_is_skipped(self):
+        runner = self.CliRunner({})
+        r = phases.auth_phase(self.target, runner, {})
+        self.assertEqual(r.status, "SKIPPED")
+        self.assertEqual(runner.calls, [])
+
+
+class ToolLinkTests(TempHome):
+    """REQ-5 / REQ-9: the ~/.local/bin tool links through the transaction."""
+
+    def setUp(self):
+        super().setUp()
+        self.repo = Path(self._tmp.name) / "repo"
+        (self.repo / "manifests").mkdir(parents=True)
+        (self.repo / "manifests" / "tools.json").write_text(
+            json.dumps({"tools": {"neovim": {}, "fzf": {}}}))
+        (self.repo / "bashrc").write_text("# bashrc\n")
+        (self.repo / "manifests" / "managed-paths.json").write_text(json.dumps(
+            {"schema": 1, "entries": [{"id": "bashrc", "dest": "{home}/.bashrc",
+                                       "kind": "symlink", "source": "bashrc"}]}))
+        self.bin_dir = self.target.data_home / "personal-dotfiles" / "bin"
+        self.nvim = self.home / ".local" / "bin" / "nvim"
+        self.fzf = self.home / ".local" / "bin" / "fzf"
+
+    def ctx(self, runner=None):
+        from installer.transaction import new_run_id
+        ctx = super().ctx(runner)
+        ctx.repo_root = self.repo
+        ctx.run_id = new_run_id()  # every transaction needs its own run id
+        return ctx
+
+    def links(self, *names):
+        return [{"id": f"tool-link-{n}", "dest": str(self.home / ".local/bin" / n),
+                 "kind": "symlink", "link_text": str(self.bin_dir / n)} for n in names]
+
+    def apply(self, packages_result):
+        """The pipeline's link step: extra entries, then the transaction."""
+
+        from installer import packages
+        ctx = self.ctx()
+        real = install.load_seam
+
+        def load(module, name):
+            if (module, name) == ("packages", "link_requests"):
+                return packages.link_requests
+            return None if module == "gui" else real(module, name)
+
+        with mock.patch.object(install, "load_seam", side_effect=load), \
+                redirect_stdout(io.StringIO()):
+            extra, _ = install.extra_desired_entries(ctx, packages_result, no_gui=True)
+            result, _ = install.transaction_phase(ctx, extra_entries=extra)
+        self.assertEqual(result.status, "PASS", result.reasons)
+        return result
+
+    def test_skipped_or_failed_packages_keep_installed_links(self):
+        self.apply(PhaseResult("packages", "PASS", [], {"links": self.links("nvim", "fzf")}))
+        self.assertEqual(os.readlink(self.nvim), str(self.bin_dir / "nvim"))
+        for skipped in (PhaseResult("packages", "SKIPPED", ["--no-packages"]),
+                        PhaseResult("packages", "FAIL", ["fzf: boom"],
+                                    {"links": self.links("nvim")})):
+            result = self.apply(skipped)
+            self.assertEqual(result.details["result"]["retired"], [], skipped)
+            self.assertEqual(os.readlink(self.nvim), str(self.bin_dir / "nvim"))
+            self.assertEqual(os.readlink(self.fzf), str(self.bin_dir / "fzf"))
+        # A complete packages run still decides: a dropped link is retired.
+        result = self.apply(PhaseResult("packages", "PASS", [],
+                                        {"links": self.links("nvim")}))
+        self.assertEqual(result.details["result"]["retired"], ["tool-link-fzf"])
+        self.assertFalse(os.path.lexists(self.fzf))
+        self.assertTrue(self.nvim.is_symlink())
+
+    def seam(self, links):
+        from installer import packages
+        seen = {}
+
+        def run(target, platform, runner, *, dry_run=False, only=None):
+            seen["only"] = only
+            return {"phase": "packages", "status": "PASS", "reasons": [],
+                    "details": {"links": links, "tools_selected": list(only or [])}}
+
+        def load(module, name):
+            if (module, name) == ("packages", "run_packages_phase"):
+                return run
+            if (module, name) == ("packages", "link_requests"):
+                return packages.link_requests
+            return None
+        return load, seen
+
+    def test_install_one_tool_creates_its_link(self):
+        load, seen = self.seam(self.links("nvim"))
+        with mock.patch.object(install, "load_seam", side_effect=load), \
+                redirect_stdout(io.StringIO()) as out:
+            rc = install.cmd_packages(self.ctx(), ["neovim"], False)
+        self.assertEqual(rc, 0, out.getvalue())
+        self.assertEqual(seen["only"], ["neovim"])
+        self.assertEqual(os.readlink(self.nvim), str(self.bin_dir / "nvim"))
+        status = {p["phase"]: p["status"] for p in phases.read_status(self.target)["phases"]}
+        self.assertEqual(status, {"packages": "PASS", "transaction": "PASS"})
+        # A never-installed home gets the link only, not every managed path.
+        self.assertFalse(os.path.lexists(self.home / ".bashrc"))
+
+    def test_install_one_tool_on_an_installed_home_retires_nothing(self):
+        from installer import packages
+        nvim_link = packages.link_requests({"links": self.links("nvim")})
+        with redirect_stdout(io.StringIO()):
+            installed, _ = install.transaction_phase(self.ctx(), extra_entries=nvim_link)
+        self.assertEqual(installed.status, "PASS", installed.reasons)
+
+        load, _ = self.seam(self.links("fzf"))
+        with mock.patch.object(install, "load_seam", side_effect=load), \
+                redirect_stdout(io.StringIO()) as out:
+            rc = install.cmd_packages(self.ctx(), ["fzf"], False)
+        self.assertEqual(rc, 0, out.getvalue())
+        self.assertEqual(os.readlink(self.fzf), str(self.bin_dir / "fzf"))
+        self.assertEqual(os.readlink(self.nvim), str(self.bin_dir / "nvim"))
+        self.assertEqual(os.readlink(self.home / ".bashrc"),
+                         str(self.target.repo_root / "bashrc"))
+        tx = {p["phase"]: p for p in phases.read_status(self.target)["phases"]}
+        self.assertEqual(tx["transaction"]["details"]["result"]["retired"], [])
+        from installer import transaction
+        self.assertEqual(set(transaction.load_status(self.target)["entries"]),
+                         {"bashrc", "tool-link-nvim", "tool-link-fzf"})
+
+    def test_dry_run_creates_no_link(self):
+        load, _ = self.seam(self.links("nvim"))
+        with mock.patch.object(install, "load_seam", side_effect=load), \
+                redirect_stdout(io.StringIO()):
+            install.cmd_packages(self.ctx(), ["neovim"], True)
+        self.assertFalse(os.path.lexists(self.nvim))
+
+
+class DriftReportingTests(TempHome):
+    def test_kept_local_changes_are_reported(self):
+        from installer.transaction import DesiredEntry
+        entry = DesiredEntry("gitconfig", self.home / ".gitconfig", "file",
+                             content=b"x", mode=0o644)
+        other = DesiredEntry("zshrc", self.home / ".zshrc", "symlink", link_text="/z")
+
+        class Applied:
+            changed, retired, drifted, backup_dir = [], [], [], None
+
+        for field, kept in (("kept", ["gitconfig"]), ("drifted_kept", [str(entry.dest)]),
+                            ("kept", [{"id": "gitconfig", "dest": str(entry.dest)}])):
+            applied = Applied()
+            setattr(applied, field, kept)
+            self.assertEqual(install.kept_local_changes(applied, [entry, other]),
+                             [("gitconfig", str(entry.dest))])
+            with redirect_stdout(io.StringIO()) as out:
+                install.report_entries(self.ctx(), [entry, other], {}, applied, {})
+            lines = out.getvalue().splitlines()
+            self.assertIn(ui.target_line(entry.dest,
+                                         "kept your local changes (use -f to overwrite)"),
+                          lines)
+            self.assertIn(ui.target_line(other.dest, "already up-to-date"), lines)
+        self.assertEqual(install.kept_local_changes(Applied(), [entry]), [])
+
+    def test_real_transaction_keeps_a_changed_copy_until_forced(self):
+        # Wiring against installer.transaction: a copied file the user
+        # changed is kept (YELLOW line + reason) and -f overwrites it.
+        from installer import transaction
+        if "force" not in inspect.signature(transaction.Transaction.apply).parameters:
+            self.skipTest("transaction without keep/force support")
+        repo = Path(self._tmp.name) / "repo"
+        (repo / "manifests").mkdir(parents=True)
+        (repo / "gitconfig.stub").write_text("[include]\n")
+        (repo / "manifests" / "managed-paths.json").write_text(json.dumps(
+            {"schema": 1, "entries": [{"id": "gitconfig", "dest": "{home}/.gitconfig",
+                                       "kind": "copy", "source": "gitconfig.stub"}]}))
+        dest = self.home / ".gitconfig"
+
+        def run(force=False):
+            ctx = self.ctx()
+            ctx.repo_root = repo
+            ctx.run_id = transaction.new_run_id()
+            with redirect_stdout(io.StringIO()) as out:
+                result, _ = install.transaction_phase(ctx, force=force)
+            self.assertEqual(result.status, "PASS", result.reasons)
+            return result, out.getvalue()
+
+        run()
+        dest.write_text("[include]\n[user]\n\tname = Me\n")
+        result, out = run()
+        self.assertIn(ui.target_line(dest, "kept your local changes (use -f to overwrite)"),
+                      out.splitlines())
+        self.assertIn("(use -f to overwrite)", result.reasons[0])
+        self.assertIn("name = Me", dest.read_text())
+        result, out = run(force=True)
+        self.assertEqual(dest.read_text(), "[include]\n")
+        self.assertIn("your local changes were overwritten: -f", out)
+
+    def test_force_is_passed_only_when_apply_accepts_it(self):
+        class Old:
+            def apply(self, desired, *, generation):
+                pass
+
+        class New:
+            def apply(self, desired, *, generation, force=False):
+                pass
+
+        self.assertEqual(install._apply_kwargs(Old(), {}, True), {"generation": {}})
+        self.assertEqual(install._apply_kwargs(New(), {}, True),
+                         {"generation": {}, "force": True})
+        self.assertEqual(install._apply_kwargs(New(), {}, False),
+                         {"generation": {}, "force": False})
+
+
 class PostInstallTests(TempHome):
     def test_unreachable_user_manager_is_relogin(self):
         runner = ScriptedRunner(
@@ -363,6 +765,50 @@ class PostInstallTests(TempHome):
         self.assertEqual(r.status, "RELOGIN_REQUIRED")
         self.assertIn("systemd-user-manager-unavailable", r.reasons)
         self.assertNotIn(["systemctl", "--user", "daemon-reload"], runner.calls)
+
+    def reachable_post(self, runner):
+        repo_root = self.home / "repo"
+        repo_root.mkdir(exist_ok=True)
+        return phases.post_install_phase(self.target, runner, repo_root=repo_root,
+                                         run_id="20260101T000000Z-0123abcd",
+                                         systemd_units_applied=True)
+
+    def enable_timer(self):
+        timer = "tmux-resurrect-autosave.timer"
+        wants = self.target.config_home / "systemd/user/timers.target.wants" / timer
+        wants.parent.mkdir(parents=True)
+        os.symlink(wants.parent.parent / timer, wants)
+
+    def test_reachable_manager_starts_the_autosave_timer(self):
+        # REQ-4: daemon-reload alone does not start a newly wanted timer.
+        self.enable_timer()
+        runner = ScriptedRunner(which={"systemctl": "/bin/systemctl"})
+        r = self.reachable_post(runner)
+        self.assertEqual(r.status, "PASS", r.reasons)
+        reload = runner.calls.index(["systemctl", "--user", "daemon-reload"])
+        start = runner.calls.index(["systemctl", "--user", "start",
+                                    "tmux-resurrect-autosave.timer"])
+        self.assertLess(reload, start)
+        self.assertEqual(r.details["autosave_timer"], "started")
+        # Enabling stays the manifest's wants link: no 'enable' call.
+        self.assertFalse(any("enable" in c for c in runner.calls))
+
+    def test_timer_start_failure_is_reported(self):
+        self.enable_timer()
+        runner = ScriptedRunner(responses={("systemctl", "--user", "start"): 1},
+                                which={"systemctl": "/bin/systemctl"})
+        r = self.reachable_post(runner)
+        self.assertEqual(r.status, "FAIL")
+        self.assertTrue(any("start tmux-resurrect-autosave.timer failed" in reason
+                            for reason in r.reasons))
+
+    def test_timer_not_enabled_is_not_started(self):
+        runner = ScriptedRunner(which={"systemctl": "/bin/systemctl"})
+        r = self.reachable_post(runner)
+        self.assertEqual(r.status, "PASS")
+        self.assertEqual(r.details["autosave_timer"], "not-enabled")
+        self.assertFalse(any(c[:3] == ["systemctl", "--user", "start"]
+                             for c in runner.calls))
 
     def test_plugin_updates_follow_skip_flags(self):
         repo_root = self.home / "repo"
@@ -443,7 +889,14 @@ class TmuxSmokeTests(TempHome):
         for argv, cenv in calls:
             self.assertIn("-L", argv)
             self.assertNotIn("TMUX", cenv)
-            self.assertTrue(cenv["TMUX_TMPDIR"].startswith(tempfile.gettempdir()))
+            self.assertTrue(os.path.basename(cenv["TMUX_TMPDIR"]).startswith("pdfs-"))
+            name = argv[argv.index("-L") + 1]
+            socket = os.path.join(cenv["TMUX_TMPDIR"], f"tmux-{os.getuid()}", name)
+            self.assertLessEqual(len(socket), 100)
+        # One short -L name for every call, and the server is killed by it.
+        names = {argv[argv.index("-L") + 1] for argv, _ in calls}
+        self.assertEqual(len(names), 1)
+        self.assertLessEqual(len(names.pop()), 16)
         self.assertEqual(calls[-1][0][-1], "kill-server")
         self.assertFalse(os.path.exists(calls[-1][1]["TMUX_TMPDIR"]))
         return status, reason
@@ -455,6 +908,24 @@ class TmuxSmokeTests(TempHome):
         status, reason = self.smoke("this-is-not-a-tmux-command\n")
         self.assertEqual(status, "FAIL")
         self.assertIn("config", reason)
+
+    def test_long_tmpdir_still_passes(self):
+        # TQ-5: a long per-session TMPDIR used to push the socket path past
+        # sun_path, so a good config failed with 'File name too long'.
+        long_root = Path(self._tmp.name) / ("t" * 60) / ("u" * 60)
+        long_root.mkdir(parents=True)
+        with mock.patch.object(tempfile, "tempdir", str(long_root)):
+            self.assertEqual(tempfile.gettempdir(), str(long_root))
+            status, reason = self.smoke("set -g status off\n")
+            self.assertEqual((status, reason), ("PASS", ""))
+            self.assertEqual(self.smoke("this-is-not-a-tmux-command\n")[0], "FAIL")
+        self.assertEqual(list(long_root.iterdir()), [])
+
+    def test_no_short_directory_is_a_clear_failure(self):
+        with mock.patch.object(phases, "_short_socket_dir", return_value=None):
+            status, reason = phases.smoke_tmux(self.target, self.TmuxRunner(), {})
+        self.assertEqual(status, "FAIL")
+        self.assertIn("TMPDIR=/tmp", reason)
 
 
 class GitIdentityTests(TempHome):

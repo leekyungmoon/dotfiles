@@ -40,6 +40,13 @@ SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 GIT_TIMEOUT = 300.0
 SMOKE_TIMEOUT = 300.0
 PLUGIN_TIMEOUT = 900.0
+AUTH_TIMEOUT = 30.0
+
+# Enabled by the manifest's timers.target.wants link; started after reload.
+AUTOSAVE_TIMER = "tmux-resurrect-autosave.timer"
+
+# sun_path is 108 bytes including the NUL; stay well below it.
+SOCKET_PATH_MAX = 100
 
 
 @dataclasses.dataclass
@@ -296,6 +303,25 @@ def plugins_step(target, runner, *, env, skip_zplug: bool, skip_vimplug: bool):
     return statuses, reasons, details
 
 
+def start_autosave_timer(target, runner, env) -> tuple[str, list[str], str]:
+    """Start the autosave timer now; daemon-reload does not start new wants.
+
+    Enabling stays the manifest's ``timers.target.wants`` link, so the timer
+    also starts with every later user manager. ``start`` is a no-op for a
+    timer that is already active.
+    """
+
+    wants = target.config_home / "systemd" / "user" / "timers.target.wants" / AUTOSAVE_TIMER
+    if not os.path.lexists(wants):
+        return PASS, [], "not-enabled"
+    completed = runner.run(["systemctl", "--user", "start", AUTOSAVE_TIMER],
+                           timeout=60, check=False, env=env)
+    if completed.returncode != 0:
+        return FAIL, [f"systemctl --user start {AUTOSAVE_TIMER} failed: "
+                      + _tail(completed.stderr)], "start-failed"
+    return PASS, [], "started"
+
+
 def post_install_phase(target, runner, *, repo_root: Path, run_id: str,
                        systemd_units_applied: bool,
                        env: dict[str, str] | None = None,
@@ -320,6 +346,10 @@ def post_install_phase(target, runner, *, repo_root: Path, run_id: str,
                                timeout=60, check=False, env=env)
         if completed.returncode == 0:
             details["systemd"] = "daemon-reloaded"
+            status, why, timer = start_autosave_timer(target, runner, env)
+            statuses.append(status)
+            reasons += why
+            details["autosave_timer"] = timer
         else:
             statuses.append(FAIL)
             reasons.append("systemctl --user daemon-reload failed: "
@@ -351,6 +381,32 @@ def smoke_zsh(target, runner, env: dict[str, str]) -> tuple[str, str]:
     return PASS, ""
 
 
+def _socket_path(socket_dir: str, name: str) -> str:
+    return os.path.join(socket_dir, f"tmux-{os.getuid()}", name)
+
+
+def _short_socket_dir(name: str, env: dict[str, str]) -> str | None:
+    """A private ``mkdtemp`` directory whose ``-L`` socket path fits sun_path."""
+
+    candidates = []
+    for root in (tempfile.gettempdir(), "/tmp", env.get("XDG_RUNTIME_DIR")):
+        if root and root not in candidates:
+            candidates.append(root)
+    for root in candidates:
+        # mkdtemp adds '/' + prefix + 8 random characters.
+        projected = _socket_path(os.path.join(root, "pdfs-" + "x" * 8), name)
+        if len(projected) > SOCKET_PATH_MAX or not os.path.isdir(root):
+            continue
+        try:
+            socket_dir = tempfile.mkdtemp(prefix="pdfs-", dir=root)
+        except OSError:
+            continue
+        if len(_socket_path(socket_dir, name)) <= SOCKET_PATH_MAX:
+            return socket_dir
+        shutil.rmtree(socket_dir, ignore_errors=True)
+    return None
+
+
 def smoke_tmux(target, runner, env: dict[str, str]) -> tuple[str, str]:
     """Load ~/.tmux.conf into a throwaway server on its own socket."""
 
@@ -358,8 +414,14 @@ def smoke_tmux(target, runner, env: dict[str, str]) -> tuple[str, str]:
     if tmux is None:
         return FAIL, "tmux-not-installed"
     conf = target.home / ".tmux.conf"
-    socket_dir = tempfile.mkdtemp(prefix="pdf-smoke-")
-    name = f"pdf-smoke-{os.getpid()}-{secrets.token_hex(4)}"
+    # A short, unique -L name inside a private TMUX_TMPDIR: isolated from
+    # every other server, and short enough for sun_path even when TMPDIR
+    # is a long per-session directory.
+    name = f"pdfs{os.getpid()}{secrets.token_hex(2)}"
+    socket_dir = _short_socket_dir(name, env)
+    if socket_dir is None:
+        return FAIL, ("no temporary directory is short enough for a tmux socket "
+                      f"(limit {SOCKET_PATH_MAX} characters); set TMPDIR=/tmp")
     tenv = dict(env)
     for key in ("TMUX", "TMUX_PANE"):
         tenv.pop(key, None)
@@ -412,13 +474,52 @@ def _preferred_zsh(runner) -> str | None:
     return runner.which("zsh")
 
 
+def password_status(runner, username: str) -> str | None:
+    """``P``, ``L`` or ``NP`` from ``passwd -S`` for the own account, or None.
+
+    ``passwd -S`` reports only whether the account has a usable (P), locked
+    (L) or empty (NP) password; it never prints the hash.
+    """
+
+    try:
+        completed = runner.run(["passwd", "-S"], timeout=15, check=False,
+                               input=b"", read_only=True)
+    except Exception:
+        return None
+    if completed.returncode != 0:
+        return None
+    fields = _out(completed).split()
+    if len(fields) < 2 or (username and fields[0] != username):
+        return None
+    return fields[1] if fields[1] in ("P", "L", "NP") else None
+
+
+def _sudo_without_password(runner) -> bool:
+    if runner.which("sudo") is None:
+        return False
+    try:
+        completed = runner.run(["sudo", "-n", "true"], timeout=15, check=False,
+                               input=b"", read_only=True)
+    except Exception:
+        return False
+    return completed.returncode == 0
+
+
 def login_shell_phase(target, runner, *, current_shell: str,
-                      allow_change: bool, interactive=None) -> PhaseResult:
+                      allow_change: bool, interactive=None,
+                      checks_passed: bool = True) -> PhaseResult:
     """Make zsh the passwd login shell.
 
     ``interactive`` is a callable ``(argv) -> returncode`` that runs attached
     to the terminal, because chsh prompts for a password; without it the call
-    goes through ``runner`` (tests, non-interactive use).
+    goes through ``runner`` (tests, non-interactive use). ``checks_passed``
+    is false when the zsh/tmux smoke checks failed: the login shell is then
+    left alone, so a broken zshrc never becomes the next login's shell.
+
+    Accounts without a usable password (cloud-init's default user, locked
+    with NOPASSWD sudo) cannot pass chsh's PAM check; they are changed with
+    ``sudo -n chsh`` when sudo needs no password, and otherwise get the sudo
+    command to run instead of a chsh that cannot succeed.
     """
 
     if Path(current_shell or "").name == "zsh":
@@ -431,21 +532,153 @@ def login_shell_phase(target, runner, *, current_shell: str,
     if zsh is None:
         return PhaseResult("login-shell", FAIL, ["zsh-not-installed"],
                            {"shell": current_shell})
-    ui.log(ui.YELLOW("Please type your password if you wish to change the "
-                     "default shell to ZSH"))
-    if interactive is not None:
-        returncode = interactive(["chsh", "-s", zsh])
+    user = target.username
+    plain = f"chsh -s {zsh}"
+    with_sudo = f"sudo chsh -s {zsh} {user}"
+    if not checks_passed:
+        ui.log(ui.YELLOW("The zsh/tmux smoke checks failed; the login shell was "
+                         f"not changed. Fix them, then run: {plain}"))
+        return PhaseResult("login-shell", SKIPPED,
+                           [f"smoke-failed; after fixing it run: {plain}"],
+                           {"shell": current_shell, "command": plain})
+
+    password = password_status(runner, user)
+    if password in ("L", "NP") and _sudo_without_password(runner):
+        ui.log(ui.YELLOW("This account has no usable password; changing the "
+                         "default shell to ZSH with sudo"))
+        completed = runner.run(["sudo", "-n", "chsh", "-s", zsh, user],
+                               timeout=60, check=False, input=b"")
+        if completed.returncode != 0:
+            return PhaseResult("login-shell", FAIL,
+                               [f"sudo chsh failed ({completed.returncode}): "
+                                f"{_tail(completed.stderr)}; run: {with_sudo}"],
+                               {"shell": current_shell, "command": with_sudo})
+    elif password == "L":
+        # chsh authenticates the caller with PAM, which a locked password
+        # can never pass; do not run a prompt that cannot succeed.
+        ui.log(ui.YELLOW("This account has a locked password, so chsh cannot "
+                         f"authenticate it. Run: {with_sudo}"))
+        return PhaseResult("login-shell", SKIPPED,
+                           [f"account has no usable password; run: {with_sudo}"],
+                           {"shell": current_shell, "command": with_sudo})
     else:
-        returncode = runner.run(["chsh", "-s", zsh], timeout=300,
-                                check=False).returncode
-    if returncode != 0:
-        return PhaseResult("login-shell", FAIL,
-                           [f"chsh failed ({returncode}); run: chsh -s {zsh}"],
-                           {"shell": current_shell})
+        ui.log(ui.YELLOW("Please type your password if you wish to change the "
+                         "default shell to ZSH"))
+        if interactive is not None:
+            returncode = interactive(["chsh", "-s", zsh])
+        else:
+            returncode = runner.run(["chsh", "-s", zsh], timeout=300,
+                                    check=False).returncode
+        if returncode != 0:
+            return PhaseResult("login-shell", FAIL,
+                               [f"chsh failed ({returncode}); run: {plain} "
+                                f"(an account without a password: {with_sudo})"],
+                               {"shell": current_shell, "command": plain})
     ui.log("Successfully changed the default shell, please re-login")
     return PhaseResult("login-shell", RELOGIN_REQUIRED,
                        ["log out and back in for zsh to become the login shell"],
                        {"shell": zsh})
+
+
+# --- AI CLI sign-in ------------------------------------------------------------
+
+def _tool_binary(target, runner, name: str) -> str | None:
+    """The installed CLI: ~/.local/bin, the installer bin dir, then PATH."""
+
+    for candidate in (target.home / ".local" / "bin" / name,
+                      target.data_home / "personal-dotfiles" / "bin" / name):
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return str(candidate)
+    return runner.which(name)
+
+
+def _text(data) -> str:
+    if isinstance(data, bytes):
+        return data.decode("utf-8", "replace")
+    return data or ""
+
+
+def _lists_subcommand(runner, argv: list[str], name: str, env) -> bool:
+    """Whether ``argv`` (a ``--help`` call) lists the ``name`` subcommand."""
+
+    helped = runner.run(argv, timeout=AUTH_TIMEOUT, check=False, env=env,
+                        input=b"", read_only=True)
+    listed = [line.split()[0] for line in _text(helped.stdout).splitlines()
+              if line.startswith("  ") and line.split()]
+    return helped.returncode == 0 and name in listed
+
+
+def _codex_signed_in(runner, binary: str, env) -> bool | None:
+    """``codex login status``: 0 when signed in, 'Not logged in' otherwise."""
+
+    if not _lists_subcommand(runner, [binary, "login", "--help"], "status", env):
+        return None
+    completed = runner.run([binary, "login", "status"], timeout=AUTH_TIMEOUT,
+                           check=False, env=env, input=b"", read_only=True)
+    if completed.returncode == 0:
+        return True
+    said = (_text(completed.stdout) + _text(completed.stderr)).lower()
+    return False if "not logged in" in said else None
+
+
+def _claude_signed_in(runner, binary: str, env) -> bool | None:
+    """``claude auth status`` (JSON ``loggedIn``) when this build has it."""
+
+    if not _lists_subcommand(runner, [binary, "auth", "--help"], "status", env):
+        return None
+    completed = runner.run([binary, "auth", "status", "--json"],
+                           timeout=AUTH_TIMEOUT, check=False, env=env, input=b"",
+                           read_only=True)
+    try:
+        # Only the boolean is read; the account details are discarded.
+        logged_in = json.loads(_text(completed.stdout)).get("loggedIn")
+    except (ValueError, AttributeError):
+        return None
+    if not isinstance(logged_in, bool):
+        return None
+    return logged_in
+
+
+AUTH_CHECKS = (
+    ("codex", _codex_signed_in, "run `codex login`"),
+    ("claude", _claude_signed_in, "run `claude auth login` (or `claude`, then /login)"),
+)
+
+
+def auth_phase(target, runner, env: dict[str, str] | None = None) -> PhaseResult:
+    """Whether the installed AI CLIs are signed in, via their own status commands.
+
+    Each check is the tool's documented non-interactive status command, run
+    as the target user; credential files are never opened here. A tool that
+    is not installed or whose answer cannot be read is ``unverified`` and does
+    not count either way.
+    """
+
+    cenv = child_env(target, env)
+    statuses: list[str] = []
+    reasons: list[str] = []
+    details: dict[str, str] = {}
+    for name, check, remedy in AUTH_CHECKS:
+        binary = _tool_binary(target, runner, name)
+        if binary is None:
+            details[name] = "not-installed"
+            continue
+        try:
+            signed_in = check(runner, binary, cenv)
+        except Exception:
+            signed_in = None
+        if signed_in is None:
+            details[name] = "unverified"
+        elif signed_in:
+            details[name] = "signed-in"
+            statuses.append(PASS)
+        else:
+            details[name] = "not-signed-in"
+            statuses.append(AUTH_REQUIRED)
+            reasons.append(f"{name} is not signed in; {remedy}")
+    if not statuses:
+        return PhaseResult("auth", SKIPPED, ["sign-in-not-verifiable"], details)
+    return PhaseResult("auth", worst(statuses), reasons, details)
 
 
 # --- git identity -------------------------------------------------------------
@@ -574,7 +807,15 @@ def completion_lines(results: list[PhaseResult]) -> list[str]:
     by_phase = {r.phase: r for r in results}
     follow: list[str] = []
     packages = by_phase.get("packages")
-    if packages is not None and packages.status != SKIPPED:
+    auth = by_phase.get("auth")
+    if auth is not None:
+        unverified = [name for name, _, _ in AUTH_CHECKS
+                      if auth.details.get(name) == "unverified"]
+        hints = {"codex": "`codex login`", "claude": "`claude` (then /login)"}
+        if unverified:
+            follow.append("Sign in if you have not yet (not verifiable here): "
+                          + ", ".join(hints[n] for n in unverified) + ".")
+    elif packages is not None and packages.status != SKIPPED:
         follow.append("Sign in to the AI CLIs if you have not yet: `codex login`, "
                       "and `claude` (then /login).")
     for result in results:
@@ -583,6 +824,10 @@ def completion_lines(results: list[PhaseResult]) -> list[str]:
     shell = by_phase.get("login-shell")
     if shell is not None and shell.status == RELOGIN_REQUIRED:
         follow.append("Log out and back in so zsh becomes your login shell.")
+    elif (shell is not None and shell.status == SKIPPED
+          and shell.details.get("command")):
+        follow.append("zsh is not your login shell yet: "
+                      + "; ".join(shell.reasons))
     post = by_phase.get("post-install")
     if post is not None and "systemd-user-manager-unavailable" in post.reasons:
         follow.append("User services (tmux) start at the next graphical login.")

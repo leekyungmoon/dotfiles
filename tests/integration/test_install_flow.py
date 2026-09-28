@@ -89,9 +89,11 @@ def overlay_files() -> list[str]:
 class FakeRunner(Runner):
     """Real git (isolated config); everything else recorded and answered."""
 
-    def __init__(self, git_env: dict[str, str], *, systemctl: bool = True):
+    def __init__(self, git_env: dict[str, str], *, systemctl: bool = True,
+                 zsh_rc: int = 0):
         self.git_env = git_env
         self.systemctl = systemctl
+        self.zsh_rc = zsh_rc
         self.calls: list[list[str]] = []
 
     def run(self, argv, *, timeout, check=True, env=None, input=None, cwd=None,
@@ -103,8 +105,11 @@ class FakeRunner(Runner):
             merged.update(self.git_env)
             return super().run(argv, timeout=timeout, check=check, env=merged,
                                input=input, cwd=cwd, read_only=read_only)
+        if argv[0] == f"{FAKE}/zsh" and argv[1:] == ["-i", "-c", "exit"]:
+            return subprocess.CompletedProcess(argv, self.zsh_rc, b"",
+                                               b"zshrc: parse error" if self.zsh_rc else b"")
         if argv[0].startswith(FAKE) or argv[0] in ("chsh", "systemctl", "sudo",
-                                                   "apt-get"):
+                                                   "apt-get", "passwd"):
             return subprocess.CompletedProcess(argv, 0, b"", b"")
         raise AssertionError(f"unexpected command {argv}")
 
@@ -139,6 +144,8 @@ def _tree_digest(root: Path, skip=()) -> dict[str, str]:
 
 
 class InstallFlowTests(unittest.TestCase):
+    DETACHED_BRANCH = "pdf-flow-detached"
+
     @classmethod
     def setUpClass(cls):
         cls._tmp = tempfile.TemporaryDirectory(prefix="pdf-flow-")
@@ -182,6 +189,12 @@ class InstallFlowTests(unittest.TestCase):
         mirror = root / "mirror.git"
         _git(env, "clone", "--bare", "--quiet", str(REPO_ROOT), str(mirror))
         branch = _git(env, "-C", str(REPO_ROOT), "rev-parse", "--abbrev-ref", "HEAD")
+        if branch == "HEAD":
+            # Detached checkout (CI, 'git checkout <sha>'): name the commit
+            # in the scratch mirror only; REPO_ROOT is read, never changed.
+            branch = cls.DETACHED_BRANCH
+            _git(env, "-C", str(mirror), "fetch", "--quiet", str(REPO_ROOT),
+                 f"+HEAD:refs/heads/{branch}")
         work = root / "work"
         _git(env, "clone", "--quiet", "--branch", branch, str(mirror), str(work))
         for rel in overlay_files():
@@ -319,7 +332,8 @@ class InstallFlowTests(unittest.TestCase):
         by_phase = self.phases()
         self.assertEqual(list(by_phase), ["preflight", "packages", "transaction",
                                           "post-install", "smoke", "login-shell",
-                                          "git-identity", "gui"])
+                                          "git-identity", "auth", "gui"])
+        self.assertEqual(by_phase["auth"]["status"], "SKIPPED")  # no AI CLIs here
         self.assertEqual(by_phase["packages"]["status"], "SKIPPED")
         self.assertEqual(by_phase["gui"]["status"], "SKIPPED")
         self.assertEqual(by_phase["transaction"]["status"], "PASS")
@@ -340,6 +354,12 @@ class InstallFlowTests(unittest.TestCase):
         resurrect = self.target.data_home / "tmux" / "resurrect"
         self.assertEqual(resurrect.stat().st_mode & 0o777, 0o700)
         self.assertIn(["systemctl", "--user", "daemon-reload"], runner.calls)
+        # REQ-4: the newly wanted autosave timer is started, after the reload.
+        start = ["systemctl", "--user", "start", "tmux-resurrect-autosave.timer"]
+        self.assertIn(start, runner.calls)
+        self.assertLess(runner.calls.index(["systemctl", "--user", "daemon-reload"]),
+                        runner.calls.index(start))
+        self.assertEqual(by_phase["post-install"]["details"]["autosave_timer"], "started")
         # zsh plugin prefill ran (fake zsh), nvim is absent here.
         self.assertTrue(any(c[1:2] == ["-c"] and "antidote" in c[-1]
                             for c in runner.ran("zsh")))
@@ -463,6 +483,80 @@ class InstallFlowTests(unittest.TestCase):
                       "shell to ZSH", out)
         self.assertEqual(self.phases()["login-shell"]["status"], "RELOGIN_REQUIRED")
         self.assertIn("Log out and back in so zsh becomes your login shell.", out)
+
+    def test_failed_smoke_keeps_the_login_shell(self):
+        # REQ-7: a zsh that fails 'zsh -i -c exit' never becomes the login shell.
+        self.clone()
+        self.shell = "/bin/bash"
+        rc, out, _ = self.main("--no-packages", "--no-gui",
+                               runner=FakeRunner(self.git_env, zsh_rc=1))
+        self.assertEqual(rc, 1, out)
+        self.assertEqual(self.chsh_calls, [])
+        by_phase = self.phases()
+        self.assertEqual(by_phase["smoke"]["status"], "FAIL")
+        self.assertEqual(by_phase["login-shell"]["status"], "SKIPPED")
+        self.assertIn("smoke-failed", by_phase["login-shell"]["reasons"][0])
+        self.assertIn("zsh is not your login shell yet", out)
+
+    def packages_seam(self, names):
+        """A packages phase that 'installs' ``names`` and requests their links."""
+
+        from installer import packages
+        real = install.load_seam
+        bin_dir = self.target.data_home / "personal-dotfiles" / "bin"
+        link_names = {"neovim": "nvim", "fzf": "fzf"}
+
+        def run(target, platform, runner, *, dry_run=False, only=None):
+            chosen = list(only or names)
+            return {"phase": "packages", "status": "PASS", "reasons": [],
+                    "details": {"links": [
+                        {"id": f"tool-link-{link_names[n]}",
+                         "dest": str(self.home / ".local/bin" / link_names[n]),
+                         "kind": "symlink", "link_text": str(bin_dir / link_names[n])}
+                        for n in chosen]}}
+
+        def seam(module, name):
+            if (module, name) == ("packages", "run_packages_phase"):
+                return run
+            if (module, name) == ("packages", "link_requests"):
+                return packages.link_requests
+            return real(module, name)
+        return seam
+
+    def test_no_packages_rerun_keeps_tool_links(self):
+        # REQ-5: --no-packages must not retire ~/.local/bin/{nvim,fzf,...}.
+        self.clone()
+        nvim = self.home / ".local" / "bin" / "nvim"
+        with mock.patch.object(install, "load_seam",
+                               side_effect=self.packages_seam(["neovim"])):
+            rc, out, _ = self.main("--no-gui", "--no-shell-change")
+        self.assertEqual(rc, 0, out)
+        self.assertTrue(nvim.is_symlink())
+        for argv in (FLAGS, ["repair", *FLAGS]):
+            rc, out, _ = self.main(*argv)
+            self.assertEqual(rc, 0, out)
+            self.assertTrue(nvim.is_symlink(), argv)
+            self.assertNotIn("no longer managed", out)
+            self.assertIn("tool-link-nvim", transaction.load_status(self.target)["entries"])
+        self.assert_installed()
+
+    def test_install_one_tool_creates_its_link(self):
+        # REQ-9: 'dotfiles install fzf' -> 'install.py packages --only fzf'.
+        self.clone()
+        self.assertEqual(self.install()[0], 0)
+        before = set(transaction.load_status(self.target)["entries"])
+        with mock.patch.object(install, "load_seam",
+                               side_effect=self.packages_seam(["fzf"])):
+            rc, out, _ = self.main("packages", "--only", "fzf")
+        self.assertEqual(rc, 0, out)
+        fzf = self.home / ".local" / "bin" / "fzf"
+        self.assertEqual(os.readlink(fzf), str(self.target.data_home
+                                              / "personal-dotfiles" / "bin" / "fzf"))
+        after = set(transaction.load_status(self.target)["entries"])
+        self.assertEqual(after, before | {"tool-link-fzf"})
+        self.assertNotIn("no longer managed", out)
+        self.assert_installed()
+        self.assertEqual(self.phases()["transaction"]["details"]["result"]["retired"], [])
 
     def test_dry_run_changes_nothing(self):
         self.clone()
