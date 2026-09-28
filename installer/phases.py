@@ -1,0 +1,614 @@
+"""Phase results and the phases that run after the transaction.
+
+Every phase reports a :class:`PhaseResult`. A phase that did not run is
+``SKIPPED``, never ``PASS``. Post-install, smoke checks and the login shell
+change all go through the injected runner so tests never touch the real
+system manager, shell database or tmux server.
+"""
+
+from __future__ import annotations
+
+import dataclasses
+import json
+import os
+import re
+import secrets
+import shutil
+import tempfile
+from pathlib import Path
+
+from installer import ui
+
+PASS = "PASS"
+FAIL = "FAIL"
+SKIPPED = "SKIPPED"
+PENDING_GUI = "PENDING_GUI"
+RELOGIN_REQUIRED = "RELOGIN_REQUIRED"
+AUTH_REQUIRED = "AUTH_REQUIRED"
+
+# Reported by installer/gui.py on Ubuntu 22.04; permanent, never retried.
+REMAPPER_UNSUPPORTED_REASON = "input-remapper-1.4-cannot-express-intent"
+STATUSES = (PASS, FAIL, SKIPPED, PENDING_GUI, RELOGIN_REQUIRED, AUTH_REQUIRED)
+
+# Worst first; the overall status of a run is the worst phase status.
+_SEVERITY = (FAIL, AUTH_REQUIRED, RELOGIN_REQUIRED, PENDING_GUI, SKIPPED, PASS)
+
+STATUS_SCHEMA = 1
+PLUGIN_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+
+GIT_TIMEOUT = 300.0
+SMOKE_TIMEOUT = 300.0
+PLUGIN_TIMEOUT = 900.0
+
+
+@dataclasses.dataclass
+class PhaseResult:
+    phase: str
+    status: str
+    reasons: list[str] = dataclasses.field(default_factory=list)
+    details: dict = dataclasses.field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if self.status not in STATUSES:
+            raise ValueError(f"unknown phase status {self.status!r}")
+
+    def to_dict(self) -> dict:
+        return {"phase": self.phase, "status": self.status,
+                "reasons": list(self.reasons), "details": jsonable(self.details)}
+
+    @classmethod
+    def coerce(cls, value, phase: str) -> "PhaseResult":
+        """Accept a PhaseResult, a compatible object or a contract dict."""
+
+        if isinstance(value, cls):
+            return value
+        if hasattr(value, "to_dict"):
+            value = value.to_dict()
+        elif dataclasses.is_dataclass(value):
+            value = dataclasses.asdict(value)
+        if not isinstance(value, dict):
+            return cls(phase, FAIL, [f"phase returned {type(value).__name__}"])
+        status = value.get("status")
+        if status not in STATUSES:
+            return cls(phase, FAIL, [f"phase returned unknown status {status!r}"])
+        return cls(str(value.get("phase") or phase), status,
+                   [str(r) for r in value.get("reasons") or []],
+                   dict(value.get("details") or {}))
+
+
+def jsonable(value):
+    if dataclasses.is_dataclass(value) and not isinstance(value, type):
+        return jsonable(dataclasses.asdict(value))
+    if isinstance(value, dict):
+        return {str(k): jsonable(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [jsonable(v) for v in value]
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, bytes):
+        return f"<{len(value)} bytes>"
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if hasattr(value, "__dict__"):
+        return jsonable(vars(value))
+    return str(value)
+
+
+def worst(statuses) -> str:
+    present = set(statuses)
+    for status in _SEVERITY:
+        if status in present:
+            return status
+    return PASS
+
+
+def overall_status(results: list[PhaseResult]) -> str:
+    return worst(r.status for r in results)
+
+
+def exit_code(results: list[PhaseResult]) -> int:
+    return 1 if any(r.status == FAIL for r in results) else 0
+
+
+def _tail(data: bytes | None, limit: int = 400) -> str:
+    if not data:
+        return ""
+    text = data.decode("utf-8", "replace").strip()
+    return text[-limit:]
+
+
+def _out(completed) -> str:
+    data = completed.stdout or b""
+    if isinstance(data, bytes):
+        data = data.decode("utf-8", "replace")
+    return data.strip()
+
+
+def child_env(target, base_env: dict[str, str] | None) -> dict[str, str]:
+    """Environment for subprocesses that must behave like the target's login."""
+
+    base = dict(base_env or {})
+    for key in ("TMUX", "TMUX_PANE", "TMUX_TMPDIR"):
+        base.pop(key, None)
+    local_bin = str(target.home / ".local" / "bin")
+    path = base.get("PATH") or "/usr/local/bin:/usr/bin:/bin"
+    if local_bin not in path.split(":"):
+        path = f"{local_bin}:{path}"
+    base.update({
+        "HOME": str(target.home),
+        "USER": target.username,
+        "LOGNAME": target.username,
+        "PATH": path,
+        "XDG_DATA_HOME": str(target.data_home),
+        "XDG_STATE_HOME": str(target.state_home),
+        "XDG_CONFIG_HOME": str(target.config_home),
+        "XDG_CACHE_HOME": str(target.cache_home),
+    })
+    base.setdefault("TERM", "xterm-256color")
+    return base
+
+
+# --- systemd ---------------------------------------------------------------
+
+def systemd_user_supported(runner) -> bool:
+    """Whether this machine boots with systemd and so has user managers."""
+
+    return runner.which("systemctl") is not None and Path("/run/systemd/system").is_dir()
+
+
+def systemd_user_reachable(runner, env: dict[str, str] | None = None) -> bool:
+    if runner.which("systemctl") is None:
+        return False
+    try:
+        completed = runner.run(["systemctl", "--user", "show-environment"],
+                               timeout=15, check=False, env=env, read_only=True)
+    except Exception:
+        return False
+    return completed.returncode == 0
+
+
+# --- tmux plugins -----------------------------------------------------------
+
+def load_tmux_plugins(repo_root: Path) -> list[dict] | None:
+    path = repo_root / "manifests" / "tmux-plugins.json"
+    if not path.is_file():
+        return None
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict) or data.get("schema") != 1:
+        raise ValueError("tmux-plugins.json: unsupported schema")
+    plugins = data.get("plugins")
+    if not isinstance(plugins, list):
+        raise ValueError("tmux-plugins.json: plugins must be a list")
+    seen = set()
+    for plugin in plugins:
+        name = plugin.get("name") if isinstance(plugin, dict) else None
+        if not isinstance(name, str) or not PLUGIN_NAME_RE.match(name) or name in seen:
+            raise ValueError(f"tmux-plugins.json: bad or duplicate name {name!r}")
+        if not isinstance(plugin.get("url"), str) or not plugin["url"]:
+            raise ValueError(f"tmux-plugins.json: {name} has no url")
+        if not isinstance(plugin.get("commit"), str) or not SHA_RE.match(plugin["commit"]):
+            raise ValueError(f"tmux-plugins.json: {name} commit must be a full sha")
+        seen.add(name)
+    return plugins
+
+
+def _git_head(runner, repo: Path) -> str | None:
+    if not (repo / ".git").exists():
+        return None
+    completed = runner.run(["git", "-C", str(repo), "rev-parse", "HEAD"],
+                           timeout=30, check=False, read_only=True)
+    return _out(completed) if completed.returncode == 0 else None
+
+
+def install_tmux_plugins(target, runner, repo_root: Path, run_id: str) -> tuple[str, list[str], dict]:
+    plugins = load_tmux_plugins(repo_root)
+    if plugins is None:
+        return SKIPPED, ["tmux-plugins-manifest-absent"], {}
+    root = target.data_home / "tmux" / "plugins"
+    root.mkdir(parents=True, exist_ok=True)
+    resurrect = target.data_home / "tmux" / "resurrect"
+    resurrect.mkdir(parents=True, exist_ok=True)
+    os.chmod(resurrect, 0o700)
+    details: dict[str, str] = {}
+    for plugin in plugins:
+        name, url, commit = plugin["name"], plugin["url"], plugin["commit"]
+        dest = root / name
+        if not dest.is_symlink() and _git_head(runner, dest) == commit:
+            details[name] = "at-pin"
+            continue
+        tmp = root / f".{name}.{run_id}.tmp"
+        if os.path.lexists(tmp):
+            shutil.rmtree(tmp, ignore_errors=True)
+        try:
+            runner.run(["git", "clone", "--quiet", "--", url, str(tmp)],
+                       timeout=GIT_TIMEOUT)
+            runner.run(["git", "-C", str(tmp), "checkout", "--quiet", "--detach",
+                        commit], timeout=60)
+            if (tmp / ".gitmodules").is_file():
+                runner.run(["git", "-C", str(tmp), "submodule", "update", "--init",
+                            "--recursive", "--quiet"], timeout=GIT_TIMEOUT)
+            if _git_head(runner, tmp) != commit:
+                raise RuntimeError(f"{name} is not at {commit}")
+            if os.path.lexists(dest):
+                backup = target.state_root / "backups" / "tmux-plugins" / run_id / name
+                backup.parent.mkdir(parents=True, exist_ok=True)
+                os.chmod(backup.parent, 0o700)
+                shutil.move(str(dest), str(backup))
+                details[name] = "replaced"
+            else:
+                details[name] = "installed"
+            os.replace(tmp, dest)
+        except Exception as exc:
+            shutil.rmtree(tmp, ignore_errors=True)
+            return FAIL, [f"tmux-plugin-{name}: {exc}"], details
+    return PASS, [], details
+
+
+def _plugin_step(runner, name: str, argv_fn, env, cwd, *, skip: bool,
+                 flag: str) -> tuple[str, str]:
+    """Run one plugin prefill/update command; ``(status, detail)``."""
+
+    if skip:
+        return SKIPPED, flag
+    binary = runner.which(name)
+    if binary is None:
+        return SKIPPED, f"{name}-not-installed"
+    completed = runner.run(argv_fn(binary), timeout=PLUGIN_TIMEOUT, check=False,
+                           env=env, input=b"", cwd=cwd)
+    if completed.returncode != 0:
+        return FAIL, (f"{name} plugins failed ({completed.returncode}): "
+                      + _tail(completed.stderr))
+    return PASS, "updated"
+
+
+# Upstream's zsh (antidote) and neovim (lazy.nvim) plugin updates.
+ZSH_PLUGIN_SCRIPT = (
+    "DOTFILES_UPDATE=1 __p9k_instant_prompt_disabled=1 source ${HOME}/.zshrc; "
+    "if ! whence antidote >/dev/null; then "
+    "echo 'antidote not found; check the zsh/antidote submodule' >&2; exit 1; fi; "
+    "antidote update && antidote reset"
+)
+NVIM_PLUGIN_ARGS = [
+    "--headless",
+    "-c", "lua require('lazy').update { wait = true }",
+    "-c", "lua require('config.plugins').report_errors { exit = true }",
+]
+
+
+def plugins_step(target, runner, *, env, skip_zplug: bool, skip_vimplug: bool):
+    statuses, reasons, details = [], [], {}
+    steps = (
+        ("zsh", lambda zsh: [zsh, "-c", ZSH_PLUGIN_SCRIPT], skip_zplug, "--skip-zplug"),
+        ("nvim", lambda nvim: [nvim, *NVIM_PLUGIN_ARGS], skip_vimplug, "--skip-vimplug"),
+    )
+    for name, argv_fn, skip, flag in steps:
+        label = "zsh_plugins" if name == "zsh" else "vim_plugins"
+        try:
+            status, detail = _plugin_step(runner, name, argv_fn, env, target.home,
+                                          skip=skip, flag=flag)
+        except Exception as exc:
+            status, detail = FAIL, f"{name} plugins: {exc}"
+        details[label] = detail if status != FAIL else "failed"
+        if status == FAIL:
+            statuses.append(FAIL)
+            reasons.append(detail)
+    return statuses, reasons, details
+
+
+def post_install_phase(target, runner, *, repo_root: Path, run_id: str,
+                       systemd_units_applied: bool,
+                       env: dict[str, str] | None = None,
+                       skip_zplug: bool = False,
+                       skip_vimplug: bool = False) -> PhaseResult:
+    statuses: list[str] = []
+    reasons: list[str] = []
+    details: dict = {}
+
+    try:
+        status, why, plugin_details = install_tmux_plugins(target, runner, repo_root, run_id)
+    except Exception as exc:  # malformed manifest or unexpected I/O
+        status, why, plugin_details = FAIL, [f"tmux-plugins: {exc}"], {}
+    statuses.append(PASS if status == SKIPPED else status)
+    reasons += why
+    details["tmux_plugins"] = plugin_details
+
+    if not systemd_units_applied:
+        details["systemd"] = "units-skipped"
+    elif systemd_user_reachable(runner, env):
+        completed = runner.run(["systemctl", "--user", "daemon-reload"],
+                               timeout=60, check=False, env=env)
+        if completed.returncode == 0:
+            details["systemd"] = "daemon-reloaded"
+        else:
+            statuses.append(FAIL)
+            reasons.append("systemctl --user daemon-reload failed: "
+                           + _tail(completed.stderr))
+    else:
+        statuses.append(RELOGIN_REQUIRED)
+        reasons.append("systemd-user-manager-unavailable")
+        details["systemd"] = "pending-next-login"
+
+    plugin_statuses, plugin_reasons, plugin_details = plugins_step(
+        target, runner, env=env, skip_zplug=skip_zplug, skip_vimplug=skip_vimplug)
+    statuses += plugin_statuses
+    reasons += plugin_reasons
+    details.update(plugin_details)
+
+    return PhaseResult("post-install", worst(statuses or [PASS]), reasons, details)
+
+
+# --- smoke checks -----------------------------------------------------------
+
+def smoke_zsh(target, runner, env: dict[str, str]) -> tuple[str, str]:
+    zsh = runner.which("zsh")
+    if zsh is None:
+        return FAIL, "zsh-not-installed"
+    completed = runner.run([zsh, "-i", "-c", "exit"], timeout=SMOKE_TIMEOUT,
+                           check=False, env=env, input=b"", cwd=target.home)
+    if completed.returncode != 0:
+        return FAIL, f"zsh -i -c exit returned {completed.returncode}: {_tail(completed.stderr)}"
+    return PASS, ""
+
+
+def smoke_tmux(target, runner, env: dict[str, str]) -> tuple[str, str]:
+    """Load ~/.tmux.conf into a throwaway server on its own socket."""
+
+    tmux = runner.which("tmux")
+    if tmux is None:
+        return FAIL, "tmux-not-installed"
+    conf = target.home / ".tmux.conf"
+    socket_dir = tempfile.mkdtemp(prefix="pdf-smoke-")
+    name = f"pdf-smoke-{os.getpid()}-{secrets.token_hex(4)}"
+    tenv = dict(env)
+    for key in ("TMUX", "TMUX_PANE"):
+        tenv.pop(key, None)
+    # TMUX_TMPDIR puts the -L socket inside our own directory.
+    tenv["TMUX_TMPDIR"] = socket_dir
+    try:
+        started = runner.run([tmux, "-L", name, "-f", "/dev/null", "new-session",
+                              "-d", "-s", "smoke"], timeout=30, check=False,
+                             env=tenv, cwd=target.home)
+        if started.returncode != 0:
+            return FAIL, f"tmux server did not start: {_tail(started.stderr)}"
+        loaded = runner.run([tmux, "-L", name, "source-file", str(conf)],
+                            timeout=60, check=False, env=tenv, cwd=target.home)
+        if loaded.returncode != 0:
+            return FAIL, f"tmux config failed to load: {_tail(loaded.stderr or loaded.stdout)}"
+        return PASS, ""
+    finally:
+        try:
+            runner.run([tmux, "-L", name, "kill-server"], timeout=30, check=False,
+                       env=tenv)
+        finally:
+            shutil.rmtree(socket_dir, ignore_errors=True)
+
+
+def smoke_phase(target, runner, env: dict[str, str] | None = None) -> PhaseResult:
+    cenv = child_env(target, env)
+    statuses, reasons, details = [], [], {}
+    for label, check in (("zsh", smoke_zsh), ("tmux", smoke_tmux)):
+        try:
+            status, reason = check(target, runner, cenv)
+        except Exception as exc:
+            status, reason = FAIL, f"{label}: {exc}"
+        statuses.append(status)
+        details[label] = status
+        if reason:
+            reasons.append(reason)
+    return PhaseResult("smoke", worst(statuses), reasons, details)
+
+
+# --- login shell ------------------------------------------------------------
+
+def _preferred_zsh(runner) -> str | None:
+    try:
+        shells = Path("/etc/shells").read_text(encoding="utf-8").split()
+    except OSError:
+        shells = []
+    for candidate in ("/usr/bin/zsh", "/bin/zsh"):
+        if candidate in shells and os.access(candidate, os.X_OK):
+            return candidate
+    return runner.which("zsh")
+
+
+def login_shell_phase(target, runner, *, current_shell: str,
+                      allow_change: bool, interactive=None) -> PhaseResult:
+    """Make zsh the passwd login shell.
+
+    ``interactive`` is a callable ``(argv) -> returncode`` that runs attached
+    to the terminal, because chsh prompts for a password; without it the call
+    goes through ``runner`` (tests, non-interactive use).
+    """
+
+    if Path(current_shell or "").name == "zsh":
+        ui.log(ui.GREEN("$SHELL is already zsh.") + f" ({current_shell})")
+        return PhaseResult("login-shell", PASS, [], {"shell": current_shell})
+    if not allow_change:
+        return PhaseResult("login-shell", SKIPPED, ["--no-shell-change"],
+                           {"shell": current_shell})
+    zsh = _preferred_zsh(runner)
+    if zsh is None:
+        return PhaseResult("login-shell", FAIL, ["zsh-not-installed"],
+                           {"shell": current_shell})
+    ui.log(ui.YELLOW("Please type your password if you wish to change the "
+                     "default shell to ZSH"))
+    if interactive is not None:
+        returncode = interactive(["chsh", "-s", zsh])
+    else:
+        returncode = runner.run(["chsh", "-s", zsh], timeout=300,
+                                check=False).returncode
+    if returncode != 0:
+        return PhaseResult("login-shell", FAIL,
+                           [f"chsh failed ({returncode}); run: chsh -s {zsh}"],
+                           {"shell": current_shell})
+    ui.log("Successfully changed the default shell, please re-login")
+    return PhaseResult("login-shell", RELOGIN_REQUIRED,
+                       ["log out and back in for zsh to become the login shell"],
+                       {"shell": zsh})
+
+
+# --- git identity -------------------------------------------------------------
+
+SECRET_HEADER = "# vim: set ft=gitconfig:\n"
+
+
+def _git_config_get(runner, secret: Path, key: str) -> str | None:
+    completed = runner.run(["git", "config", "--file", str(secret), key],
+                           timeout=30, check=False, read_only=True)
+    value = _out(completed) if completed.returncode == 0 else ""
+    return value or None
+
+
+def git_identity_phase(target, runner, *, prompt=None, dry_run: bool = False) -> PhaseResult:
+    """Upstream's ~/.gitconfig.secret check: identity lives outside the repo.
+
+    ``prompt`` is ``callable(question) -> str | None`` reading the terminal;
+    ``None`` (no terminal) prints the commands to run instead.
+    """
+
+    secret = target.home / ".gitconfig.secret"
+    commands = [
+        f'git config --file {secret} user.name "(YOUR NAME)"',
+        f'git config --file {secret} user.email "(YOUR EMAIL)"',
+    ]
+    if runner.which("git") is None:
+        return PhaseResult("git-identity", FAIL, ["git-not-installed"])
+    if not dry_run and not os.path.lexists(secret):
+        fd = os.open(secret, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(SECRET_HEADER)
+    name = _git_config_get(runner, secret, "user.name") if secret.exists() else None
+    email = _git_config_get(runner, secret, "user.email") if secret.exists() else None
+    if name and email:
+        ui.log(ui.GREEN(f"user.name  : {name}"))
+        ui.log(ui.GREEN(f"user.email : {email}"))
+        return PhaseResult("git-identity", PASS, [], {"file": str(secret)})
+
+    ui.log(ui.YELLOW("[!!!] Please configure git user name and email:"))
+    for command in commands:
+        ui.log("    " + ui.YELLOW(command))
+    if prompt is None or dry_run:
+        return PhaseResult("git-identity", SKIPPED, ["git-identity-not-configured"],
+                           {"file": str(secret), "commands": commands})
+    name = name or (prompt("(git config user.name) Please input your name  : ") or "").strip()
+    email = email or (prompt("(git config user.email) Please input your email : ") or "").strip()
+    if not (name and email):
+        return PhaseResult("git-identity", SKIPPED, ["git-identity-not-configured"],
+                           {"file": str(secret), "commands": commands})
+    for key, value in (("user.name", name), ("user.email", email)):
+        completed = runner.run(["git", "config", "--file", str(secret), key, value],
+                               timeout=30, check=False)
+        if completed.returncode != 0:
+            return PhaseResult("git-identity", FAIL,
+                               [f"git config --file {secret} {key} failed"])
+    ui.log(ui.GREEN(f"user.name  : {name}"))
+    ui.log(ui.GREEN(f"user.email : {email}"))
+    return PhaseResult("git-identity", PASS, [], {"file": str(secret)})
+
+
+# --- status -----------------------------------------------------------------
+
+def write_status(target, payload: dict) -> Path:
+    root = target.state_root
+    root.mkdir(parents=True, exist_ok=True)
+    os.chmod(root, 0o700)
+    path = root / "status.json"
+    tmp = root / f".status.json.{os.getpid()}.tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        json.dump(jsonable(payload), handle, indent=2, sort_keys=True)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(tmp, path)
+    return path
+
+
+def read_status(target) -> dict | None:
+    try:
+        return json.loads((target.state_root / "status.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
+def format_summary(results: list[PhaseResult]) -> str:
+    lines = ["", "Summary:"]
+    for result in results:
+        line = f"  {result.phase:<14} {result.status}"
+        if result.reasons:
+            line += "  (" + "; ".join(result.reasons) + ")"
+        lines.append(line)
+    lines.append(f"  {'overall':<14} {overall_status(results)}")
+    follow = {
+        RELOGIN_REQUIRED: "Log out and back in to finish (login shell / user services).",
+        PENDING_GUI: "Desktop settings are deferred; run 'dotfiles gui-apply' inside the desktop session.",
+        AUTH_REQUIRED: "Some tools need sign-in; see the reasons above.",
+        FAIL: "Some phases failed; fix the reasons above and rerun 'dotfiles repair'.",
+    }
+    seen = {r.status for r in results}
+    pending_reasons = [reason for r in results if r.status == PENDING_GUI
+                       for reason in r.reasons]
+    if pending_reasons and all(r == REMAPPER_UNSUPPORTED_REASON for r in pending_reasons):
+        follow[PENDING_GUI] = ("Ctrl+Super+Left/Right tab switching is unavailable on "
+                               "Ubuntu 22.04 (input-remapper 1.4); nothing to rerun.")
+    for status in _SEVERITY:
+        if status in seen and status in follow:
+            lines.append("  -> " + follow[status])
+    return "\n".join(lines)
+
+
+def completion_lines(results: list[PhaseResult]) -> list[str]:
+    """Upstream's closing box, then YELLOW follow-ups for this run."""
+
+    failed = [r for r in results if r.status == FAIL]
+    lines = [""]
+    if failed:
+        lines.append(ui.boxed("You have %3d warnings or errors -- check the logs!"
+                              % len(failed), ui.YELLOW, use_bold=True))
+        lines += ["   " + ui.YELLOW(f"{r.phase}: " + "; ".join(r.reasons or ["failed"]))
+                  for r in failed]
+    else:
+        lines.append(ui.boxed("\u2714  You are all set! ", ui.GREEN, use_bold=True))
+
+    by_phase = {r.phase: r for r in results}
+    follow: list[str] = []
+    packages = by_phase.get("packages")
+    if packages is not None and packages.status != SKIPPED:
+        follow.append("Sign in to the AI CLIs if you have not yet: `codex login`, "
+                      "and `claude` (then /login).")
+    for result in results:
+        if result.status == AUTH_REQUIRED:
+            follow.append(f"{result.phase} needs sign-in: " + "; ".join(result.reasons))
+    shell = by_phase.get("login-shell")
+    if shell is not None and shell.status == RELOGIN_REQUIRED:
+        follow.append("Log out and back in so zsh becomes your login shell.")
+    post = by_phase.get("post-install")
+    if post is not None and "systemd-user-manager-unavailable" in post.reasons:
+        follow.append("User services (tmux) start at the next graphical login.")
+    gui = by_phase.get("gui")
+    if gui is not None and gui.status == PENDING_GUI:
+        # 22.04's input-remapper 1.4 can never express the tab chord, so
+        # rerunning gui-apply would not help; say so instead of suggesting it.
+        permanent = [r for r in gui.reasons if r == REMAPPER_UNSUPPORTED_REASON]
+        retryable = [r for r in gui.reasons if r != REMAPPER_UNSUPPORTED_REASON]
+        if permanent:
+            follow.append("Ctrl+Super+Left/Right tab switching is not available on "
+                          "Ubuntu 22.04: its input-remapper 1.4 cannot express it. "
+                          "The other desktop settings are unaffected.")
+        if retryable:
+            follow.append("Pending desktop settings (run `dotfiles gui-apply` in the "
+                          "desktop session): " + "; ".join(retryable))
+    identity = by_phase.get("git-identity")
+    if identity is not None and identity.status == SKIPPED:
+        for command in identity.details.get("commands", []):
+            follow.append(command)
+    lines += ["- " + ui.YELLOW(item) for item in follow]
+    lines += [
+        "- Please restart shell (e.g. " + ui.CYAN("`exec zsh`") + ") if necessary.",
+        "- To install some packages locally (e.g. neovim, fzf), try "
+        + ui.CYAN("`dotfiles install <package>`"),
+        "- If you want to update dotfiles (or have any errors), try "
+        + ui.CYAN("`dotfiles update`"),
+    ]
+    return lines

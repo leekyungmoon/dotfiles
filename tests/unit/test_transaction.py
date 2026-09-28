@@ -180,7 +180,7 @@ class HomeCase(unittest.TestCase):
         (nvim / "lua" / "쓰기 dir" / "a b.lua").write_text("x")
         os.chmod(nvim / "lua", 0o750)
         os.symlink("../init.lua", nvim / "lua" / "link")
-        os.symlink("/nonexistent/place", home / ".dotfiles")
+        os.symlink("/nonexistent/place", home / ".vimrc")
         (home / ".legacyrc").write_text("legacy\n")
         (home / "keep.txt").write_text("sentinel\n")
         (home / ".config" / "keep.conf").write_text("sentinel conf\n")
@@ -195,9 +195,7 @@ class HomeCase(unittest.TestCase):
                 content=b"[Unit]\nDescription=tmux\n",
                 mode=0o644,
             ),
-            DesiredEntry(
-                "dotfiles-compat", home / ".dotfiles", "symlink", link_text=str(self.target.repo_root)
-            ),
+            DesiredEntry("vimrc", home / ".vimrc", "symlink", link_text=self.link("vim/vimrc")),
             DesiredEntry("legacy", home / ".legacyrc", "absent"),
         ]
 
@@ -281,7 +279,7 @@ class InstallTests(HomeCase):
         self.assertEqual(sorted(result.changed), sorted(d.id for d in desired))
         self.assertEqual(os.readlink(home / ".zshrc"), self.link("zsh/zshrc"))
         self.assertEqual(os.readlink(home / ".config" / "nvim"), self.link("nvim"))
-        self.assertEqual(os.readlink(home / ".dotfiles"), str(self.target.repo_root))
+        self.assertEqual(os.readlink(home / ".vimrc"), self.link("vim/vimrc"))
         service = home / ".config" / "systemd" / "user" / "tmux.service"
         self.assertEqual(service.read_bytes(), b"[Unit]\nDescription=tmux\n")
         self.assertEqual(stat.S_IMODE(os.lstat(service).st_mode), 0o644)
@@ -310,7 +308,7 @@ class InstallTests(HomeCase):
         self.assertEqual(ObjectState.from_json(meta["state"]).kind, "dir")
         self.assertEqual(snapshot(baseline_nvim / "object"), ObjectState.from_json(meta["state"]))
         self.assertEqual(
-            snapshot(root / "backups" / "baseline" / "dotfiles-compat" / "object"),
+            snapshot(root / "backups" / "baseline" / "vimrc" / "object"),
             ObjectState("symlink", link_text="/nonexistent/place"),
         )
         self.assertEqual(snapshot(root / "backups" / "baseline" / "zshrc" / "object"), before[".zshrc"])
@@ -868,7 +866,6 @@ class DirectoryPromotionTests(HomeCase):
             self.target,
             [
                 DesiredEntry("repo", self.target.repo_root, "dir", staged_dir=staged),
-                DesiredEntry("dotfiles-compat", self.repo_link, "symlink", link_text=str(self.target.repo_root)),
             ],
             **kwargs,
         )
@@ -903,7 +900,7 @@ class DirectoryPromotionTests(HomeCase):
         staged = self.make_staged("s1", "v1")
         staged_state = snapshot(staged)
         with self.assertRaises(Injected):
-            self.promote(staged, fault=FaultAt("swapped:dotfiles-compat"))
+            self.promote(staged, fault=FaultAt("swapped:repo"))
         self.assertFalse(os.path.lexists(self.target.repo_root))
         self.assertFalse(os.path.lexists(self.repo_link))
         self.assertEqual(snapshot(staged), staged_state)
@@ -916,19 +913,20 @@ class DirectoryPromotionTests(HomeCase):
         self.assertEqual(snapshot(self.target.repo_root), expected)
         self.assertTrue(staged.is_dir())  # caller cleans staging
 
-    def test_existing_populated_compat_dir_backed_up(self):
-        live = self.home / ".dotfiles"
+    def test_existing_populated_dotfiles_dir_backed_up(self):
+        live = self.home / ".dotfiles"  # == target.repo_root
+        self.assertEqual(live, self.target.repo_root)
         (live / "sub").mkdir(parents=True)
         (live / "sub" / "file").write_text("user's old checkout")
         original = snapshot(live)
         staged = self.make_staged("s1", "v1")
+        expected = snapshot(staged)
         result = self.promote(staged)
-        self.assertTrue(os.path.islink(live))
-        self.assertEqual(snapshot(self.target.state_root / "backups" / "baseline" / "dotfiles-compat" / "object"), original)
+        self.assertEqual(snapshot(live), expected)
+        self.assertEqual(snapshot(self.target.state_root / "backups" / "baseline" / "repo" / "object"), original)
         self.assertIsNotNone(result.backup_dir)
         tx.restore(self.target, which="baseline")
         self.assertEqual(snapshot(live), original)
-        self.assertFalse(os.path.lexists(self.target.repo_root))
 
 
 class DurabilityTests(HomeCase):

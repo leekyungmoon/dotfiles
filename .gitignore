@@ -1,3 +1,6 @@
 # vim and neovim
 nvim/spell
 vim/spell
+
+# python bytecode (the installer runs with bytecode off; this is a safety net)
+__pycache__/

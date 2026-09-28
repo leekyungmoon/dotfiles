@@ -70,7 +70,6 @@ class ValidManifestTests(ManifestTestCase):
     def test_resolves_all_kinds(self):
         resolved = self.resolve(
             [
-                {"id": "dotfiles-compat", "dest": "{home}/.dotfiles", "kind": "symlink", "source": "."},
                 {"id": "zshrc", "dest": "{home}/.zshrc", "kind": "symlink", "source": "zsh/zshrc"},
                 {"id": "nvim", "dest": "{config}/nvim", "kind": "symlink", "source": "nvim"},
                 {
@@ -92,8 +91,7 @@ class ValidManifestTests(ManifestTestCase):
             ]
         )
         by_id = {e.id: e for e in resolved}
-        self.assertEqual(by_id["dotfiles-compat"].link_text, str(self.target.repo_root))
-        self.assertEqual(by_id["dotfiles-compat"].dest, self.home / ".dotfiles")
+        self.assertEqual(self.target.repo_root, self.home / ".dotfiles")
         self.assertEqual(
             by_id["zshrc"].link_text, str(self.home / ".dotfiles" / "zsh" / "zshrc")
         )
@@ -318,9 +316,15 @@ class RejectionTests(ManifestTestCase):
         # The escaping directory was not touched.
         self.assertEqual(list(outside.iterdir()), [])
 
+    def test_dotfiles_itself_is_not_a_managed_entry(self):
+        # ~/.dotfiles is the checkout (target.repo_root), never a manifest entry.
+        self.assertRejected(
+            [{"id": "dotfiles-compat", "dest": "{home}/.dotfiles", "kind": "symlink", "source": "."}],
+            "installer-owned",
+        )
+
     def test_symlinked_parent_into_repository(self):
         self.target.repo_root.mkdir(parents=True)
-        os.symlink(self.target.repo_root, self.home / ".dotfiles")
         (self.target.repo_root / "cfg").mkdir()
         os.symlink(self.home / ".dotfiles" / "cfg", self.home / ".config")
         self.assertRejected(

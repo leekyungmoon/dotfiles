@@ -114,11 +114,12 @@ class ResolveTargetTests(unittest.TestCase):
         self.assertEqual(target.state_home, self.home / ".local" / "state")
         self.assertEqual(target.config_home, self.home / ".config")
         self.assertEqual(target.cache_home, self.home / ".cache")
-        self.assertEqual(
-            target.repo_root,
-            self.home / ".local" / "share" / "personal-dotfiles" / "repo",
-        )
-        self.assertEqual(target.compat_link, self.home / ".dotfiles")
+        self.assertEqual(target.repo_root, self.home / ".dotfiles")
+        self.assertEqual(target.compat_link, target.repo_root)
+        self.assertEqual(target.staging_root,
+                         self.home / ".local" / "share" / "personal-dotfiles" / "staging")
+        self.assertEqual(target.state_root,
+                         self.home / ".local" / "state" / "personal-dotfiles")
 
     def test_unset_home_falls_back_to_passwd(self):
         self.assertEqual(self.resolve({}).home, self.home)
@@ -161,8 +162,10 @@ class ResolveTargetTests(unittest.TestCase):
         target = self.resolve({"HOME": str(self.home),
                                "XDG_DATA_HOME": str(custom)})
         self.assertEqual(target.data_home, custom)
-        self.assertEqual(target.repo_root,
-                         custom / "personal-dotfiles" / "repo")
+        # The checkout stays at ~/.dotfiles; only scratch clones follow XDG.
+        self.assertEqual(target.repo_root, self.home / ".dotfiles")
+        self.assertEqual(target.staging_root,
+                         custom / "personal-dotfiles" / "staging")
 
     def test_relative_xdg_is_refused(self):
         with self.assertRaises(plat.PlatformError):

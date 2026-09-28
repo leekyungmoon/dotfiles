@@ -1,506 +1,818 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# ruff: noqa: E402
 
 '''
-   @wookayin's              ███████╗██╗██╗     ███████╗███████╗
+   @leekyungmoon's          ███████╗██╗██╗     ███████╗███████╗
    ██████╗  █████╗ ████████╗██╔════╝██║██║     ██╔════╝██╔════╝
    ██╔══██╗██╔══██╗╚══██╔══╝█████╗  ██║██║     █████╗  ███████╗
    ██║  ██║██║  ██║   ██║   ██╔══╝  ██║██║     ██╔══╝  ╚════██║
    ██████╔╝╚█████╔╝   ██║   ██║     ██║███████╗███████╗███████║
    ╚═════╝  ╚════╝    ╚═╝   ╚═╝     ╚═╝╚══════╝╚══════╝╚══════╝
 
-   https://dotfiles.wook.kr/
+   https://github.com/leekyungmoon/dotfiles
 '''
-print(__doc__)  # print logo.
 
+from __future__ import annotations
 
-import os
-import argparse
-parser = argparse.ArgumentParser()
-parser.add_argument('-f', '--force', action="store_true", default=False,
-                    help='If set, it will override existing symbolic links')
-parser.add_argument('--skip-vimplug', action='store_true',
-                    help='If set, do not update vim plugins.')
-parser.add_argument('--skip-zplug', action='store_true',
-                    help='If set, skip update of zsh plugins.')
-
-args = parser.parse_args()
-
-################# BEGIN OF FIXME #################
-IS_SSH = os.getenv('SSH_TTY', None) is not None
-
-# Task Definition
-# (path of target symlink) : (location of source file in the repository)
-tasks = {
-    # SHELLS
-    '~/.bashrc' : 'bashrc',
-    '~/.screenrc' : 'screenrc',
-
-    # VIM
-    '~/.vimrc' : 'vim/vimrc',
-    '~/.vim' : 'vim',
-    '~/.vim/autoload/plug.vim' : 'vim/bundle/vim-plug/plug.vim',
-
-    # NeoVIM
-    '~/.config/nvim' : 'nvim',
-
-    # GIT
-    '~/.gitconfig' : 'git/gitconfig',
-    '~/.gitignore' : 'git/gitignore',
-
-    # ZSH
-    '~/.zsh'      : 'zsh',
-    '~/.zlogin'   : 'zsh/zlogin',
-    '~/.zlogout'  : 'zsh/zlogout',
-    '~/.zpreztorc': 'zsh/zpreztorc',
-    '~/.zprofile' : 'zsh/zprofile',
-    '~/.zshenv'   : 'zsh/zshenv',
-    '~/.zshrc'    : 'zsh/zshrc',
-
-    # Bins
-    '~/.local/bin/dotfiles' : 'bin/dotfiles',
-    '~/.local/bin/fasd' : 'zsh/fasd/fasd',
-    '~/.local/bin/fzf' : dict(src='~/.fzf/bin/fzf', force=True),
-
-    # X
-    '~/.Xmodmap' : 'Xmodmap',
-
-    # GTK
-    '~/.gtkrc-2.0' : 'gtkrc-2.0',
-
-    # terminal emulators (kitty, alacritty, wezterm)
-    '~/.config/kitty': dict(src='config/kitty', cond=not IS_SSH),
-    '~/.config/alacritty': dict(src='config/alacritty', cond=not IS_SSH),
-    '~/.config/wezterm': dict(src='config/wezterm', cond=not IS_SSH),
-
-    # tmux
-    '~/.tmux'      : 'tmux',
-    '~/.tmux.conf' : 'tmux/tmux.conf',
-
-    # .config (XDG-style)
-    '~/.config/terminator' : 'config/terminator',
-    '~/.config/pudb/pudb.cfg' : 'config/pudb/pudb.cfg',
-
-    # pip and python
-    #'~/.pip/pip.conf' : 'pip/pip.conf',
-    '~/.pythonrc.py' : 'python/pythonrc.py',
-    '~/.pylintrc' : 'python/pylintrc',
-    '~/.condarc' : 'python/condarc',
-    '~/.config/pycodestyle' : 'python/pycodestyle',
-    '~/.ptpython/config.py' : dict(action="remove"),
-    '~/.config/ptpython/config.py' : 'python/ptpython.config.py',
-}
-
-
-import os
-import platform
-
-# Make sure the CWD is the root of dotfiles.
-__PATH__ = os.path.abspath(os.path.dirname(__file__))
-os.chdir(__PATH__)
-
-
-post_actions = []
-post_actions += [  # Check symbolic link at $HOME
-    '''#!/bin/bash
-    # Check whether ~/.vim and ~/.zsh are well-configured
-    for f in ~/.vim ~/.zsh ~/.vimrc ~/.zshrc; do
-        if ! readlink $f >/dev/null; then
-            echo -e "\033[0;31m\
-ERROR: $f is not a symbolic link to ~/.dotfiles.
-Please remove your local folder/file $f and try again.\033[0m"
-            echo -n "(Press any key to continue) "; read user_confirm
-            exit 100;
-        else
-            echo "OK: $f --> $(readlink $f)"
-        fi
-    done
-''']
-
-post_actions += [  # fzf
-    r'''#!/bin/bash
-    # Install junegunn/fzf
-    FZF_REPO="https://github.com/junegunn/fzf.git"
-    if [[ ! -d "$HOME/.fzf" ]]; then
-        git clone "$FZF_REPO" "$HOME/.fzf"
-    else
-        cd $HOME/.fzf && git fetch --tags
-    fi
-    cd $HOME/.fzf
-
-    # Checkout the latest release (tag)
-    tag=$(git ls-remote --tags --exit-code --refs "$FZF_REPO" \
-          | sed -E 's/^[[:xdigit:]]+[[:space:]]+refs\/tags\/(.+)/\1/g' \
-          | sort -V | tail -n1)
-    git checkout "$tag" || { echo "Checkout $tag failed. Check $HOME/.fzf" && exit 1; }
-
-    echo "Running: $ ./install --all --no-update-rc"
-    ./install --all --no-update-rc
-''']
-
-post_actions += [  # video2gif
-    '''#!/bin/bash
-    # Download command line scripts
-    mkdir -p "$HOME/.local/bin/"
-    _download() {
-        curl -L "$2" > "$1" && chmod +x "$1"
-    }
-    ret=0
-    set -v
-    _download "$HOME/.local/bin/video2gif" "https://raw.githubusercontent.com/wookayin/video2gif/master/video2gif" || ret=1
-    exit $ret;
-''']
-
-post_actions += [  # antidote (zsh plugins)
-    '''#!/bin/bash
-    # Update zsh bundles and cache (the init file)
-    zsh -c "
-        # source zsh plugin manager and list plugins
-        DOTFILES_UPDATE=1 __p9k_instant_prompt_disabled=1 source ${HOME}/.zshrc
-        if ! which antidote > /dev/null; then
-            echo -e '\033[0;31m\
-ERROR: antidote not found. Double check the submodule exists, and you have a valid ~/.zshrc!\033[0m'
-            ls -alh ~/.zsh/antidote/
-            ls -alh ~/.zshrc
-            exit 1;
-        fi
-        antidote update
-        antidote reset
-        source ~/.zshrc
-    "
-    ''' if not args.skip_zplug else \
-        '# zsh plugins update (Skipped)'
-]
-
-post_actions += [  # tmux plugins
-    # Install tmux plugins via tpm
-    '~/.tmux/plugins/tpm/bin/install_plugins',
-
-    r'''#!/bin/bash
-    # Check tmux version >= 3.2 (or use `dotfiles install tmux`)
-    _version_check() {    # target_ver current_ver
-        [ "$1" = "$(echo -e "$1\n$2" | sort -s -t- -k 2,2n | sort -t. -s -k 1,1n -k 2,2n | head -n1)" ]
-    }
-    if [[ `uname` == "Linux" ]] && ! type tmux >/dev/null 2>&1; then
-        echo -e "\033[0;33mInstalling tmux because not installed globally.\033[0m"
-        bin/dotfiles install tmux
-        export PATH="$PATH:~/.local/bin"
-    elif ! _version_check "3.2" "$(tmux -V | cut -d' ' -f2)"; then
-        echo -en "\033[0;33m"
-        echo -e "$(tmux -V) is too old. tmux 3.2+ is required.\n"
-        echo -e "Contact system administrator, or run:"
-        echo -e "\033[0m  $ dotfiles install tmux  \033[0;33m # (installs to ~/.local/, if you don't have sudo)"
-        exit 1;
-    else
-        echo "$(which tmux): $(tmux -V)"
-    fi
-''']
-
-post_actions += [  # default shell
-    r'''#!/bin/bash
-    # Change default shell to zsh
-    /bin/zsh --version >/dev/null || (\
-        echo -e "\033[0;31mError: /bin/zsh not found. Please install zsh.\033[0m"; exit 1)
-    if [[ ! "$SHELL" = *zsh ]]; then
-        echo -e '\033[0;33mPlease type your password if you wish to change the default shell to ZSH\e[m'
-        chsh -s /bin/zsh && echo -e 'Successfully changed the default shell, please re-login'
-    else
-        echo -e "\033[0;32m\$SHELL is already zsh.\033[0m $(zsh --version)"
-    fi
-''']
-
-post_actions += [  # patch and test TERMINFO
-    r'''#!/bin/bash
-    # Run etc/terminfo.sh to keep terminfo Up-to-date
-    bash "etc/terminfo.sh" install
-    '''
-]
-
-post_actions += [  # install some essential packages (linux)
-    '''#!/bin/bash
-    # Check and install node, rg, fd locally
-    export PATH="$PATH:$HOME/.local/bin"
-    type node || bin/dotfiles install node
-    type rg   || bin/dotfiles install ripgrep
-    type fd   || bin/dotfiles install fd
-
-    # Required by neovim
-    if ! type tree-sitter; then
-        bin/dotfiles install tree-sitter
-    else
-        tree-sitter --version
-    fi
-    '''
-] if platform.system() == "Linux" else []
-
-post_actions += [  # macOS
-    '''#!/bin/bash
-    # macOS: homebrew installation
-    type brew || { echo "Homebrew not found. Install: https://brew.sh/" && exit 1; }
-
-    # Required by neovim
-    if ! type tree-sitter; then
-        brew install tree-sitter-cli
-    else
-        tree-sitter --version
-    fi
-    '''
-] if platform.system() == "Darwin" else []
-
-post_actions += [  # neovim
-    '''#!/bin/bash
-    bash "etc/install-neovim.sh"
-''']
-
-post_actions += [  # vim-plug
-    # Run lazy.nvim installation
-    {'update'  : '''# vim plugins: install and update via Lazy
-        PATH="$PATH:~/.local/bin" \
-        nvim --headless \
-            -c "lua require('lazy').update { wait = true }" \
-            -c "lua require('config.plugins').report_errors { exit = true }"
-        ''',
-     'none'    : '# vim plugins: skipped',
-     }['update' if not args.skip_vimplug else 'none']
-    + '\n' +
-    r'''#!/bin/bash
-    if [[ -n "~/.vim/plugged/*.cloning(#qN)" ]]; then
-        echo "Cleaning up plugin installation artifacts..."
-        rm -fv ~/.vim/plugged/*.cloning
-    fi
-    '''
-]
-
-post_actions += [  # gitconfig.secret
-    r'''#!/bin/bash
-    # Create ~/.gitconfig.secret file and check user configuration
-    if [ ! -f ~/.gitconfig.secret ]; then
-        cat > ~/.gitconfig.secret <<EOL
-# vim: set ft=gitconfig:
-EOL
-    fi
-    if ! git config --file ~/.gitconfig.secret user.name 2>&1 > /dev/null || \
-       ! git config --file ~/.gitconfig.secret user.email 2>&1 > /dev/null; then echo -ne '
-    \033[1;33m[!!!] Please configure git user name and email:
-        git config --file ~/.gitconfig.secret user.name "(YOUR NAME)"
-        git config --file ~/.gitconfig.secret user.email "(YOUR EMAIL)"
-\033[0m'
-        echo -en '\n'
-        echo -en "(git config user.name) \033[0;33m Please input your name  : \033[0m"; read git_username
-        echo -en "(git config user.email)\033[0;33m Please input your email : \033[0m"; read git_useremail
-        if [[ -n "$git_username" ]] && [[ -n "$git_useremail" ]]; then
-            git config --file ~/.gitconfig.secret user.name "$git_username"
-            git config --file ~/.gitconfig.secret user.email "$git_useremail"
-        else
-            exit 1;   # error
-        fi
-    fi
-
-    # get the current config
-    echo -en '\033[0;32m';
-    echo -en 'user.name  : '; git config --file ~/.gitconfig.secret user.name
-    echo -en 'user.email : '; git config --file ~/.gitconfig.secret user.email
-    echo -en '\033[0m';
-''']
-
-
-################# END OF FIXME #################
-
-
-def _wrap_colors(ansicode):
-    return (lambda msg: ansicode + str(msg) + '\033[0m')
-GRAY   = _wrap_colors("\033[0;37m")
-WHITE  = _wrap_colors("\033[1;37m")
-RED    = _wrap_colors("\033[0;31m")
-GREEN  = _wrap_colors("\033[0;32m")
-YELLOW = _wrap_colors("\033[0;33m")
-CYAN   = _wrap_colors("\033[0;36m")
-BLUE   = _wrap_colors("\033[0;34m")
-
-
-import os
 import sys
-import subprocess
 
-from signal import signal, SIGPIPE, SIG_DFL
-from sys import stderr
+sys.dont_write_bytecode = True  # keep the checkout free of __pycache__
 
-if sys.version_info[0] >= 3:  # python3
-    unicode = lambda s, _: str(s)
-    from builtins import input
-else:  # python2
-    input = sys.modules['__builtin__'].raw_input
+import argparse  # noqa: E402
+import dataclasses  # noqa: E402
+import hashlib  # noqa: E402
+import importlib  # noqa: E402
+import inspect  # noqa: E402
+import json  # noqa: E402
+import os  # noqa: E402
+import pwd  # noqa: E402
+import subprocess  # noqa: E402
+import time  # noqa: E402
+from pathlib import Path  # noqa: E402
+
+HERE = Path(__file__).resolve().parent
+if str(HERE) not in sys.path:
+    sys.path.insert(0, str(HERE))
+
+from installer import phases  # noqa: E402
+from installer import platform as plat  # noqa: E402
+from installer import repo  # noqa: E402
+from installer import ui  # noqa: E402
+from installer.phases import FAIL, PASS, SKIPPED, PhaseResult  # noqa: E402
+
+MIN_PYTHON = (3, 10)
+
+USAGE = """\
+Install the dotfiles from this checkout, which must be ~/.dotfiles:
+
+    git clone --recursive https://github.com/leekyungmoon/dotfiles.git ~/.dotfiles
+    cd ~/.dotfiles && python3 install.py
+
+    python3 install.py [-f] [--skip-vimplug] [--skip-zplug] [--no-packages]
+                       [--no-gui] [--no-shell-change] [--dry-run]
+    python3 install.py status [--json]
+    python3 install.py restore (--baseline | --run RUN_ID) [--force] [--id ID ...]
+    python3 install.py repair
+    python3 install.py gui-apply [--autostart]
+"""
+
+SUBCOMMANDS = ("install", "status", "restore", "repair", "gui-apply", "packages")
+# Commands that act on the checkout and so must run from ~/.dotfiles.
+LOCATED_COMMANDS = ("install", "repair", "gui-apply", "packages")
+# Entries managed by the pre-release layout that promoted a staged checkout.
+LEGACY_IDS = ("repo", "dotfiles-compat")
 
 
-def log(msg, cr=True):
-    stderr.write(msg)
-    if cr:
-        stderr.write('\n')
+@dataclasses.dataclass
+class Options:
+    force: bool = False
+    skip_vimplug: bool = False
+    skip_zplug: bool = False
+    no_packages: bool = False
+    no_gui: bool = False
+    no_shell_change: bool = False
+    dry_run: bool = False
 
-def log_boxed(msg, color_fn=WHITE, use_bold=False, len_adjust=0):
-    import unicodedata
-    pad_msg = (" " + msg + "  ")
-    l = sum(not unicodedata.combining(ch) for ch in unicode(pad_msg, 'utf-8')) + len_adjust  # noqa
-    if use_bold:
-        log(color_fn("┏" + ("━" * l) + "┓\n" +
-                     "┃" + pad_msg   + "┃\n" +
-                     "┗" + ("━" * l) + "┛\n"), cr=False)
-    else:
-        log(color_fn("┌" + ("─" * l) + "┐\n" +
-                     "│" + pad_msg   + "│\n" +
-                     "└" + ("─" * l) + "┘\n"), cr=False)
 
-def makedirs(target, mode=511, exist_ok=False):
+@dataclasses.dataclass
+class Context:
+    target: plat.Target
+    platform: plat.Platform | None
+    runner: object
+    env: dict
+    run_id: str
+    current_shell: str = ""
+    interactive: object = None  # callable(argv) -> returncode, for chsh
+    repo_root: Path | None = None  # the checkout; defaults to target.repo_root
+    prompt: object = None  # callable(question) -> str | None, for git identity
+
+    def __post_init__(self) -> None:
+        if self.repo_root is None:
+            self.repo_root = self.target.repo_root
+
+
+# --- argument parsing ---------------------------------------------------------
+
+def _install_flags(p: argparse.ArgumentParser) -> None:
+    p.add_argument("-f", "--force", action="store_true", default=False,
+                   help="accepted like upstream; managed targets are always "
+                        "replaced after an exact backup")
+    p.add_argument("--skip-vimplug", action="store_true",
+                   help="do not install or update neovim plugins")
+    p.add_argument("--skip-zplug", action="store_true",
+                   help="do not install or update zsh plugins")
+    p.add_argument("--no-packages", action="store_true",
+                   help="skip apt packages and pinned tools")
+    p.add_argument("--no-gui", action="store_true",
+                   help="skip desktop (GNOME) settings")
+    p.add_argument("--no-shell-change", action="store_true",
+                   help="do not run chsh to make zsh the login shell")
+    p.add_argument("--dry-run", action="store_true",
+                   help="report what would change without changing anything")
+    p.add_argument("--allow-any-location", action="store_true",
+                   help=argparse.SUPPRESS)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="install.py", description=USAGE,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = parser.add_subparsers(dest="command", metavar="COMMAND")
+    sub.required = True
+
+    p = sub.add_parser("install", help="install (the default command)")
+    _install_flags(p)
+
+    p = sub.add_parser("repair", help="reapply this checkout (same as install)")
+    _install_flags(p)
+
+    p = sub.add_parser("status", help="show the installed generation and drift")
+    p.add_argument("--json", action="store_true", help="machine-readable output")
+
+    p = sub.add_parser("restore", help="restore managed paths from backups")
+    which = p.add_mutually_exclusive_group(required=True)
+    which.add_argument("--baseline", action="store_true",
+                       help="restore the state before the first install")
+    which.add_argument("--run", metavar="RUN_ID",
+                       help="restore the state before the given run")
+    p.add_argument("-f", "--force", action="store_true",
+                   help="also restore paths that drifted since the last install")
+    p.add_argument("--id", dest="ids", action="append", metavar="ID",
+                   help="restrict to this managed entry id (repeatable)")
+
+    p = sub.add_parser("gui-apply", help="apply desktop settings in this session")
+    p.add_argument("--autostart", action="store_true",
+                   help="invoked from the login autostart entry")
+    p.add_argument("--allow-any-location", action="store_true",
+                   help=argparse.SUPPRESS)
+
+    # Internal: used by 'dotfiles install <name>'.
+    p = sub.add_parser("packages")  # no help=: not listed in --help
+    p.add_argument("--only", action="append", required=True, metavar="NAME")
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("-f", "--force", action="store_true")
+    p.add_argument("--allow-any-location", action="store_true",
+                   help=argparse.SUPPRESS)
+    return parser
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """``install.py [flags]`` means ``install.py install [flags]``."""
+
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if not argv or (argv[0] not in SUBCOMMANDS and argv[0].startswith("-")
+                    and argv[0] not in ("-h", "--help")):
+        argv = ["install", *argv]
+    return build_parser().parse_args(argv)
+
+
+def options_from(args: argparse.Namespace) -> Options:
+    return Options(**{f.name: bool(getattr(args, f.name, False))
+                      for f in dataclasses.fields(Options)})
+
+
+# --- seams --------------------------------------------------------------------
+
+def load_seam(module_name: str, function_name: str):
+    """Return ``installer.<module>.<function>`` or None when not provided."""
+
     try:
-        os.makedirs(target, mode=mode)
-    except OSError as ex:  # py2 has no exist_ok=True
-        import errno
-        if ex.errno == errno.EEXIST and exist_ok: pass
-        else: raise
-
-# get current directory (absolute path)
-current_dir = os.path.abspath(os.path.dirname(__file__))
-os.chdir(current_dir)
-
-# check if git submodules are loaded properly
-stat = subprocess.check_output("git submodule status --recursive",
-                               shell=True, universal_newlines=True)
-submodule_issues = [(l.split()[1], l[0]) for l in stat.split('\n')  # noqa
-                    if len(l) and l[0] != ' ']
-
-if submodule_issues:
-    stat_messages = {'+': 'needs update', '-': 'not initialized', 'U': 'conflict!'}
-    for (submodule_name, submodule_stat) in submodule_issues:
-        log(RED("git submodule {name} : {status}".format(
-            name=submodule_name,
-            status=stat_messages.get(submodule_stat, '(Unknown)'))))
-    log(YELLOW("Git submodules are not initialized.\n"))
-
-    update_submodule = True
-    if update_submodule:
-        git_submodule_update_cmd = 'git submodule update --init --recursive'
-        # git 2.8+ supports parallel submodule fetching
-        try:
-            git_version = str(subprocess.check_output(
-                """git --version | awk '{print $3}'""", shell=True))
-            if git_version >= '2.8':
-                git_submodule_update_cmd += ' --jobs 8'
-        except Exception:
-            pass
-        log("Running: %s" % CYAN(git_submodule_update_cmd))
-        subprocess.call(git_submodule_update_cmd, shell=True)
-    else:
-        log(RED("Aborted."))
-        sys.exit(1)
+        module = importlib.import_module(f"installer.{module_name}")
+    except ModuleNotFoundError as exc:
+        if exc.name in (f"installer.{module_name}", "installer"):
+            return None
+        raise
+    function = getattr(module, function_name, None)
+    return function if callable(function) else None
 
 
-log_boxed("Creating symbolic links", color_fn=CYAN)
-for target, item in sorted(tasks.items()):
-    # normalize paths
-    if isinstance(item, str):
-        item = {'src': item}
+def packages_phase(ctx: Context, *, disabled: bool, dry_run: bool) -> PhaseResult:
+    if disabled:
+        return PhaseResult("packages", SKIPPED, ["--no-packages"])
+    run = load_seam("packages", "run_packages_phase")
+    if run is None:
+        return PhaseResult("packages", SKIPPED, ["packages-phase-not-available"])
+    try:
+        return PhaseResult.coerce(
+            run(ctx.target, ctx.platform, ctx.runner, dry_run=dry_run), "packages")
+    except Exception as exc:
+        return PhaseResult("packages", FAIL, [f"{type(exc).__name__}: {exc}"])
 
-    source = item.get('src', None)
-    force = item.get('force', False)
-    fail_on_error = item.get('fail_on_error', False)
 
-    if not item.get('cond', True):
-        continue
+def gui_phase(ctx: Context, *, disabled: bool, autostart: bool = False) -> PhaseResult:
+    if disabled:
+        return PhaseResult("gui", SKIPPED, ["--no-gui"])
+    apply = load_seam("gui", "apply_or_defer")
+    if apply is None:
+        return PhaseResult("gui", SKIPPED, ["gui-phase-not-available"])
+    env = dict(ctx.env)
+    if autostart:
+        env["PERSONAL_DOTFILES_GUI_AUTOSTART"] = "1"
+    try:
+        return PhaseResult.coerce(apply(ctx.target, ctx.runner, env), "gui")
+    except Exception as exc:
+        return PhaseResult("gui", FAIL, [f"{type(exc).__name__}: {exc}"])
 
-    if source:
-        source = os.path.join(current_dir, os.path.expanduser(source))
-    target = os.path.expanduser(target)
 
-    if item.get('action', None) == 'remove':
-        try:
-            os.unlink(target)
-        except OSError:  # FileNotFoundError
-            pass
-        continue
+def extra_desired_entries(ctx: Context, packages_result: PhaseResult | None,
+                          *, no_gui: bool) -> tuple[list, list[str]]:
+    """Transaction entries contributed by the packages and gui modules.
 
-    assert source is not None
-    # bad entry if source does not exists...
-    if force:
-        pass  # Even if the source does not exist, always make a symlink
-    elif not os.path.lexists(source):
-        log(RED("source %s : does not exist" % source))
-        continue
+    Returns ``(entries, warnings)``; a gui autostart entry that cannot be
+    built is a warning (the GNOME section reports the gui state), while a
+    broken package link request fails the transaction.
+    """
 
-    # if --force option is given, delete and override the previous symlink
-    if os.path.lexists(target):
-        is_broken_link = os.path.islink(target) and not os.path.exists(os.readlink(target))
-        err = ""
-
-        if is_broken_link:  # safe to remove
-            if os.path.islink(target):
-                os.unlink(target)
-
-        elif os.path.islink(target):
-            if args.force:
-                os.unlink(target)
+    extra = []
+    warnings: list[str] = []
+    if packages_result is not None and packages_result.details.get("links"):
+        link_requests = load_seam("packages", "link_requests")
+        if link_requests is not None:
+            extra += list(link_requests(packages_result.details))
+    if not no_gui:
+        autostart = load_seam("gui", "autostart_desired_entry")
+        if autostart is not None:
+            try:
+                entry = autostart(ctx.target)
+            except Exception as exc:
+                warnings.append(f"gui autostart entry unavailable: "
+                                f"{type(exc).__name__}: {exc}")
             else:
-                msg = GRAY("already exists, skipped")
-                log("{:60s} : {}".format(BLUE(target), msg))
-        elif fail_on_error:
-            err = RED("already exists, please remove " + target + " manually.")
-        else:
-            if args.force:
-                err = YELLOW("already exists but not a symbolic link; --force option ignored")
-            else:
-                err = YELLOW("exists, but not a symbolic link. Check by yourself!!")
-        if err:
-            log("{:60s} : {}".format(BLUE(target), err))
-            if fail_on_error:
-                sys.exit(1)
+                if entry is not None:
+                    extra.append(entry)
+    return extra, warnings
 
-    # make a symbolic link if available
-    if not os.path.lexists(target):
-        mkdir_target = os.path.split(target)[0]
-        if not os.path.isdir(mkdir_target):
-            makedirs(mkdir_target)
-            log(GREEN('Created directory : %s' % mkdir_target))
-        os.symlink(source, target)
-        log("{:60s} : {}".format(
-            BLUE(target),
-            GREEN("symlink created from '%s'" % source)
-        ))
 
-errors = []
-for action in post_actions:
-    if not action:
-        continue
+# --- location -------------------------------------------------------------------
 
-    action_title = action.strip().split('\n')[0].strip()
-    if action_title == '#!/bin/bash':
-        action_title = action.strip().split('\n')[1].strip()
+def location_error(here: Path, target: plat.Target) -> str | None:
+    """Why ``here`` is not the ``~/.dotfiles`` checkout, or None."""
 
-    log("\n", cr=False)
-    log_boxed("Executing: " + action_title, color_fn=CYAN)
-    exitcode = subprocess.call(
-        ['bash', '-e', '-c', action],
-        preexec_fn=lambda: signal(SIGPIPE, SIG_DFL),
+    expected = target.repo_root
+    if Path(os.path.realpath(here)) == Path(os.path.realpath(expected)):
+        return None
+    return (
+        f"install.py must run from the checkout at {expected}, not {here}.\n"
+        "Clone the repository into ~/.dotfiles and run it from there:\n\n"
+        f"    git clone --recursive {repo.DEFAULT_REPO_URL} ~/.dotfiles\n"
+        "    cd ~/.dotfiles && python3 install.py\n\n"
+        "or use the one-line installer:\n\n"
+        "    curl -fsSL https://raw.githubusercontent.com/leekyungmoon/dotfiles"
+        "/HEAD/etc/install | bash"
     )
-    if exitcode != 0:
-        errors.append(action_title)
-        log(RED("FAILED (exit code: %d): %s" % (exitcode, action_title)))
-    if exitcode == 100:  # FATAL, should abort
-        sys.exit(100)
 
-log("\n")
-if errors:
-    log_boxed("You have %3d warnings or errors -- check the logs!" % len(errors),
-              color_fn=YELLOW, use_bold=True)
-    for e in errors:
-        log("   " + YELLOW(e))
-    log("\n")
-else:
-    log_boxed("✔  You are all set! ",
-              color_fn=GREEN, use_bold=True)
 
-log("- Please restart shell (e.g. " + CYAN("`exec zsh`") + ") if necessary.")
-log("- To install some packages locally (e.g. neovim, tmux), try " + CYAN("`dotfiles install <package>`"))
-log("- If you want to update dotfiles (or have any errors), try " + CYAN("`dotfiles update`"))
-log("\n\n", cr=False)
+# --- phases -------------------------------------------------------------------
 
-sys.exit(len(errors))
+def preflight_phase(ctx: Context) -> PhaseResult:
+    reasons = []
+    details: dict = {}
+    if ctx.platform is not None:
+        p = ctx.platform
+        ui.log_target("platform", ui.GREEN(f"{p.distribution} {p.release} ({p.architecture})"))
+    if sys.version_info < MIN_PYTHON:
+        reasons.append("python 3.10+ is required")
+    if ctx.runner.which("git") is None:
+        reasons.append("git is not installed (run etc/install, or: sudo apt-get "
+                       "install -y git)")
+    if not ctx.target.home.is_dir():
+        reasons.append(f"home {ctx.target.home} does not exist")
+    elif not os.access(ctx.target.home, os.W_OK):
+        reasons.append(f"home {ctx.target.home} is not writable")
+    checkout = Path(ctx.repo_root)
+    if not repo.is_checkout(checkout):
+        reasons.append(f"{checkout} is not a git checkout")
+    if reasons:
+        for reason in reasons:
+            ui.log(ui.RED(reason))
+        return PhaseResult("preflight", FAIL, reasons)
+
+    ui.log_target(checkout, ui.GREEN("git checkout"))
+    try:
+        issues = repo.submodule_issues(ctx.runner, checkout)
+        if issues:
+            for path, flag in issues:
+                ui.log(ui.RED("git submodule {name} : {status}".format(
+                    name=path, status=repo.SUBMODULE_STATUS.get(flag, "(Unknown)"))))
+            ui.log(ui.YELLOW("Git submodules are not initialized.\n"))
+            ui.log("Running: %s" % ui.CYAN(
+                "git submodule update --init --recursive --jobs 8"))
+            repo.update_submodules(ctx.runner, checkout)
+            repo.verify_submodules(ctx.runner, checkout)
+            details["submodules"] = "updated"
+        else:
+            details["submodules"] = "ok"
+    except Exception as exc:
+        ui.log(ui.RED(f"submodules: {exc}"))
+        return PhaseResult("preflight", FAIL, [f"submodules: {exc}"], details)
+    return PhaseResult("preflight", PASS, [], details)
+
+
+def _manifest_sha(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _backup_location(target: plat.Target, run_id: str, entry_id: str) -> Path | None:
+    """Where the transaction kept the object it replaced for ``entry_id``."""
+
+    folder = target.state_root / "backups" / "runs" / run_id / entry_id
+    try:
+        meta = json.loads((folder / "meta.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    payload = meta.get("payload")
+    if payload == "object":
+        return folder / "object"
+    if payload == "baseline":
+        return target.state_root / "backups" / "baseline" / entry_id / "object"
+    return None
+
+
+def report_entries(ctx: Context, desired: list, befores: dict, applied,
+                   sources: dict) -> None:
+    changed = set(applied.changed)
+    for entry in sorted(desired, key=lambda d: str(d.dest)):
+        dest = entry.dest
+        if entry.id not in changed:
+            ui.log_target(dest, ui.GREEN("already up-to-date"))
+            continue
+        if entry.kind == "symlink":
+            what = f"symlink created from '{entry.link_text}'"
+        elif entry.kind == "file":
+            what = f"copied from '{sources.get(entry.id) or 'the repository'}'"
+        elif entry.kind == "absent":
+            what = "removed"
+        else:
+            what = "installed"
+        before = befores.get(entry.id)
+        if before is not None and before.kind != "absent":
+            backup = _backup_location(ctx.target, ctx.run_id, entry.id)
+            where = str(backup) if backup else str(applied.backup_dir)
+            if entry.kind == "absent":
+                ui.log_target(dest, ui.YELLOW(f"backed up to {where}, removed"))
+            else:
+                ui.log_target(dest, ui.YELLOW(f"backed up to {where}, replaced")
+                              + " " + ui.GREEN(f"({what})"))
+        elif entry.kind == "absent":
+            ui.log_target(dest, ui.GRAY("already absent"))
+        else:
+            ui.log_target(dest, ui.GREEN(what))
+    for entry_id in applied.retired:
+        ui.log_target(entry_id, ui.YELLOW("no longer managed; restored from the baseline"))
+    for entry_id in applied.drifted:
+        ui.log_target(entry_id, ui.YELLOW("no longer managed but changed since; left as is"))
+
+
+def transaction_phase(ctx: Context, *, extra_entries: list | None = None
+                      ) -> tuple[PhaseResult, bool]:
+    """Apply the managed paths from the checkout.
+
+    Returns the result and whether systemd-user entries were applied.
+    """
+
+    from installer import manifest as manifest_mod
+    from installer import transaction
+
+    checkout = Path(ctx.repo_root)
+    manifest_path = checkout / "manifests" / "managed-paths.json"
+    try:
+        loaded = manifest_mod.load_manifest(manifest_path)
+        resolved = manifest_mod.resolve(loaded, ctx.target, checkout)
+    except manifest_mod.ManifestError as exc:
+        ui.log(ui.RED(f"manifest: {exc}"))
+        return PhaseResult("transaction", FAIL, [f"manifest: {exc}"]), False
+
+    try:
+        previous = transaction.load_status(ctx.target)
+    except Exception:
+        previous = {}
+    legacy = [i for i in LEGACY_IDS if i in (previous.get("entries") or {})]
+    if legacy:
+        reason = ("this home was installed by the pre-release layout that managed "
+                  f"{', '.join(legacy)}; run 'python3 install.py restore --baseline' "
+                  "with that installer first")
+        ui.log(ui.RED(reason))
+        return PhaseResult("transaction", FAIL, [reason]), False
+
+    systemd_ok = phases.systemd_user_supported(ctx.runner)
+    skipped = transaction.skipped_by_condition(resolved, systemd_user=systemd_ok)
+    desired = transaction.entries_from_manifest(resolved, ctx.target,
+                                                systemd_user=systemd_ok)
+    desired += list(extra_entries or [])
+    sources = {e.id: str(e.source) for e in resolved if e.kind == "copy"}
+    try:
+        info = repo.checkout_info(ctx.runner, checkout)
+        commit, origin, branch = info.commit, info.origin_url, info.branch
+    except Exception:
+        commit, origin, branch = None, None, None
+    generation = {
+        "commit": commit,
+        "manifest_sha256": _manifest_sha(manifest_path),
+        "origin": origin,
+        "ref": branch,
+        "checkout": str(checkout),
+    }
+    befores = {}
+    for entry in desired:
+        try:
+            befores[entry.id] = transaction.snapshot(Path(entry.dest))
+        except Exception:
+            befores[entry.id] = None
+    try:
+        with transaction.Transaction(ctx.target, ctx.run_id) as tx:
+            applied = tx.apply(desired, generation=generation)
+    except transaction.ConcurrentRunError as exc:
+        ui.log(ui.RED(f"another install is running: {exc}"))
+        return PhaseResult("transaction", FAIL,
+                           [f"another install is running: {exc}"]), False
+    except Exception as exc:
+        ui.log(ui.RED(f"rolled back: {type(exc).__name__}: {exc}"))
+        return PhaseResult("transaction", FAIL,
+                           [f"rolled back: {type(exc).__name__}: {exc}"]), False
+
+    report_entries(ctx, desired, befores, applied, sources)
+    details = {"commit": commit, "result": phases.jsonable(applied)}
+    reasons = []
+    if skipped:
+        details["skipped_ids"] = skipped
+        reasons.append("systemd-user entries skipped: no systemd user manager")
+        for entry in resolved:
+            if entry.id in skipped:
+                ui.log_target(entry.dest, ui.GRAY("skipped (no systemd user manager)"))
+    return PhaseResult("transaction", PASS, reasons, details), bool(systemd_ok)
+
+
+def finish(ctx: Context, command: str, results: list[PhaseResult], *,
+           merge: bool = False, closing: bool = False) -> int:
+    """Write status.json and the summary; ``merge`` updates only these phases."""
+
+    recorded = [r.to_dict() for r in results]
+    if merge:
+        previous = phases.read_status(ctx.target) or {}
+        names = {r.phase for r in results}
+        recorded = [p for p in previous.get("phases", [])
+                    if isinstance(p, dict) and p.get("phase") not in names] + recorded
+    payload = {
+        "schema": phases.STATUS_SCHEMA,
+        "command": command,
+        "run_id": ctx.run_id,
+        "finished": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "overall": phases.worst(p.get("status") for p in recorded),
+        "phases": recorded,
+    }
+    try:
+        phases.write_status(ctx.target, payload)
+    except OSError as exc:
+        print(f"warning: cannot write status.json: {exc}", file=sys.stderr)
+    print(phases.format_summary(results))
+    if closing:
+        for line in phases.completion_lines(results):
+            ui.log(line)
+    return phases.exit_code(results)
+
+
+def _report(results: list[PhaseResult], result: PhaseResult) -> PhaseResult:
+    results.append(result)
+    status = result.status
+    color = {PASS: ui.GREEN, FAIL: ui.RED}.get(status, ui.YELLOW)
+    ui.log(f"[{result.phase}] " + color(status)
+           + (f": {'; '.join(result.reasons)}" if result.reasons else ""))
+    return result
+
+
+def run_pipeline(ctx: Context, command: str, opts: Options) -> int:
+    """Checking platform -> packages -> links -> post actions -> GNOME settings."""
+
+    results: list[PhaseResult] = []
+
+    ui.section("Checking platform")
+    if _report(results, preflight_phase(ctx)).status == FAIL:
+        return finish(ctx, command, results, closing=True)
+
+    ui.section("Installing packages")
+    packages_result = _report(results, packages_phase(
+        ctx, disabled=opts.no_packages, dry_run=False))
+    if packages_result.status == FAIL:
+        return finish(ctx, command, results, closing=True)
+
+    ui.section("Creating symbolic links")
+    try:
+        extra, warnings = extra_desired_entries(ctx, packages_result, no_gui=opts.no_gui)
+    except Exception as exc:
+        _report(results, PhaseResult("transaction", FAIL,
+                                     [f"extra entries: {type(exc).__name__}: {exc}"]))
+        return finish(ctx, command, results, closing=True)
+    for warning in warnings:
+        ui.log(ui.YELLOW(warning))
+    tx_result, systemd_applied = transaction_phase(ctx, extra_entries=extra)
+    tx_result.reasons.extend(warnings)
+    if _report(results, tx_result).status == FAIL:
+        return finish(ctx, command, results, closing=True)
+
+    ui.section("Post actions")
+    child_env = phases.child_env(ctx.target, ctx.env)
+    _report(results, phases.post_install_phase(
+        ctx.target, ctx.runner, repo_root=Path(ctx.repo_root), run_id=ctx.run_id,
+        systemd_units_applied=systemd_applied, env=child_env,
+        skip_zplug=opts.skip_zplug, skip_vimplug=opts.skip_vimplug))
+    _report(results, phases.smoke_phase(ctx.target, ctx.runner, ctx.env))
+    _report(results, phases.login_shell_phase(
+        ctx.target, ctx.runner, current_shell=ctx.current_shell,
+        allow_change=not opts.no_shell_change, interactive=ctx.interactive))
+    _report(results, phases.git_identity_phase(ctx.target, ctx.runner,
+                                               prompt=ctx.prompt))
+
+    ui.section("GNOME settings")
+    _report(results, gui_phase(ctx, disabled=opts.no_gui))
+    return finish(ctx, command, results, closing=True)
+
+
+# --- dry run ------------------------------------------------------------------
+
+def dry_run_install(ctx: Context, opts: Options | None = None) -> int:
+    from installer import manifest as manifest_mod
+
+    opts = opts or Options(dry_run=True)
+    ui.section("Checking platform")
+    results = [preflight_phase(ctx)]
+    ui.section("Installing packages")
+    results.append(packages_phase(ctx, disabled=opts.no_packages, dry_run=True))
+    ui.section("Creating symbolic links")
+    checkout = Path(ctx.repo_root)
+    try:
+        loaded = manifest_mod.load_manifest(checkout / "manifests" / "managed-paths.json")
+        resolved = manifest_mod.resolve(loaded, ctx.target, checkout)
+    except manifest_mod.ManifestError as exc:
+        results.append(PhaseResult("plan", FAIL, [f"manifest: {exc}"]))
+    else:
+        plan = {}
+        for entry in sorted(resolved, key=lambda e: str(e.dest)):
+            action = _planned_action(entry)
+            plan[entry.id] = f"{action} {entry.dest}"
+            color = ui.GREEN if action in ("unchanged", "keep-absent") else ui.YELLOW
+            ui.log_target(entry.dest, color(f"would {action}"
+                                            if action not in ("unchanged", "keep-absent")
+                                            else "already up-to-date"))
+            print(f"  {plan[entry.id]}")
+        results.append(PhaseResult("plan", PASS, [], {"entries": plan}))
+    for result in results:
+        print(f"[{result.phase}] {result.status}"
+              + (f": {'; '.join(result.reasons)}" if result.reasons else ""))
+    print("dry run: nothing was changed")
+    return phases.exit_code(results)
+
+
+def _planned_action(entry) -> str:
+    dest = entry.dest
+    exists = os.path.lexists(dest)
+    if entry.kind == "remove":
+        return "remove" if exists else "keep-absent"
+    if entry.kind in ("symlink", "link"):
+        if dest.is_symlink() and os.readlink(dest) == entry.link_text:
+            return "unchanged"
+    elif entry.kind == "copy" and dest.is_file() and not dest.is_symlink():
+        if entry.source is not None and dest.read_bytes() == entry.source.read_bytes():
+            return "unchanged"
+    return "replace" if exists else "create"
+
+
+# --- other commands -----------------------------------------------------------
+
+def cmd_status(ctx: Context, as_json: bool) -> int:
+    from installer import transaction
+
+    try:
+        state = transaction.load_status(ctx.target)
+    except Exception as exc:
+        state = {"error": f"{type(exc).__name__}: {exc}"}
+    payload = {"state": phases.jsonable(state), "last_run": phases.read_status(ctx.target)}
+    if as_json:
+        print(json.dumps(payload, indent=2, sort_keys=True))
+        return 0
+    last = payload["last_run"] or {}
+    print(f"repo:      {ctx.target.repo_root}")
+    print(f"last run:  {last.get('run_id', '-')} {last.get('command', '')} "
+          f"-> {last.get('overall', 'never installed')}")
+    for phase in last.get("phases", []):
+        reasons = "; ".join(phase.get("reasons") or [])
+        print(f"  {phase.get('phase', '?'):<14} {phase.get('status')}"
+              + (f"  ({reasons})" if reasons else ""))
+    entries = state.get("entries") if isinstance(state, dict) else None
+    if isinstance(entries, dict):
+        drifted = [k for k, v in entries.items()
+                   if isinstance(v, dict) and v.get("matches") is False]
+        print(f"managed:   {len(entries)} entries, "
+              f"{len(drifted)} drifted{': ' + ', '.join(drifted) if drifted else ''}")
+    elif isinstance(state, dict) and state.get("error"):
+        print(f"state:     {state['error']}")
+    return 0
+
+
+def cmd_restore(ctx: Context, args) -> int:
+    from installer import transaction
+
+    which = "baseline" if args.baseline else args.run
+    if which != "baseline" and not plat.is_generation_id(which):
+        print(ui.RED(f"error: {which!r} is not a run id"), file=sys.stderr)
+        return 2
+    try:
+        result = transaction.restore(ctx.target, which=which, force=args.force,
+                                     ids=args.ids)
+    except Exception as exc:
+        print(ui.RED(f"restore failed: {type(exc).__name__}: {exc}"), file=sys.stderr)
+        return 1
+    data = phases.jsonable(result)
+    for entry_id in data.get("restored", []):
+        ui.log_target(entry_id, ui.GREEN(f"restored ({which})"))
+    for entry_id in data.get("forced", []):
+        ui.log_target(entry_id, ui.YELLOW("restored over local changes (--force)"))
+    for entry_id in data.get("unchanged", []):
+        ui.log_target(entry_id, ui.GRAY("already restored"))
+    if data.get("backup_dir"):
+        ui.log(ui.YELLOW(f"the replaced objects were backed up to {data['backup_dir']}"))
+
+    # A full baseline restore also returns the GNOME keys and input-remapper
+    # presets to their pre-install values; they are not files, so the file
+    # transaction above cannot. Restoring a single id or run stays file-only.
+    gui_status = None
+    if which == "baseline" and not args.ids:
+        restore_gui = load_seam("gui", "restore_gui")
+        if restore_gui is not None:
+            try:
+                gui_result = PhaseResult.coerce(restore_gui(ctx.target, ctx.runner, ctx.env),
+                                           "gui-restore")
+            except Exception as exc:  # the file restore already succeeded
+                gui_result = PhaseResult("gui-restore", phases.FAIL,
+                                         [f"{type(exc).__name__}: {exc}"])
+            gui_status = gui_result.status
+            data["gui"] = phases.jsonable(gui_result)
+            color = {phases.PASS: ui.GREEN, phases.SKIPPED: ui.GRAY,
+                     phases.PENDING_GUI: ui.YELLOW}.get(gui_status, ui.RED)
+            ui.log_target("GNOME settings", color(f"{gui_status.lower()}"
+                          + (f" ({'; '.join(gui_result.reasons)})" if gui_result.reasons else "")))
+            if gui_status == phases.PENDING_GUI:
+                ui.log(ui.YELLOW("GNOME settings are restored from a desktop session: run "
+                                 "'python3 ~/.dotfiles/install.py restore --baseline' again "
+                                 "inside GNOME (files already restored stay as they are)."))
+    print(json.dumps(data, indent=2, sort_keys=True))
+    return 1 if gui_status == phases.FAIL else 0
+
+
+def _package_names(repo_root: Path) -> set[str]:
+    names: set[str] = set()
+    try:
+        data = json.loads((repo_root / "manifests" / "packages.json").read_text("utf-8"))
+        names.update(g["id"] for g in data.get("groups", []) if isinstance(g, dict))
+    except (OSError, ValueError, KeyError):
+        pass
+    try:
+        data = json.loads((repo_root / "manifests" / "tools.json").read_text("utf-8"))
+        tools = data.get("tools", {})
+        names.update(tools if isinstance(tools, dict)
+                     else (t.get("name") for t in tools if isinstance(t, dict)))
+    except (OSError, ValueError):
+        pass
+    names.discard(None)
+    return names
+
+
+def cmd_packages(ctx: Context, only: list[str], dry_run: bool,
+                 force: bool = False) -> int:
+    allowed = _package_names(Path(ctx.repo_root))
+    unknown = [name for name in only if name not in allowed]
+    if unknown:
+        print(ui.RED(f"error: not in the package manifests: {', '.join(unknown)}; "
+                     f"allowed: {', '.join(sorted(allowed)) or '(none)'}"),
+              file=sys.stderr)
+        return 2
+    run = load_seam("packages", "run_packages_phase")
+    if run is None:
+        print("error: the packages phase is not available in this checkout",
+              file=sys.stderr)
+        return 1
+    parameters = inspect.signature(run).parameters
+    if "only" not in parameters:
+        print("error: the packages phase does not support selecting packages; "
+              "run 'dotfiles repair' instead", file=sys.stderr)
+        return 1
+    kwargs = {"dry_run": dry_run, "only": list(only)}
+    if force and "force" in parameters:
+        kwargs["force"] = True
+    result = PhaseResult.coerce(
+        run(ctx.target, ctx.platform, ctx.runner, **kwargs), "packages")
+    return finish(ctx, "packages", [result], merge=True)
+
+
+def _open_tty(mode: str):
+    try:
+        return open("/dev/tty", mode)
+    except OSError:
+        return None
+
+
+def _interactive(argv: list[str]) -> int:
+    """Run a command attached to the terminal (chsh needs to prompt)."""
+
+    stdin = None
+    if not sys.stdin.isatty():
+        stdin = _open_tty("rb") or subprocess.DEVNULL
+    try:
+        return subprocess.call(argv, stdin=stdin)
+    finally:
+        if stdin not in (None, subprocess.DEVNULL):
+            stdin.close()
+
+
+def terminal_prompt():
+    """A ``prompt(question)`` reading the terminal, or None without one."""
+
+    if sys.stdin.isatty():
+        def prompt(question: str) -> str | None:
+            try:
+                return input(ui.YELLOW(question))
+            except EOFError:
+                return None
+        return prompt
+    probe = _open_tty("r")
+    if probe is None:
+        return None
+    probe.close()
+
+    def prompt_tty(question: str) -> str | None:
+        handle = _open_tty("r+")
+        if handle is None:
+            return None
+        with handle:
+            handle.write(ui.YELLOW(question))
+            handle.flush()
+            line = handle.readline()
+        return line.rstrip("\n") if line else None
+    return prompt_tty
+
+
+def main(argv: list[str] | None = None, *, env: dict | None = None,
+         euid: int | None = None, getpwuid=pwd.getpwuid, runner=None,
+         detect=plat.detect_platform, here: Path | None = None,
+         prompt=None, interactive=None, run_id: str | None = None) -> int:
+    args = parse_args(argv)
+    env = dict(os.environ if env is None else env)
+    ui.configure(env=env)
+    here = Path(here) if here is not None else HERE
+    command = args.command
+
+    if command in ("install", "repair"):
+        ui.log(__doc__)  # print logo.
+
+    try:
+        target = plat.resolve_target(env, euid=euid, getpwuid=getpwuid)
+        platform = None
+        if command not in ("status", "restore"):
+            platform = detect()
+            plat.require_supported_platform(platform)
+    except plat.PlatformError as exc:
+        print(ui.RED(f"error: {exc}"), file=sys.stderr)
+        return 2
+
+    if command in LOCATED_COMMANDS and not getattr(args, "allow_any_location", False):
+        problem = location_error(here, target)
+        if problem is not None:
+            print(ui.RED("error: " + problem), file=sys.stderr)
+            return 2
+
+    from installer.runner import DryRunRunner, Runner
+    from installer.transaction import new_run_id
+
+    dry_run = bool(getattr(args, "dry_run", False))
+    if runner is None:
+        runner = DryRunRunner() if dry_run else Runner()
+    try:
+        current_shell = getpwuid(target.uid).pw_shell
+    except KeyError:
+        current_shell = ""
+    # prompt=False (tests) means "no terminal": print the commands instead.
+    if prompt is None and command in ("install", "repair") and not dry_run:
+        prompt = terminal_prompt()
+    ctx = Context(target=target, platform=platform, runner=runner, env=env,
+                  run_id=run_id or new_run_id(), current_shell=current_shell,
+                  interactive=interactive or _interactive, repo_root=here,
+                  prompt=prompt if callable(prompt) else None)
+
+    if command in ("install", "repair"):
+        opts = options_from(args)
+        if opts.dry_run:
+            return dry_run_install(ctx, opts)
+        return run_pipeline(ctx, command, opts)
+    if command == "status":
+        return cmd_status(ctx, args.json)
+    if command == "restore":
+        return cmd_restore(ctx, args)
+    if command == "gui-apply":
+        result = gui_phase(ctx, disabled=False, autostart=args.autostart)
+        return finish(ctx, "gui-apply", [result], merge=True)
+    if command == "packages":
+        return cmd_packages(ctx, args.only, args.dry_run, args.force)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

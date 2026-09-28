@@ -65,10 +65,14 @@ class Target:
 
     @property
     def repo_root(self) -> Path:
-        return self.data_home / APP_NAME / "repo"
+        """The git checkout itself: ``~/.dotfiles`` (as in upstream)."""
+
+        return self.home / ".dotfiles"
 
     @property
     def staging_root(self) -> Path:
+        """Scratch clones only; never the installed checkout."""
+
         return self.data_home / APP_NAME / "staging"
 
     @property
@@ -77,7 +81,9 @@ class Target:
 
     @property
     def compat_link(self) -> Path:
-        return self.home / ".dotfiles"
+        """Alias of :attr:`repo_root`, kept for existing callers."""
+
+        return self.repo_root
 
     def to_json(self) -> str:
         payload = {k: str(v) for k, v in dataclasses.asdict(self).items()}
