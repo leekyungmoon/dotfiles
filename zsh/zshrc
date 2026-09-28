@@ -38,6 +38,11 @@ else
   export COLORTERM="truecolor"
 fi
 
+# Do not let automation-launched parent processes disable colors for interactive
+# terminal applications such as Codex. Individual commands can still opt out
+# explicitly when needed.
+unset NO_COLOR
+
 # Enable Powerlevel10k instant prompt. Should stay close to the top of ~/.zshrc.
 # Initialization code that may require console input (password prompts, [y/n]
 # confirmations, etc.) must go above this block; everything else may go below.
@@ -270,7 +275,6 @@ fi
 if [ -f "$HOME/.zshrc.local" ]; then
     source "$HOME/.zshrc.local"
 fi
-
 
 # Profiling
 if [ -n "$ZSH_PROFILE_LOG" ]; then

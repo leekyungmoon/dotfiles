@@ -212,8 +212,8 @@
 	recurse = true
 
 [credential]
+	helper = libsecret
 	# helper = store --file ~/.git-credentials
-	helper = cache --timeout 60
 
 # Github: always use SSH protocol for pushing to github
 # https://stackoverflow.com/questions/43800726/always-pull-using-https-push-using-ssh-using-insteadof

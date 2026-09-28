@@ -1,0 +1,201 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+target_pane=${1:-}
+if [[ ! ${target_pane} =~ ^%[0-9]+$ ]]; then
+  exit 2
+fi
+
+kill_grace=0.10s
+tmux_query_timeout=0.75s
+process_query_timeout=0.50s
+primary_metadata_timeout=0.75s
+fallback_metadata_timeout=0.35s
+payload_timeout=2s
+buffer_load_timeout=3s
+
+send_ctrl_v() {
+  timeout --kill-after="${kill_grace}" "${tmux_query_timeout}" \
+    tmux send-keys -t "${target_pane}" C-v >/dev/null 2>&1
+}
+
+pane_separator='|||TSP|||'
+pane_format="#{pane_tty}${pane_separator}#{pane_current_command}"
+if ! pane_metadata=$(timeout --kill-after="${kill_grace}" \
+  "${tmux_query_timeout}" tmux display-message -p -t "${target_pane}" \
+  "${pane_format}" 2>/dev/null); then
+  exit 1
+fi
+if [[ ${pane_metadata} != *"${pane_separator}"* ]]; then
+  exit 1
+fi
+pane_tty=${pane_metadata%%"${pane_separator}"*}
+pane_current_command=${pane_metadata#*"${pane_separator}"}
+if [[ ! ${pane_tty} =~ ^/dev/(pts/[0-9]+|tty[0-9]+)$ ]]; then
+  exit 1
+fi
+pane_tty=${pane_tty#/dev/}
+
+# Restored AI panes can keep a zsh supervisor as pane_current_command.  Prefer
+# the exact foreground process group on the pane tty, while retaining tmux's
+# current-command value as a compatibility signal for directly launched TUIs.
+if ! pane_processes=$(timeout --kill-after="${kill_grace}" \
+  "${process_query_timeout}" ps -t "${pane_tty}" \
+  -o comm=,pgid=,tpgid= 2>/dev/null); then
+  exit 1
+fi
+foreground_kind=other
+if [[ ${pane_current_command} =~ ^(zsh|bash|sh|dash|fish|ksh)$ ]]; then
+  foreground_kind=shell
+elif [[ ${pane_current_command} =~ ^(codex|claude)$ ]]; then
+  foreground_kind=ai
+fi
+while read -r command_name process_group foreground_group; do
+  if [[ ! ${process_group} =~ ^[0-9]+$ ||
+    ! ${foreground_group} =~ ^[0-9]+$ ||
+    ${process_group} != "${foreground_group}" ||
+    ${foreground_group} == 0 ]]; then
+    continue
+  fi
+  if [[ ${command_name} =~ ^(codex|claude)$ ]]; then
+    foreground_kind=ai
+    break
+  fi
+  if [[ ${command_name} =~ ^(zsh|bash|sh|dash|fish|ksh)$ ]]; then
+    foreground_kind=shell
+  fi
+done <<<"${pane_processes}"
+
+# Preserve native C-v semantics for editors and other foreground programs.
+# Shells and AI TUIs continue through the bounded, synchronous clipboard-aware
+# path so the paste cannot be reordered behind a later key press.
+if [[ ${foreground_kind} == other ]]; then
+  send_ctrl_v
+  exit 0
+fi
+
+# Sidebar restore can create a session without copying the graphical variables
+# that are still present in tmux's global environment.  Read that environment
+# once, then import only this fixed allowlist without eval.
+global_environment=""
+if global_environment=$(timeout --kill-after="${kill_grace}" \
+  "${tmux_query_timeout}" tmux show-environment -g 2>/dev/null); then
+  while IFS= read -r environment_entry; do
+    [[ ${environment_entry} == *=* ]] || continue
+    environment_name=${environment_entry%%=*}
+    case ${environment_name} in
+      DISPLAY|WAYLAND_DISPLAY|XDG_RUNTIME_DIR|XDG_SESSION_TYPE|\
+        DBUS_SESSION_BUS_ADDRESS)
+        ;;
+      *)
+        continue
+        ;;
+    esac
+    if [[ -z ${!environment_name-} ]]; then
+      printf -v "${environment_name}" '%s' "${environment_entry#*=}"
+      export "${environment_name}"
+    fi
+  done <<<"${global_environment}"
+fi
+
+contains_image() {
+  grep -Eiq \
+    '(^|[[:space:]])image/[A-Za-z0-9.+-]+(;[^[:space:]]+)?([[:space:]]|$)' \
+    <<<"$1"
+}
+
+contains_text() {
+  grep -Eiq \
+    '(^|[[:space:]])(text/plain[^[:space:]]*|UTF8_STRING|STRING|TEXT)([[:space:]]|$)' \
+    <<<"$1"
+}
+
+has_non_whitespace() {
+  grep -q '[^[:space:]]' <<<"$1"
+}
+
+# Prefer the native backend for the graphical session.  GNOME can expose a
+# selection through only one bridge, so use the other backend only when the
+# native probe fails, times out, is empty, or offers no supported MIME type.
+clipboard_backends=()
+if [[ -n ${WAYLAND_DISPLAY:-} ]] && command -v wl-paste >/dev/null 2>&1; then
+  clipboard_backends+=(wayland)
+fi
+if command -v xclip >/dev/null 2>&1; then
+  clipboard_backends+=(x11)
+fi
+if [[ -z ${WAYLAND_DISPLAY:-} ]] && command -v wl-paste >/dev/null 2>&1; then
+  clipboard_backends+=(wayland)
+fi
+
+clipboard_backend=""
+candidate_index=0
+for candidate_backend in "${clipboard_backends[@]}"; do
+  candidate_types=""
+  candidate_timeout=${fallback_metadata_timeout}
+  if [[ ${candidate_index} -eq 0 ]]; then
+    candidate_timeout=${primary_metadata_timeout}
+  fi
+  if [[ ${candidate_backend} == wayland ]]; then
+    if ! candidate_types=$(timeout --kill-after="${kill_grace}" \
+      "${candidate_timeout}" wl-paste --list-types 2>/dev/null); then
+      candidate_index=$((candidate_index + 1))
+      continue
+    fi
+  else
+    if ! candidate_types=$(timeout --kill-after="${kill_grace}" \
+      "${candidate_timeout}" xclip -selection clipboard -out \
+      -target TARGETS 2>/dev/null); then
+      candidate_index=$((candidate_index + 1))
+      continue
+    fi
+  fi
+
+  if contains_image "${candidate_types}"; then
+    send_ctrl_v
+    exit 0
+  fi
+  if contains_text "${candidate_types}"; then
+    clipboard_backend=${candidate_backend}
+    break
+  fi
+  if has_non_whitespace "${candidate_types}"; then
+    # A successful nonempty response belongs to the authoritative backend.
+    # Do not reinterpret a stale bridge selection as the current clipboard.
+    send_ctrl_v
+    exit 0
+  fi
+  candidate_index=$((candidate_index + 1))
+done
+
+# Preserve native behavior when neither bridge can return usable MIME metadata
+# within the bound.  In an AI TUI this is also the final image-paste fallback.
+if [[ -z ${clipboard_backend} ]]; then
+  send_ctrl_v
+  exit 0
+fi
+
+buffer_name="smart-paste-${target_pane#%}-$$"
+cleanup_buffer() {
+  timeout --kill-after="${kill_grace}" "${tmux_query_timeout}" \
+    tmux delete-buffer -b "${buffer_name}" >/dev/null 2>&1 || true
+}
+trap cleanup_buffer EXIT
+
+if [[ ${clipboard_backend} == wayland ]]; then
+  clipboard_reader=(timeout --kill-after="${kill_grace}" \
+    "${payload_timeout}" wl-paste --no-newline)
+else
+  clipboard_reader=(timeout --kill-after="${kill_grace}" \
+    "${payload_timeout}" xclip -selection clipboard -out)
+fi
+
+if ! ("${clipboard_reader[@]}" |
+  timeout --kill-after="${kill_grace}" "${buffer_load_timeout}" \
+    tmux load-buffer -b "${buffer_name}" -) 2>/dev/null; then
+  exit 1
+fi
+
+timeout --kill-after="${kill_grace}" "${tmux_query_timeout}" \
+  tmux paste-buffer -t "${target_pane}" -b "${buffer_name}" -p
