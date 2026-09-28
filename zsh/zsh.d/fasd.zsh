@@ -2,6 +2,22 @@
 #
 # @see https://github.com/clvv/fasd
 
+# The prezto-generated hook (~/.cache/prezto/fasd-cache.zsh) runs
+# `eval "fasd --proc $(fasd --sanitize $1)"`. --sanitize keeps newlines, so
+# lines 2..N of a multi-line command were executed a second time inside the
+# hook, with stderr sent to /dev/null (e.g. a pasted scp ran twice, the second
+# time silently). Tokenize with (z)/(Q) instead: nothing is executed or
+# expanded, and fasd still receives the arguments.
+if (( $+functions[_fasd_preexec] )); then
+  _fasd_preexec() {
+    emulate -L zsh
+    local -a words
+    words=("${(@Q)${(z)1}}")
+    (( ${#words} )) || return 0
+    fasd --proc "${words[@]}" </dev/null >/dev/null 2>&1
+  }
+fi
+
 alias a='fasd -a'        # any
 alias s='fasd -si'       # show / search / select
 alias d='fasd -d'        # directory
