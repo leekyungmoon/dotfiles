@@ -32,6 +32,11 @@ PC 재부팅이나 예기치 않은 종료 이후에도 터미널 작업환경�
 | `systemd/user/tmux-resurrect-autosave.{service,timer}` | 1분 주기 저장 |
 | `manifests/tmux-plugins.json` | TPM과 plugin의 고정 commit |
 
+표의 경로는 저장소 checkout인 `~/.dotfiles` 기준이다. unit 파일은
+`~/.config/systemd/user/`에 복사되며, 예전 로컬 설정이 남긴
+`~/.config/systemd/user/tmux.service.d/login.conf` drop-in은 배포된 unit을
+덮어쓰므로 설치기가 제거한다(백업 후 제거, [RECOVERY.md](RECOVERY.md) 참고).
+
 plugin은 `${XDG_DATA_HOME:-$HOME/.local/share}/tmux/plugins`
 (`TMUX_PLUGIN_MANAGER_PATH`)에, 저장본은
 `${XDG_DATA_HOME:-$HOME/.local/share}/tmux/resurrect`에 둔다. 설치기는 plugin을
