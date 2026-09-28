@@ -21,6 +21,9 @@ alias tn='tmux new -s'
 alias ta='tmux attach -t'
 alias tk='tmux kill-session -t'
 alias td='tmux detach'
+# `trn NEW` renames the current session; `trn -t OLD NEW` targets another one.
+# Deliberately not `tr`: coreutils tr is a real command and must stay reachable.
+alias trn='tmux rename-session'
 
 
 # Normalize safely recognizable command selections after bracketed paste reaches
