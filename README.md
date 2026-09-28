@@ -135,3 +135,29 @@ $ dotfiles install ripgrep        # -> ~/.local/bin/rg
 [The MIT License (MIT)](LICENSE)
 
 Copyright (c) 2012-2026 Jongwook Choi (@wookayin)
+
+Modifications in this repository are released under the same MIT license.
+
+
+## Acknowledgements
+
+This repository is derived from [wookayin/dotfiles][upstream] by
+[Jongwook Choi (@wookayin)][wookayin], and keeps its full upstream commit
+history and MIT license. The vim/neovim, zsh, tmux and helper-script
+foundations here are his work; the Ubuntu bootstrap, desktop integration and
+clipboard helpers are the changes made on top.
+
+It is an independent repository rather than a GitHub fork, so that nothing in
+it can be pushed back to upstream by accident. Upstream is tracked as a
+fetch-only remote:
+
+```sh
+git remote add upstream \
+  https://github.com/wookayin/dotfiles.git
+git remote set-url --push upstream no-push
+```
+
+Please report issues with this repository here, not upstream.
+
+[upstream]: https://github.com/wookayin/dotfiles
+[wookayin]: https://github.com/wookayin
