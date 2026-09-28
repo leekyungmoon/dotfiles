@@ -285,7 +285,7 @@ MOCK_TTY_COMMANDS=$'zsh 77 77\ncodex 77 77'
 run_case
 grep -Fxq 'send-keys:send-keys -t %77 C-v' "${MOCK_LOG}"
 
-# Sidebar-restored sessions can omit graphical variables even though tmux's
+# Restored or scripted sessions can omit graphical variables even though tmux's
 # global environment still has them.  The helper imports the fixed allowlist
 # and keeps Wayland authoritative instead of selecting stale X11 metadata.
 reset_case

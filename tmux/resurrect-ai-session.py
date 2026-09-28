@@ -320,23 +320,31 @@ def ai_resume_command(pane_pid: int) -> list[str] | None:
     }
     if len(explicit) > 1:
         return []
-    conversation_id = next(iter(explicit)) if explicit else None
-    if conversation_id is None:
-        locks: set[str] = set()
-        rollouts: set[tuple[Path, str]] = set()
-        for pid, _, _, _ in candidates:
-            candidate_locks, candidate_rollouts = open_codex_ids(pid)
-            locks.update(candidate_locks)
-            rollouts.update(candidate_rollouts)
-        root_ids = {
-            value
-            for value in locks | {item[1] for item in rollouts}
-            if (payload := session_metadata(value, rollouts)) is not None
-            and metadata_is_root(payload)
-        }
-        if len(root_ids) != 1:
-            return []
+    # The live thread (writer lock / open rollout) wins over the command line:
+    # /new or /resume inside the TUI switches threads without changing argv,
+    # so a "codex resume <id>" argv only names the thread the process began
+    # with.
+    locks: set[str] = set()
+    rollouts: set[tuple[Path, str]] = set()
+    for pid, _, _, _ in candidates:
+        candidate_locks, candidate_rollouts = open_codex_ids(pid)
+        locks.update(candidate_locks)
+        rollouts.update(candidate_rollouts)
+    live_ids = locks | {item[1] for item in rollouts}
+    root_ids = {
+        value
+        for value in live_ids
+        if (payload := session_metadata(value, rollouts)) is not None
+        and metadata_is_root(payload)
+    }
+    if len(root_ids) == 1:
         conversation_id = next(iter(root_ids))
+    elif explicit and not root_ids and live_ids <= explicit:
+        # No verified root: the argv ID stands only when no live evidence
+        # contradicts it (none at all, or only that same ID).
+        conversation_id = next(iter(explicit))
+    else:
+        return []
 
     source_argv = next(
         (argv for _, _, argv, _ in candidates if codex_resume_id(argv) == conversation_id),
@@ -346,6 +354,51 @@ def ai_resume_command(pane_pid: int) -> list[str] | None:
     if codex_hooks_disabled(source_argv):
         command.extend(("--disable", "hooks"))
     return command
+
+
+def child_commands(pane_pid: int) -> list[list[str]]:
+    """argv of every direct child of the pane process (what resurrect's
+    default "ps" save strategy records as the pane command)."""
+    result: list[list[str]] = []
+    try:
+        entries = os.listdir("/proc")
+    except OSError:
+        return result
+    for entry in entries:
+        if not entry.isdigit():
+            continue
+        stat = proc_stat(int(entry))
+        if stat is not None and stat[0] == pane_pid:
+            argv = proc_cmdline(int(entry))
+            if argv:
+                result.append(argv)
+    return result
+
+
+def requoted_command(saved: str, children: Iterable[list[str]]) -> str:
+    """Shell-quoted form of the saved pane command, or "" when unproven.
+
+    resurrect's "ps" strategy stores argv joined by spaces with no quoting,
+    and a restore types that text into the pane's shell.  Rebuild it with
+    shlex.join from the live argv it came from; when no live child matches
+    the saved text exactly, or an argument cannot be typed back safely
+    (control characters, undecodable bytes), keep nothing.
+    """
+    if not saved:
+        return ""
+    matches = {
+        tuple(argv) for argv in children
+        if " ".join(argv) == saved
+    }
+    if len(matches) != 1:
+        return ""
+    argv = list(next(iter(matches)))
+    if any(
+        not arg.isprintable() or "\ufffd" in arg
+        for arg in argv
+    ):
+        return ""
+    return shlex.join(argv)
 
 
 def live_panes() -> dict[tuple[str, str, str], int]:
@@ -375,8 +428,10 @@ def enrich_state(
     lines: Iterable[str],
     panes: dict[tuple[str, str, str], int],
     identity: Callable[[int], list[str] | None] | None = None,
+    commands: Callable[[int], list[list[str]]] | None = None,
 ) -> list[str]:
     identity = identity or ai_resume_command
+    commands = commands or child_commands
     result: list[str] = []
     seen: set[tuple[str, str, str]] = set()
     for line in lines:
@@ -399,6 +454,9 @@ def enrich_state(
             fields[10] = ":" + (shlex.join(command) if command else "")
         elif fields[9] in {"codex", "claude"} or saved_command_is_ai(fields[10]):
             fields[10] = ":"
+        else:
+            saved = fields[10][1:] if fields[10].startswith(":") else fields[10]
+            fields[10] = ":" + requoted_command(saved, commands(panes[key]))
         result.append("\t".join(fields) + ending)
     return result
 

@@ -75,7 +75,7 @@ if [[ ${foreground_kind} == other ]]; then
   exit 0
 fi
 
-# Sidebar restore can create a session without copying the graphical variables
+# A restored or scripted session can lack the graphical variables
 # that are still present in tmux's global environment.  Read that environment
 # once, then import only this fixed allowlist without eval.
 global_environment=""

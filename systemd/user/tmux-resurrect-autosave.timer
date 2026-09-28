@@ -2,6 +2,8 @@
 Description=Save live tmux state every minute (tmux-resurrect)
 
 [Timer]
+# Each run saves through resurrect-save, which skips (keeping "last") until
+# the running tmux server has restored the last snapshot.
 OnActiveSec=1min
 OnUnitActiveSec=1min
 AccuracySec=1s

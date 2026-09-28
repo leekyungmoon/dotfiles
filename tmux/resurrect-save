@@ -3,10 +3,80 @@
 # binding, tmux-resurrect-autosave.timer and tmux.service's stop hook.
 # A save counts only when the post-save AI hook reports success; otherwise the
 # previous "last" snapshot is kept.
+#
+# A save also waits until this tmux server has restored "last": a fresh
+# server (after a crash or re-login) holds only the login session until the
+# restore ran, and saving it would repoint "last" at a nearly empty snapshot.
+# The skip exits with status 75, which tmux-resurrect-autosave.service counts
+# as success.
+#
+# `resurrect-save --pre-restore` / `--post-restore` are the restore hooks
+# (resurrect.conf); they bracket every restore, automatic or prefix + C-r.
 set -euo pipefail
 umask 077
 # Keep the caller's PATH first (same tmux as the server); add usual fallbacks.
 export PATH="${PATH:+$PATH:}$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin"
+
+SKIPPED=75
+BOOTSTRAP=__continuum_startup
+BOOTSTRAP_RESTORING="~restoring-login-session"
+# Per-server state ("on" = restored, "restoring" = a restore is running).
+RESTORE_STATE_OPTION=@tmux-restore-complete
+# Only a restore this soon after the server started is the login restore.
+LOGIN_RESTORE_WINDOW=60
+
+server_age() {
+    local start now
+    start=$(tmux display-message -p '#{start_time}') || return 1
+    now=$(date +%s)
+    [[ $start =~ ^[0-9]+$ ]] || return 1
+    printf '%s\n' "$((now - start))"
+}
+
+pre_restore() {
+    tmux set-option -g "$RESTORE_STATE_OPTION" restoring
+    local age
+    age=$(server_age) || return 0
+    ((age <= LOGIN_RESTORE_WINDOW)) || return 0
+    # Only the untouched login session: one window, one pane, no client.
+    local row
+    row=$(tmux list-sessions -F '#{session_name}	#{session_windows}	#{session_attached}' |
+        awk -F '\t' -v name="$BOOTSTRAP" '$1 == name { print $2 "\t" $3 }')
+    [[ $row == $'1\t0' ]] || return 0
+    [[ $(tmux list-panes -s -t "=$BOOTSTRAP" -F x | wc -l) -eq 1 ]] || return 0
+    tmux has-session -t "=$BOOTSTRAP_RESTORING" 2>/dev/null && return 0
+    tmux rename-session -t "=$BOOTSTRAP" "$BOOTSTRAP_RESTORING"
+}
+
+post_restore() {
+    if tmux has-session -t "=$BOOTSTRAP_RESTORING" 2>/dev/null; then
+        if tmux list-sessions -F '#{session_name}' | grep -qvx -- "$BOOTSTRAP_RESTORING"; then
+            tmux kill-session -t "=$BOOTSTRAP_RESTORING"
+        elif ! tmux has-session -t "=$BOOTSTRAP" 2>/dev/null; then
+            tmux rename-session -t "=$BOOTSTRAP_RESTORING" "$BOOTSTRAP"
+        fi
+    fi
+    tmux set-option -g "$RESTORE_STATE_OPTION" on
+}
+
+# True when a save may replace "last" on this server.
+restore_settled() {
+    local state
+    state=$(tmux show-option -gqv "$RESTORE_STATE_OPTION")
+    [[ $state == on ]] && return 0
+    # Anything else (unset, or "restoring" from an aborted restore) is not
+    # settled. Do not infer it from @continuum-save-last-timestamp: continuum
+    # also writes that at plugin load, so a server that skipped the login
+    # restore would look settled after a config reload and overwrite "last".
+    return 1
+}
+
+case ${1:-} in
+    --pre-restore) pre_restore; exit 0 ;;
+    --post-restore) post_restore; exit 0 ;;
+    '') ;;
+    *) printf 'usage: %s [--pre-restore|--post-restore]\n' "$0" >&2; exit 2 ;;
+esac
 
 tmux has-session
 
@@ -52,6 +122,15 @@ exec 9>"$state_dir/operation.lock"
 flock -n 9 || exit 0
 
 previous=$(readlink -- "$state_dir/last" || true)
+previous_path=$previous
+[[ -z $previous || $previous == /* ]] || previous_path=$state_dir/$previous
+if [[ -n $previous && -f $previous_path ]] && ! restore_settled; then
+    printf '%s\n' \
+        'tmux-resurrect: this tmux server has not restored the last snapshot yet; save skipped, previous snapshot kept.' \
+        "Restore it with prefix + C-r, or keep the current state instead: tmux set-option -g $RESTORE_STATE_OPTION on" >&2
+    exit "$SKIPPED"
+fi
+
 # Upstream filenames have one-second precision; never overwrite a prior save.
 while [[ -e "$state_dir/tmux_resurrect_$(date +%Y%m%dT%H%M%S).txt" ]]; do
     sleep 0.2
@@ -75,5 +154,7 @@ if [[ $save_status -ne 0 || ! -s $TMUX_RESURRECT_HOOK_OK ]]; then
 fi
 current=$(readlink -- "$state_dir/last")
 test -s "$state_dir/$current"
+# This server's state is now what "last" holds, so later saves may follow.
+tmux set-option -g "$RESTORE_STATE_OPTION" on
 tmux set-option -g @continuum-save-last-timestamp "$(date +%s)"
 touch -- "$state_dir/last-successful-save"

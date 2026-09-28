@@ -4,11 +4,13 @@ Documentation=https://github.com/tmux-plugins/tmux-resurrect
 
 [Service]
 Type=oneshot
-Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PATH=%h/.local/share/personal-dotfiles/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
 UnsetEnvironment=TMUX TMUX_PANE
 # Skip (not fail) when no tmux server with sessions is running.
 ExecCondition=/usr/bin/env tmux has-session
 ExecStart=%h/.dotfiles/tmux/resurrect-save
+# 75: the server has not restored "last" yet, so the save was skipped.
+SuccessExitStatus=75
 Nice=10
 IOSchedulingClass=idle
 TimeoutStartSec=30s
