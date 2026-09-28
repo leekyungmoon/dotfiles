@@ -1,0 +1,1438 @@
+{
+  "schema_version": 1,
+  "description": "Reviewed GNOME navigation settings: window, workspace, monitor and application switching, the explicit Super+arrow tiling unbindings, the Ubuntu Dock click action, the Ctrl+Alt+T terminal launcher, and GNOME Terminal tab/window/paste shortcuts. Values are GVariant text as printed by 'gsettings get'.",
+  "defaults_desktop": "ubuntu:GNOME",
+  "defaults_desktop_note": "Release defaults below are the ones GLib resolves with XDG_CURRENT_DESKTOP=ubuntu:GNOME (the stock Ubuntu session), because ubuntu-settings and gnome-shell ship desktop-specific overrides. Other desktop names resolve different defaults; the managed values are written either way.",
+  "apply_policy": {
+    "write": "Every entry is managed: the installer backs up the current per-key state (explicit value or unset) and then writes the manifest value, even when it equals the release default.",
+    "unavailable_key": "An entry whose release record says available=false is skipped on that release and recorded as not-applicable; it is never an apply failure.",
+    "missing_schema": "An available entry whose schema is not installed yet stays pending until a later session.",
+    "unmanaged_keys": "Keys not listed here are never written or reset."
+  },
+  "releases": {
+    "22.04": {
+      "codename": "jammy",
+      "gnome_shell": "42",
+      "validated_packages": {
+        "gsettings-desktop-schemas": "42.0-1ubuntu1",
+        "gnome-shell-common": "42.9-0ubuntu2.3",
+        "gnome-shell": "42.9-0ubuntu2.3",
+        "mutter-common": "42.9-0ubuntu9",
+        "gnome-settings-daemon-common": "42.1-1ubuntu2.2",
+        "gnome-terminal": "3.44.0-1ubuntu1",
+        "gnome-shell-extension-ubuntu-dock": "72~ubuntu5.22.04.3",
+        "ubuntu-settings": "22.04.6"
+      }
+    },
+    "24.04": {
+      "codename": "noble",
+      "gnome_shell": "46",
+      "validated_packages": {
+        "gsettings-desktop-schemas": "46.1-0ubuntu1",
+        "gnome-shell-common": "46.0-0ubuntu6~24.04.15",
+        "gnome-shell": "46.0-0ubuntu6~24.04.15",
+        "mutter-common": "46.2-1ubuntu0.24.04.16",
+        "gnome-settings-daemon-common": "46.0-1ubuntu1.24.04.1",
+        "gnome-terminal": "3.52.0-1ubuntu2",
+        "gnome-shell-extension-ubuntu-dock": "90ubuntu3",
+        "ubuntu-settings": "24.04.6"
+      }
+    }
+  },
+  "schema_packages": {
+    "org.gnome.desktop.wm.keybindings": "gsettings-desktop-schemas",
+    "org.gnome.shell.keybindings": "gnome-shell-common",
+    "org.gnome.settings-daemon.plugins.media-keys": "gnome-settings-daemon-common",
+    "org.gnome.mutter": "mutter-common",
+    "org.gnome.Terminal.Legacy.Settings": "gnome-terminal",
+    "org.gnome.Terminal.Legacy.Keybindings": "gnome-terminal",
+    "org.gnome.mutter.keybindings": "mutter-common",
+    "org.gnome.shell.extensions.dash-to-dock": "gnome-shell-extension-ubuntu-dock"
+  },
+  "settings": [
+    {
+      "id": "window.switch-windows",
+      "group": "window-navigation",
+      "scope": "global",
+      "schema": "org.gnome.desktop.wm.keybindings",
+      "key": "switch-windows",
+      "value": "['<Alt>Tab']",
+      "type": "as",
+      "releases": {
+        "22.04": {
+          "available": true,
+          "default": "['<Alt>Tab']",
+          "equals_default": true
+        },
+        "24.04": {
+          "available": true,
+          "default": "['<Alt>Tab']",
+          "equals_default": true
+        }
+      }
+    },
+    {
+      "id": "window.switch-windows-backward",
+      "group": "window-navigation",
+      "scope": "global",
+      "schema": "org.gnome.desktop.wm.keybindings",
+      "key": "switch-windows-backward",
+      "value": "['<Shift><Alt>Tab']",
+      "type": "as",
+      "releases": {
+        "22.04": {
+          "available": true,
+          "default": "['<Shift><Alt>Tab']",
+          "equals_default": true
+        },
+        "24.04": {
+          "available": true,
+          "default": "['<Shift><Alt>Tab']",
+          "equals_default": true
+        }
+      }
+    },
+    {
+      "id": "window.switch-applications",
+      "group": "window-navigation",
+      "scope": "global",
+      "schema": "org.gnome.desktop.wm.keybindings",
+      "key": "switch-applications",
+      "value": "['<Super>Tab']",
+      "type": "as",
+      "releases": {
+        "22.04": {
+          "available": true,
+          "default": "['<Super>Tab']",
+          "equals_default": true
+        },
+        "24.04": {
+          "available": true,
+          "default": "['<Super>Tab']",
+          "equals_default": true
+        }
+      }
+    },
+    {
+      "id": "window.switch-applications-backward",
+      "group": "window-navigation",
+      "scope": "global",
+      "schema": "org.gnome.desktop.wm.keybindings",
+      "key": "switch-applications-backward",
+      "value": "['<Shift><Super>Tab']",
+      "type": "as",
+      "releases": {
+        "22.04": {
+          "available": true,
+          "default": "['<Shift><Super>Tab']",
+          "equals_default": true
+        },
+        "24.04": {
+          "available": true,
+          "default": "['<Shift><Super>Tab']",
+          "equals_default": true
+        }
+      }
+    },
+    {
+      "id": "window.switch-group",
+      "group": "window-navigation",
+      "scope": "global",
+      "schema": "org.gnome.desktop.wm.keybindings",
+      "key": "switch-group",
+      "value": "['<Super>Above_Tab', '<Alt>Above_Tab']",
+      "type": "as",
+      "releases": {
+        "22.04": {
+          "available": true,
+          "default": "['<Super>Above_Tab', '<Alt>Above_Tab']",
+          "equals_default": true
+        },
+        "24.04": {
+          "available": true,
+          "default": "['<Super>Above_Tab', '<Alt>Above_Tab']",
+          "equals_default": true
+        }
+      }
+    },
+    {
+      "id": "window.switch-group-backward",
+      "group": "window-navigation",
+      "scope": "global",
+      "schema": "org.gnome.desktop.wm.keybindings",
+      "key": "switch-group-backward",
+      "value": "['<Shift><Super>Above_Tab', '<Shift><Alt>Above_Tab']",
+      "type": "as",
+      "releases": {
+        "22.04": {
+          "available": true,
+          "default": "['<Shift><Super>Above_Tab', '<Shift><Alt>Above_Tab']",
+          "equals_default": true
+        },
+        "24.04": {
+          "available": true,
+          "default": "['<Shift><Super>Above_Tab', '<Shift><Alt>Above_Tab']",
+          "equals_default": true
+        }
+      }
+    },
+    {
+      "id": "window.cycle-group",
+      "group": "window-navigation",
+      "scope": "global",
+      "schema": "org.gnome.desktop.wm.keybindings",
+      "key": "cycle-group",
+      "value": "['<Alt>F6']",
+      "type": "as",
+      "releases": {
+        "22.04": {
+          "available": true,
+          "default": "['<Alt>F6']",
+          "equals_default": true
+        },
+        "24.04": {
+          "available": true,
+          "default": "['<Alt>F6']",
+          "equals_default": true
+        }
+      }
+    },
+    {
+      "id": "window.cycle-group-backward",
+      "group": "window-navigation",
+      "scope": "global",
+      "schema": "org.gnome.desktop.wm.keybindings",
+      "key": "cycle-group-backward",
+      "value": "['<Shift><Alt>F6']",
+      "type": "as",
+      "releases": {
+        "22.04": {
+          "available": true,
+          "default": "['<Shift><Alt>F6']",
+          "equals_default": true
+        },
+        "24.04": {
+          "available": true,
+          "default": "['<Shift><Alt>F6']",
+          "equals_default": true
+        }
+      }
+    },
+    {
+      "id": "window.close",
+      "group": "window-navigation",
+      "scope": "global",
+      "schema": "org.gnome.desktop.wm.keybindings",
+      "key": "close",
+      "value": "['<Alt>F4']",
+      "type": "as",
+      "releases": {
+        "22.04": {
+          "available": true,
+          "default": "['<Alt>F4']",
+          "equals_default": true
+        },
+        "24.04": {
+          "available": true,
+          "default": "['<Alt>F4']",
+          "equals_default": true
+        }
+      }
+    },
+    {
+      "id": "window.minimize",
+      "group": "window-navigation",
+      "scope": "global",
+      "schema": "org.gnome.desktop.wm.keybindings",
+      "key": "minimize",
+      "value": "['<Super>h']",
+      "type": "as",
+      "releases": {
+        "22.04": {
+          "available": true,
+          "default": "['<Super>h']",
+          "equals_default": true
+        },
+        "24.04": {
+          "available": true,
+          "default": "['<Super>h']",
+          "equals_default": true
+        }
+      }
+    },
+    {
+      "id": "window.toggle-maximized",
+      "group": "window-navigation",
+      "scope": "global",
+      "schema": "org.gnome.desktop.wm.keybindings",
+      "key": "toggle-maximized",
+      "value": "['<Alt>F10']",
+      "type": "as",
+      "releases": {
+        "22.04": {
+          "available": true,
+          "default": "['<Alt>F10']",
+          "equals_default": true
+        },
+        "24.04": {
+          "available": true,
+          "default": "['<Alt>F10']",
+          "equals_default": true
+        }
+      }
+    },
+    {
+      "id": "window.show-desktop",
+      "group": "window-navigation",
+      "scope": "global",
+      "schema": "org.gnome.desktop.wm.keybindings",
+      "key": "show-desktop",
+      "value": "['<Primary><Super>d', '<Primary><Alt>d', '<Super>d']",
+      "type": "as",
+      "releases": {
+        "22.04": {
+          "available": true,
+          "default": "['<Primary><Super>d', '<Primary><Alt>d', '<Super>d']",
+          "equals_default": true
+        },
+        "24.04": {
+          "available": true,
+          "default": "['<Primary><Super>d', '<Primary><Alt>d', '<Super>d']",
+          "equals_default": true
+        }
+      }
+    },
+    {
+      "id": "workspace.switch-to-workspace-left",
+      "group": "workspace-navigation",
+      "scope": "global",
+      "schema": "org.gnome.desktop.wm.keybindings",
+      "key": "switch-to-workspace-left",
+      "value": "['<Super>Page_Up', '<Super><Alt>Left', '<Control><Alt>Left']",
+      "type": "as",
+      "releases": {
+        "22.04": {
+          "available": true,
+          "default": "['<Super>Page_Up', '<Super><Alt>Left', '<Control><Alt>Left']",
+          "equals_default": true
+        },
+        "24.04": {
+          "available": true,
+          "default": "['<Super>Page_Up', '<Super><Alt>Left', '<Control><Alt>Left']",
+          "equals_default": true
+        }
+      }
+    },
+    {
+      "id": "workspace.switch-to-workspace-right",
+      "group": "workspace-navigation",
+      "scope": "global",
+      "schema": "org.gnome.desktop.wm.keybindings",
+      "key": "switch-to-workspace-right",
+      "value": "['<Super>Page_Down', '<Super><Alt>Right', '<Control><Alt>Right']",
+      "type": "as",
+      "releases": {
+        "22.04": {
+          "available": true,
+          "default": "['<Super>Page_Down', '<Super><Alt>Right', '<Control><Alt>Right']",
+          "equals_default": true
+        },
+        "24.04": {
+          "available": true,
+          "default": "['<Super>Page_Down', '<Super><Alt>Right', '<Control><Alt>Right']",
+          "equals_default": true
+        }
+      }
+    },
+    {
+      "id": "workspace.switch-to-workspace-up",
+      "group": "workspace-navigation",
+      "scope": "global",
+      "schema": "org.gnome.desktop.wm.keybindings",
+      "key": "switch-to-workspace-up",
+      "value": "['<Control><Alt>Up']",
+      "type": "as",
+      "releases": {
+        "22.04": {
+          "available": true,
+          "default": "['<Control><Alt>Up']",
+          "equals_default": true
+        },
+        "24.04": {
+          "available": true,
+          "default": "['<Control><Alt>Up']",
+          "equals_default": true
+        }
+      }
+    },
+    {
+      "id": "workspace.switch-to-workspace-down",
+      "group": "workspace-navigation",
+      "scope": "global",
+      "schema": "org.gnome.desktop.wm.keybindings",
+      "key": "switch-to-workspace-down",
+      "value": "['<Control><Alt>Down']",
+      "type": "as",
+      "releases": {
+        "22.04": {
+          "available": true,
+          "default": "['<Control><Alt>Down']",
+          "equals_default": true
+        },
+        "24.04": {
+          "available": true,
+          "default": "['<Control><Alt>Down']",
+          "equals_default": true
+        }
+      }
+    },
+    {
+      "id": "workspace.switch-to-workspace-1",
+      "group": "workspace-navigation",
+      "scope": "global",
+      "schema": "org.gnome.desktop.wm.keybindings",
+      "key": "switch-to-workspace-1",
+      "value": "['<Super>Home']",
+      "type": "as",
+      "releases": {
+        "22.04": {
+          "available": true,
+          "default": "['<Super>Home']",
+          "equals_default": true
+        },
+        "24.04": {
+          "available": true,
+          "default": "['<Super>Home']",
+          "equals_default": true
+        }
+      }
+    },
+    {
+      "id": "workspace.switch-to-workspace-last",
+      "group": "workspace-navigation",
+      "scope": "global",
+      "schema": "org.gnome.desktop.wm.keybindings",
+      "key": "switch-to-workspace-last",
+      "value": "['<Super>End']",
+      "type": "as",
+      "releases": {
+        "22.04": {
+          "available": true,
+          "default": "['<Super>End']",
+          "equals_default": true
+        },
+        "24.04": {
+          "available": true,
+          "default": "['<Super>End']",
+          "equals_default": true
+        }
+      }
+    },
+    {
+      "id": "workspace.move-to-workspace-left",
+      "group": "workspace-navigation",
+      "scope": "global",
+      "schema": "org.gnome.desktop.wm.keybindings",
+      "key": "move-to-workspace-left",
+      "value": "['<Super><Shift>Page_Up', '<Super><Shift><Alt>Left', '<Control><Shift><Alt>Left']",
+      "type": "as",
+      "releases": {
+        "22.04": {
+          "available": true,
+          "default": "['<Super><Shift>Page_Up', '<Super><Shift><Alt>Left', '<Control><Shift><Alt>Left']",
+          "equals_default": true
+        },
+        "24.04": {
+          "available": true,
+          "default": "['<Super><Shift>Page_Up', '<Super><Shift><Alt>Left', '<Control><Shift><Alt>Left']",
+          "equals_default": true
+        }
+      }
+    },
+    {
+      "id": "workspace.move-to-workspace-right",
+      "group": "workspace-navigation",
+      "scope": "global",
+      "schema": "org.gnome.desktop.wm.keybindings",
+      "key": "move-to-workspace-right",
+      "value": "['<Super><Shift>Page_Down', '<Super><Shift><Alt>Right', '<Control><Shift><Alt>Right']",
+      "type": "as",
+      "releases": {
+        "22.04": {
+          "available": true,
+          "default": "['<Super><Shift>Page_Down', '<Super><Shift><Alt>Right', '<Control><Shift><Alt>Right']",
+          "equals_default": true
+        },
+        "24.04": {
+          "available": true,
+          "default": "['<Super><Shift>Page_Down', '<Super><Shift><Alt>Right', '<Control><Shift><Alt>Right']",
+          "equals_default": true
+        }
+      }
+    },
+    {
+      "id": "workspace.move-to-workspace-up",
+      "group": "workspace-navigation",
+      "scope": "global",
+      "schema": "org.gnome.desktop.wm.keybindings",
+      "key": "move-to-workspace-up",
+      "value": "['<Control><Shift><Alt>Up']",
+      "type": "as",
+      "releases": {
+        "22.04": {
+          "available": true,
+          "default": "['<Control><Shift><Alt>Up']",
+          "equals_default": true
+        },
+        "24.04": {
+          "available": true,
+          "default": "['<Control><Shift><Alt>Up']",
+          "equals_default": true
+        }
+      }
+    },
+    {
+      "id": "workspace.move-to-workspace-down",
+      "group": "workspace-navigation",
+      "scope": "global",
+      "schema": "org.gnome.desktop.wm.keybindings",
+      "key": "move-to-workspace-down",
+      "value": "['<Control><Shift><Alt>Down']",
+      "type": "as",
+      "releases": {
+        "22.04": {
+          "available": true,
+          "default": "['<Control><Shift><Alt>Down']",
+          "equals_default": true
+        },
+        "24.04": {
+          "available": true,
+          "default": "['<Control><Shift><Alt>Down']",
+          "equals_default": true
+        }
+      }
+    },
+    {
+      "id": "workspace.move-to-workspace-1",
+      "group": "workspace-navigation",
+      "scope": "global",
+      "schema": "org.gnome.desktop.wm.keybindings",
+      "key": "move-to-workspace-1",
+      "value": "['<Super><Shift>Home']",
+      "type": "as",
+      "releases": {
+        "22.04": {
+          "available": true,
+          "default": "['<Super><Shift>Home']",
+          "equals_default": true
+        },
+        "24.04": {
+          "available": true,
+          "default": "['<Super><Shift>Home']",
+          "equals_default": true
+        }
+      }
+    },
+    {
+      "id": "workspace.move-to-workspace-last",
+      "group": "workspace-navigation",
+      "scope": "global",
+      "schema": "org.gnome.desktop.wm.keybindings",
+      "key": "move-to-workspace-last",
+      "value": "['<Super><Shift>End']",
+      "type": "as",
+      "releases": {
+        "22.04": {
+          "available": true,
+          "default": "['<Super><Shift>End']",
+          "equals_default": true
+        },
+        "24.04": {
+          "available": true,
+          "default": "['<Super><Shift>End']",
+          "equals_default": true
+        }
+      }
+    },
+    {
+      "id": "monitor.move-to-monitor-left",
+      "group": "monitor-navigation",
+      "scope": "global",
+      "schema": "org.gnome.desktop.wm.keybindings",
+      "key": "move-to-monitor-left",
+      "value": "['<Super><Shift>Left']",
+      "type": "as",
+      "releases": {
+        "22.04": {
+          "available": true,
+          "default": "['<Super><Shift>Left']",
+          "equals_default": true
+        },
+        "24.04": {
+          "available": true,
+          "default": "['<Super><Shift>Left']",
+          "equals_default": true
+        }
+      }
+    },
+    {
+      "id": "monitor.move-to-monitor-right",
+      "group": "monitor-navigation",
+      "scope": "global",
+      "schema": "org.gnome.desktop.wm.keybindings",
+      "key": "move-to-monitor-right",
+      "value": "['<Super><Shift>Right']",
+      "type": "as",
+      "releases": {
+        "22.04": {
+          "available": true,
+          "default": "['<Super><Shift>Right']",
+          "equals_default": true
+        },
+        "24.04": {
+          "available": true,
+          "default": "['<Super><Shift>Right']",
+          "equals_default": true
+        }
+      }
+    },
+    {
+      "id": "monitor.move-to-monitor-up",
+      "group": "monitor-navigation",
+      "scope": "global",
+      "schema": "org.gnome.desktop.wm.keybindings",
+      "key": "move-to-monitor-up",
+      "value": "['<Super><Shift>Up']",
+      "type": "as",
+      "releases": {
+        "22.04": {
+          "available": true,
+          "default": "['<Super><Shift>Up']",
+          "equals_default": true
+        },
+        "24.04": {
+          "available": true,
+          "default": "['<Super><Shift>Up']",
+          "equals_default": true
+        }
+      }
+    },
+    {
+      "id": "monitor.move-to-monitor-down",
+      "group": "monitor-navigation",
+      "scope": "global",
+      "schema": "org.gnome.desktop.wm.keybindings",
+      "key": "move-to-monitor-down",
+      "value": "['<Super><Shift>Down']",
+      "type": "as",
+      "releases": {
+        "22.04": {
+          "available": true,
+          "default": "['<Super><Shift>Down']",
+          "equals_default": true
+        },
+        "24.04": {
+          "available": true,
+          "default": "['<Super><Shift>Down']",
+          "equals_default": true
+        }
+      }
+    },
+    {
+      "id": "application.switch-to-application-1",
+      "group": "application-navigation",
+      "scope": "global",
+      "schema": "org.gnome.shell.keybindings",
+      "key": "switch-to-application-1",
+      "value": "['<Super>1']",
+      "type": "as",
+      "releases": {
+        "22.04": {
+          "available": true,
+          "default": "['<Super>1']",
+          "equals_default": true
+        },
+        "24.04": {
+          "available": true,
+          "default": "['<Super>1']",
+          "equals_default": true
+        }
+      },
+      "note": "With Ubuntu Dock hot-keys enabled (release default), the dock's app-hotkey-1 also binds <Super>1; the dock key is not managed."
+    },
+    {
+      "id": "application.switch-to-application-2",
+      "group": "application-navigation",
+      "scope": "global",
+      "schema": "org.gnome.shell.keybindings",
+      "key": "switch-to-application-2",
+      "value": "['<Super>2']",
+      "type": "as",
+      "releases": {
+        "22.04": {
+          "available": true,
+          "default": "['<Super>2']",
+          "equals_default": true
+        },
+        "24.04": {
+          "available": true,
+          "default": "['<Super>2']",
+          "equals_default": true
+        }
+      },
+      "note": "With Ubuntu Dock hot-keys enabled (release default), the dock's app-hotkey-2 also binds <Super>2; the dock key is not managed."
+    },
+    {
+      "id": "application.switch-to-application-3",
+      "group": "application-navigation",
+      "scope": "global",
+      "schema": "org.gnome.shell.keybindings",
+      "key": "switch-to-application-3",
+      "value": "['<Super>3']",
+      "type": "as",
+      "releases": {
+        "22.04": {
+          "available": true,
+          "default": "['<Super>3']",
+          "equals_default": true
+        },
+        "24.04": {
+          "available": true,
+          "default": "['<Super>3']",
+          "equals_default": true
+        }
+      },
+      "note": "With Ubuntu Dock hot-keys enabled (release default), the dock's app-hotkey-3 also binds <Super>3; the dock key is not managed."
+    },
+    {
+      "id": "application.switch-to-application-4",
+      "group": "application-navigation",
+      "scope": "global",
+      "schema": "org.gnome.shell.keybindings",
+      "key": "switch-to-application-4",
+      "value": "['<Super>4']",
+      "type": "as",
+      "releases": {
+        "22.04": {
+          "available": true,
+          "default": "['<Super>4']",
+          "equals_default": true
+        },
+        "24.04": {
+          "available": true,
+          "default": "['<Super>4']",
+          "equals_default": true
+        }
+      },
+      "note": "With Ubuntu Dock hot-keys enabled (release default), the dock's app-hotkey-4 also binds <Super>4; the dock key is not managed."
+    },
+    {
+      "id": "application.switch-to-application-5",
+      "group": "application-navigation",
+      "scope": "global",
+      "schema": "org.gnome.shell.keybindings",
+      "key": "switch-to-application-5",
+      "value": "['<Super>5']",
+      "type": "as",
+      "releases": {
+        "22.04": {
+          "available": true,
+          "default": "['<Super>5']",
+          "equals_default": true
+        },
+        "24.04": {
+          "available": true,
+          "default": "['<Super>5']",
+          "equals_default": true
+        }
+      },
+      "note": "With Ubuntu Dock hot-keys enabled (release default), the dock's app-hotkey-5 also binds <Super>5; the dock key is not managed."
+    },
+    {
+      "id": "application.switch-to-application-6",
+      "group": "application-navigation",
+      "scope": "global",
+      "schema": "org.gnome.shell.keybindings",
+      "key": "switch-to-application-6",
+      "value": "['<Super>6']",
+      "type": "as",
+      "releases": {
+        "22.04": {
+          "available": true,
+          "default": "['<Super>6']",
+          "equals_default": true
+        },
+        "24.04": {
+          "available": true,
+          "default": "['<Super>6']",
+          "equals_default": true
+        }
+      },
+      "note": "With Ubuntu Dock hot-keys enabled (release default), the dock's app-hotkey-6 also binds <Super>6; the dock key is not managed."
+    },
+    {
+      "id": "application.switch-to-application-7",
+      "group": "application-navigation",
+      "scope": "global",
+      "schema": "org.gnome.shell.keybindings",
+      "key": "switch-to-application-7",
+      "value": "['<Super>7']",
+      "type": "as",
+      "releases": {
+        "22.04": {
+          "available": true,
+          "default": "['<Super>7']",
+          "equals_default": true
+        },
+        "24.04": {
+          "available": true,
+          "default": "['<Super>7']",
+          "equals_default": true
+        }
+      },
+      "note": "With Ubuntu Dock hot-keys enabled (release default), the dock's app-hotkey-7 also binds <Super>7; the dock key is not managed."
+    },
+    {
+      "id": "application.switch-to-application-8",
+      "group": "application-navigation",
+      "scope": "global",
+      "schema": "org.gnome.shell.keybindings",
+      "key": "switch-to-application-8",
+      "value": "['<Super>8']",
+      "type": "as",
+      "releases": {
+        "22.04": {
+          "available": true,
+          "default": "['<Super>8']",
+          "equals_default": true
+        },
+        "24.04": {
+          "available": true,
+          "default": "['<Super>8']",
+          "equals_default": true
+        }
+      },
+      "note": "With Ubuntu Dock hot-keys enabled (release default), the dock's app-hotkey-8 also binds <Super>8; the dock key is not managed."
+    },
+    {
+      "id": "application.switch-to-application-9",
+      "group": "application-navigation",
+      "scope": "global",
+      "schema": "org.gnome.shell.keybindings",
+      "key": "switch-to-application-9",
+      "value": "['<Super>9']",
+      "type": "as",
+      "releases": {
+        "22.04": {
+          "available": true,
+          "default": "['<Super>9']",
+          "equals_default": true
+        },
+        "24.04": {
+          "available": true,
+          "default": "['<Super>9']",
+          "equals_default": true
+        }
+      },
+      "note": "With Ubuntu Dock hot-keys enabled (release default), the dock's app-hotkey-9 also binds <Super>9; the dock key is not managed."
+    },
+    {
+      "id": "application.open-new-window-application-1",
+      "group": "application-navigation",
+      "scope": "global",
+      "schema": "org.gnome.shell.keybindings",
+      "key": "open-new-window-application-1",
+      "value": "['<Super><Control>1']",
+      "type": "as",
+      "releases": {
+        "22.04": {
+          "available": false
+        },
+        "24.04": {
+          "available": true,
+          "default": "['<Super><Control>1']",
+          "equals_default": true
+        }
+      },
+      "note": "Not in the 22.04 GNOME Shell 42 schema; on 22.04 <Ctrl><Super>1 comes from the unmanaged Ubuntu Dock key app-ctrl-hotkey-1. On 24.04 the unmanaged dock key app-ctrl-hotkey-1 (default ['<Ctrl><Super>1'], active while hot-keys=true) binds the same accelerator; which handler receives it in a live session is UNVERIFIED."
+    },
+    {
+      "id": "application.open-new-window-application-2",
+      "group": "application-navigation",
+      "scope": "global",
+      "schema": "org.gnome.shell.keybindings",
+      "key": "open-new-window-application-2",
+      "value": "['<Super><Control>2']",
+      "type": "as",
+      "releases": {
+        "22.04": {
+          "available": false
+        },
+        "24.04": {
+          "available": true,
+          "default": "['<Super><Control>2']",
+          "equals_default": true
+        }
+      },
+      "note": "Not in the 22.04 GNOME Shell 42 schema; on 22.04 <Ctrl><Super>2 comes from the unmanaged Ubuntu Dock key app-ctrl-hotkey-2. On 24.04 the unmanaged dock key app-ctrl-hotkey-2 (default ['<Ctrl><Super>2'], active while hot-keys=true) binds the same accelerator; which handler receives it in a live session is UNVERIFIED."
+    },
+    {
+      "id": "application.open-new-window-application-3",
+      "group": "application-navigation",
+      "scope": "global",
+      "schema": "org.gnome.shell.keybindings",
+      "key": "open-new-window-application-3",
+      "value": "['<Super><Control>3']",
+      "type": "as",
+      "releases": {
+        "22.04": {
+          "available": false
+        },
+        "24.04": {
+          "available": true,
+          "default": "['<Super><Control>3']",
+          "equals_default": true
+        }
+      },
+      "note": "Not in the 22.04 GNOME Shell 42 schema; on 22.04 <Ctrl><Super>3 comes from the unmanaged Ubuntu Dock key app-ctrl-hotkey-3. On 24.04 the unmanaged dock key app-ctrl-hotkey-3 (default ['<Ctrl><Super>3'], active while hot-keys=true) binds the same accelerator; which handler receives it in a live session is UNVERIFIED."
+    },
+    {
+      "id": "application.open-new-window-application-4",
+      "group": "application-navigation",
+      "scope": "global",
+      "schema": "org.gnome.shell.keybindings",
+      "key": "open-new-window-application-4",
+      "value": "['<Super><Control>4']",
+      "type": "as",
+      "releases": {
+        "22.04": {
+          "available": false
+        },
+        "24.04": {
+          "available": true,
+          "default": "['<Super><Control>4']",
+          "equals_default": true
+        }
+      },
+      "note": "Not in the 22.04 GNOME Shell 42 schema; on 22.04 <Ctrl><Super>4 comes from the unmanaged Ubuntu Dock key app-ctrl-hotkey-4. On 24.04 the unmanaged dock key app-ctrl-hotkey-4 (default ['<Ctrl><Super>4'], active while hot-keys=true) binds the same accelerator; which handler receives it in a live session is UNVERIFIED."
+    },
+    {
+      "id": "application.open-new-window-application-5",
+      "group": "application-navigation",
+      "scope": "global",
+      "schema": "org.gnome.shell.keybindings",
+      "key": "open-new-window-application-5",
+      "value": "['<Super><Control>5']",
+      "type": "as",
+      "releases": {
+        "22.04": {
+          "available": false
+        },
+        "24.04": {
+          "available": true,
+          "default": "['<Super><Control>5']",
+          "equals_default": true
+        }
+      },
+      "note": "Not in the 22.04 GNOME Shell 42 schema; on 22.04 <Ctrl><Super>5 comes from the unmanaged Ubuntu Dock key app-ctrl-hotkey-5. On 24.04 the unmanaged dock key app-ctrl-hotkey-5 (default ['<Ctrl><Super>5'], active while hot-keys=true) binds the same accelerator; which handler receives it in a live session is UNVERIFIED."
+    },
+    {
+      "id": "application.open-new-window-application-6",
+      "group": "application-navigation",
+      "scope": "global",
+      "schema": "org.gnome.shell.keybindings",
+      "key": "open-new-window-application-6",
+      "value": "['<Super><Control>6']",
+      "type": "as",
+      "releases": {
+        "22.04": {
+          "available": false
+        },
+        "24.04": {
+          "available": true,
+          "default": "['<Super><Control>6']",
+          "equals_default": true
+        }
+      },
+      "note": "Not in the 22.04 GNOME Shell 42 schema; on 22.04 <Ctrl><Super>6 comes from the unmanaged Ubuntu Dock key app-ctrl-hotkey-6. On 24.04 the unmanaged dock key app-ctrl-hotkey-6 (default ['<Ctrl><Super>6'], active while hot-keys=true) binds the same accelerator; which handler receives it in a live session is UNVERIFIED."
+    },
+    {
+      "id": "application.open-new-window-application-7",
+      "group": "application-navigation",
+      "scope": "global",
+      "schema": "org.gnome.shell.keybindings",
+      "key": "open-new-window-application-7",
+      "value": "['<Super><Control>7']",
+      "type": "as",
+      "releases": {
+        "22.04": {
+          "available": false
+        },
+        "24.04": {
+          "available": true,
+          "default": "['<Super><Control>7']",
+          "equals_default": true
+        }
+      },
+      "note": "Not in the 22.04 GNOME Shell 42 schema; on 22.04 <Ctrl><Super>7 comes from the unmanaged Ubuntu Dock key app-ctrl-hotkey-7. On 24.04 the unmanaged dock key app-ctrl-hotkey-7 (default ['<Ctrl><Super>7'], active while hot-keys=true) binds the same accelerator; which handler receives it in a live session is UNVERIFIED."
+    },
+    {
+      "id": "application.open-new-window-application-8",
+      "group": "application-navigation",
+      "scope": "global",
+      "schema": "org.gnome.shell.keybindings",
+      "key": "open-new-window-application-8",
+      "value": "['<Super><Control>8']",
+      "type": "as",
+      "releases": {
+        "22.04": {
+          "available": false
+        },
+        "24.04": {
+          "available": true,
+          "default": "['<Super><Control>8']",
+          "equals_default": true
+        }
+      },
+      "note": "Not in the 22.04 GNOME Shell 42 schema; on 22.04 <Ctrl><Super>8 comes from the unmanaged Ubuntu Dock key app-ctrl-hotkey-8. On 24.04 the unmanaged dock key app-ctrl-hotkey-8 (default ['<Ctrl><Super>8'], active while hot-keys=true) binds the same accelerator; which handler receives it in a live session is UNVERIFIED."
+    },
+    {
+      "id": "application.open-new-window-application-9",
+      "group": "application-navigation",
+      "scope": "global",
+      "schema": "org.gnome.shell.keybindings",
+      "key": "open-new-window-application-9",
+      "value": "['<Super><Control>9']",
+      "type": "as",
+      "releases": {
+        "22.04": {
+          "available": false
+        },
+        "24.04": {
+          "available": true,
+          "default": "['<Super><Control>9']",
+          "equals_default": true
+        }
+      },
+      "note": "Not in the 22.04 GNOME Shell 42 schema; on 22.04 <Ctrl><Super>9 comes from the unmanaged Ubuntu Dock key app-ctrl-hotkey-9. On 24.04 the unmanaged dock key app-ctrl-hotkey-9 (default ['<Ctrl><Super>9'], active while hot-keys=true) binds the same accelerator; which handler receives it in a live session is UNVERIFIED."
+    },
+    {
+      "id": "overview.shift-overview-up",
+      "group": "workspace-navigation",
+      "scope": "global",
+      "schema": "org.gnome.shell.keybindings",
+      "key": "shift-overview-up",
+      "value": "['<Super><Alt>Up']",
+      "type": "as",
+      "releases": {
+        "22.04": {
+          "available": true,
+          "default": "['<Super><Alt>Up']",
+          "equals_default": true
+        },
+        "24.04": {
+          "available": true,
+          "default": "['<Super><Alt>Up']",
+          "equals_default": true
+        }
+      }
+    },
+    {
+      "id": "overview.shift-overview-down",
+      "group": "workspace-navigation",
+      "scope": "global",
+      "schema": "org.gnome.shell.keybindings",
+      "key": "shift-overview-down",
+      "value": "['<Super><Alt>Down']",
+      "type": "as",
+      "releases": {
+        "22.04": {
+          "available": true,
+          "default": "['<Super><Alt>Down']",
+          "equals_default": true
+        },
+        "24.04": {
+          "available": true,
+          "default": "['<Super><Alt>Down']",
+          "equals_default": true
+        }
+      }
+    },
+    {
+      "id": "launcher.terminal",
+      "group": "terminal-launcher",
+      "scope": "global",
+      "schema": "org.gnome.settings-daemon.plugins.media-keys",
+      "key": "terminal",
+      "value": "['<Primary><Alt>t']",
+      "type": "as",
+      "releases": {
+        "22.04": {
+          "available": true,
+          "default": "['<Primary><Alt>t']",
+          "equals_default": true
+        },
+        "24.04": {
+          "available": true,
+          "default": "['<Primary><Alt>t']",
+          "equals_default": true
+        }
+      },
+      "note": "Launches the desktop's default terminal; which terminal opens is decided outside GSettings."
+    },
+    {
+      "id": "workspace-mode.dynamic-workspaces",
+      "group": "prerequisite",
+      "scope": "setting",
+      "schema": "org.gnome.mutter",
+      "key": "dynamic-workspaces",
+      "value": "true",
+      "type": "b",
+      "releases": {
+        "22.04": {
+          "available": true,
+          "default": "true",
+          "equals_default": true
+        },
+        "24.04": {
+          "available": true,
+          "default": "true",
+          "equals_default": true
+        }
+      },
+      "note": "Workspace count is dynamic, so switch/move-to-workspace-last and left/right semantics follow the live workspace list."
+    },
+    {
+      "id": "workspace-mode.workspaces-only-on-primary",
+      "group": "prerequisite",
+      "scope": "setting",
+      "schema": "org.gnome.mutter",
+      "key": "workspaces-only-on-primary",
+      "value": "true",
+      "type": "b",
+      "releases": {
+        "22.04": {
+          "available": true,
+          "default": "true",
+          "equals_default": true
+        },
+        "24.04": {
+          "available": true,
+          "default": "true",
+          "equals_default": true
+        }
+      },
+      "note": "Workspace switching moves only the primary monitor; secondary monitors stay fixed."
+    },
+    {
+      "id": "terminal.shortcuts-enabled",
+      "group": "prerequisite",
+      "scope": "setting",
+      "schema": "org.gnome.Terminal.Legacy.Settings",
+      "key": "shortcuts-enabled",
+      "value": "true",
+      "type": "b",
+      "releases": {
+        "22.04": {
+          "available": true,
+          "default": "true",
+          "equals_default": true
+        },
+        "24.04": {
+          "available": true,
+          "default": "true",
+          "equals_default": true
+        }
+      },
+      "note": "GNOME Terminal ignores every Legacy.Keybindings entry when this is false."
+    },
+    {
+      "id": "terminal.new-tab",
+      "group": "terminal-tabs",
+      "scope": "app:gnome-terminal",
+      "schema": "org.gnome.Terminal.Legacy.Keybindings",
+      "path": "/org/gnome/terminal/legacy/keybindings/",
+      "key": "new-tab",
+      "value": "'<Control>t'",
+      "type": "s",
+      "releases": {
+        "22.04": {
+          "available": true,
+          "default": "'<Control><Shift>t'",
+          "equals_default": false
+        },
+        "24.04": {
+          "available": true,
+          "default": "'<Control><Shift>t'",
+          "equals_default": false
+        }
+      }
+    },
+    {
+      "id": "terminal.new-window",
+      "group": "terminal-tabs",
+      "scope": "app:gnome-terminal",
+      "schema": "org.gnome.Terminal.Legacy.Keybindings",
+      "path": "/org/gnome/terminal/legacy/keybindings/",
+      "key": "new-window",
+      "value": "'<Control><Shift>t'",
+      "type": "s",
+      "releases": {
+        "22.04": {
+          "available": true,
+          "default": "'<Control><Shift>n'",
+          "equals_default": false
+        },
+        "24.04": {
+          "available": true,
+          "default": "'<Control><Shift>n'",
+          "equals_default": false
+        }
+      }
+    },
+    {
+      "id": "terminal.close-tab",
+      "group": "terminal-tabs",
+      "scope": "app:gnome-terminal",
+      "schema": "org.gnome.Terminal.Legacy.Keybindings",
+      "path": "/org/gnome/terminal/legacy/keybindings/",
+      "key": "close-tab",
+      "value": "'<Control>w'",
+      "type": "s",
+      "releases": {
+        "22.04": {
+          "available": true,
+          "default": "'<Control><Shift>w'",
+          "equals_default": false
+        },
+        "24.04": {
+          "available": true,
+          "default": "'<Control><Shift>w'",
+          "equals_default": false
+        }
+      }
+    },
+    {
+      "id": "terminal.prev-tab",
+      "group": "terminal-tabs",
+      "scope": "app:gnome-terminal",
+      "schema": "org.gnome.Terminal.Legacy.Keybindings",
+      "path": "/org/gnome/terminal/legacy/keybindings/",
+      "key": "prev-tab",
+      "value": "'<Control>Page_Up'",
+      "type": "s",
+      "releases": {
+        "22.04": {
+          "available": true,
+          "default": "'<Control>Page_Up'",
+          "equals_default": true
+        },
+        "24.04": {
+          "available": true,
+          "default": "'<Control>Page_Up'",
+          "equals_default": true
+        }
+      }
+    },
+    {
+      "id": "terminal.next-tab",
+      "group": "terminal-tabs",
+      "scope": "app:gnome-terminal",
+      "schema": "org.gnome.Terminal.Legacy.Keybindings",
+      "path": "/org/gnome/terminal/legacy/keybindings/",
+      "key": "next-tab",
+      "value": "'<Control>Page_Down'",
+      "type": "s",
+      "releases": {
+        "22.04": {
+          "available": true,
+          "default": "'<Control>Page_Down'",
+          "equals_default": true
+        },
+        "24.04": {
+          "available": true,
+          "default": "'<Control>Page_Down'",
+          "equals_default": true
+        }
+      }
+    },
+    {
+      "id": "tiling.toggle-tiled-left",
+      "group": "window-tiling",
+      "scope": "global",
+      "schema": "org.gnome.mutter.keybindings",
+      "key": "toggle-tiled-left",
+      "value": "@as []",
+      "type": "as",
+      "releases": {
+        "22.04": {
+          "available": true,
+          "default": "['<Super>Left']",
+          "equals_default": false
+        },
+        "24.04": {
+          "available": true,
+          "default": "['<Super>Left']",
+          "equals_default": false
+        }
+      },
+      "unbinds": true,
+      "note": "Explicit unbinding: frees <Super>Left for the user's own use."
+    },
+    {
+      "id": "tiling.toggle-tiled-right",
+      "group": "window-tiling",
+      "scope": "global",
+      "schema": "org.gnome.mutter.keybindings",
+      "key": "toggle-tiled-right",
+      "value": "@as []",
+      "type": "as",
+      "releases": {
+        "22.04": {
+          "available": true,
+          "default": "['<Super>Right']",
+          "equals_default": false
+        },
+        "24.04": {
+          "available": true,
+          "default": "['<Super>Right']",
+          "equals_default": false
+        }
+      },
+      "unbinds": true,
+      "note": "Explicit unbinding: frees <Super>Right for the user's own use."
+    },
+    {
+      "id": "tiling.maximize",
+      "group": "window-tiling",
+      "scope": "global",
+      "schema": "org.gnome.desktop.wm.keybindings",
+      "key": "maximize",
+      "value": "@as []",
+      "type": "as",
+      "releases": {
+        "22.04": {
+          "available": true,
+          "default": "['<Super>Up']",
+          "equals_default": false
+        },
+        "24.04": {
+          "available": true,
+          "default": "['<Super>Up']",
+          "equals_default": false
+        }
+      },
+      "unbinds": true,
+      "note": "Explicit unbinding: frees <Super>Up; window.toggle-maximized (<Alt>F10) still maximizes."
+    },
+    {
+      "id": "tiling.unmaximize",
+      "group": "window-tiling",
+      "scope": "global",
+      "schema": "org.gnome.desktop.wm.keybindings",
+      "key": "unmaximize",
+      "value": "@as []",
+      "type": "as",
+      "releases": {
+        "22.04": {
+          "available": true,
+          "default": "['<Super>Down', '<Alt>F5']",
+          "equals_default": false
+        },
+        "24.04": {
+          "available": true,
+          "default": "['<Super>Down', '<Alt>F5']",
+          "equals_default": false
+        }
+      },
+      "unbinds": true,
+      "note": "Explicit unbinding: frees <Super>Down and <Alt>F5; window.toggle-maximized (<Alt>F10) still restores."
+    },
+    {
+      "id": "tiling.edge-tiling",
+      "group": "window-tiling",
+      "scope": "setting",
+      "schema": "org.gnome.mutter",
+      "key": "edge-tiling",
+      "value": "false",
+      "type": "b",
+      "releases": {
+        "22.04": {
+          "available": true,
+          "default": "true",
+          "equals_default": false
+        },
+        "24.04": {
+          "available": true,
+          "default": "true",
+          "equals_default": false
+        }
+      },
+      "note": "Dragging a window to a screen edge no longer tiles it. The release default true comes from the ubuntu-settings and gnome-shell desktop overrides."
+    },
+    {
+      "id": "dock.click-action",
+      "group": "dock-behavior",
+      "scope": "setting",
+      "schema": "org.gnome.shell.extensions.dash-to-dock",
+      "key": "click-action",
+      "value": "'cycle-windows'",
+      "type": "enum",
+      "releases": {
+        "22.04": {
+          "available": true,
+          "default": "'focus-or-previews'",
+          "equals_default": false
+        },
+        "24.04": {
+          "available": true,
+          "default": "'focus-or-appspread'",
+          "equals_default": false
+        }
+      },
+      "note": "Clicking a running application's dock icon cycles through its windows. Only this dock key is managed; the dock hot-keys stay unmanaged."
+    },
+    {
+      "id": "terminal.paste",
+      "group": "terminal-clipboard",
+      "scope": "app:gnome-terminal",
+      "schema": "org.gnome.Terminal.Legacy.Keybindings",
+      "path": "/org/gnome/terminal/legacy/keybindings/",
+      "key": "paste",
+      "value": "'<Control><Shift>v'",
+      "type": "s",
+      "releases": {
+        "22.04": {
+          "available": true,
+          "default": "'<Control><Shift>v'",
+          "equals_default": true
+        },
+        "24.04": {
+          "available": true,
+          "default": "'<Control><Shift>v'",
+          "equals_default": true
+        }
+      }
+    }
+  ],
+  "unmanaged": [
+    {
+      "topic": "chrome-tabs",
+      "reason": "Google Chrome's Ctrl+T, Ctrl+W and Ctrl+Page_Up/Page_Down are built-in browser shortcuts, not GSettings keys; nothing here configures Chrome."
+    },
+    {
+      "topic": "ubuntu-dock-hotkeys",
+      "reason": "org.gnome.shell.extensions.dash-to-dock hot-keys and app-hotkey-N/app-ctrl-hotkey-N keep their release defaults; they are not written by this manifest."
+    },
+    {
+      "topic": "terminal-other-shortcuts",
+      "reason": "GNOME Terminal keys other than the five tab/window keys keep their current values."
+    }
+  ],
+  "unverified": [
+    "24.04: <Ctrl><Super>1..9 is bound both by the managed org.gnome.shell.keybindings open-new-window-application-N and by the unmanaged Ubuntu Dock app-ctrl-hotkey-N default; the live winner is UNVERIFIED.",
+    "24.04: the Ubuntu Tiling Assistant extension (gnome-shell-extension-ubuntu-tiling-assistant, part of ubuntu-desktop-minimal) has its own unmanaged keybindings that default to <Super>Left/Right/Up/Down; whether it still grabs Super+arrows after the Mutter/WM unbindings is UNVERIFIED and not managed here.",
+    "Both releases: <Super>1..9 is bound both by the managed switch-to-application-N and by the unmanaged Ubuntu Dock app-hotkey-N default; the live winner is UNVERIFIED.",
+    "Whether Mutter, GNOME Shell, the Ubuntu Dock and GNOME Terminal pick up the written values live or only after a relogin is UNVERIFIED; schema checks prove type, default and accepted value only."
+  ]
+}

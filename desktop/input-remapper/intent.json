@@ -1,0 +1,29 @@
+{
+  "schema": 1,
+  "description": "While a physical keyboard's Ctrl+Super+Left or Ctrl+Super+Right is held, the focused application receives Ctrl+Page_Up or Ctrl+Page_Down (previous/next tab in Chrome and GNOME Terminal). Semantic intent only: no device names, group keys or origin hashes.",
+  "owned_preset_name": "personal-dotfiles-tabs",
+  "target_uinput": "keyboard",
+  "codes": {
+    "KEY_LEFTCTRL": 29,
+    "KEY_LEFTMETA": 125,
+    "KEY_RIGHTMETA": 126,
+    "KEY_LEFT": 105,
+    "KEY_RIGHT": 106,
+    "KEY_PAGEUP": 104,
+    "KEY_PAGEDOWN": 109
+  },
+  "chords": [
+    {
+      "id": "tab-previous",
+      "hold": [["KEY_LEFTCTRL"], ["KEY_LEFTMETA", "KEY_RIGHTMETA"]],
+      "press": "KEY_LEFT",
+      "emit": {"hold": ["KEY_LEFTCTRL"], "press": "KEY_PAGEUP"}
+    },
+    {
+      "id": "tab-next",
+      "hold": [["KEY_LEFTCTRL"], ["KEY_LEFTMETA", "KEY_RIGHTMETA"]],
+      "press": "KEY_RIGHT",
+      "emit": {"hold": ["KEY_LEFTCTRL"], "press": "KEY_PAGEDOWN"}
+    }
+  ]
+}

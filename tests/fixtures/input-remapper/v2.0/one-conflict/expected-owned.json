@@ -1,0 +1,142 @@
+[
+    {
+        "input_combination": [
+            {
+                "type": 1,
+                "code": 58
+            }
+        ],
+        "target_uinput": "keyboard",
+        "output_symbol": "KEY_ESC",
+        "mapping_type": "key_macro"
+    },
+    {
+        "input_combination": [
+            {
+                "type": 1,
+                "code": 125
+            },
+            {
+                "type": 1,
+                "code": 105
+            }
+        ],
+        "target_uinput": "keyboard",
+        "output_symbol": "KEY_HOME",
+        "mapping_type": "key_macro"
+    },
+    {
+        "input_combination": [
+            {
+                "type": 1,
+                "code": 29
+            },
+            {
+                "type": 1,
+                "code": 125
+            },
+            {
+                "type": 1,
+                "code": 103
+            }
+        ],
+        "target_uinput": "keyboard",
+        "output_symbol": "KEY_END",
+        "mapping_type": "key_macro"
+    },
+    {
+        "input_combination": [
+            {
+                "type": 1,
+                "code": 183
+            }
+        ],
+        "target_uinput": "keyboard",
+        "output_symbol": "key(KEY_A).key(KEY_B)",
+        "mapping_type": "key_macro"
+    },
+    {
+        "input_combination": [
+            {
+                "type": 1,
+                "code": 29
+            },
+            {
+                "type": 1,
+                "code": 125
+            },
+            {
+                "type": 1,
+                "code": 105
+            }
+        ],
+        "target_uinput": "keyboard",
+        "output_symbol": "hold_keys(KEY_LEFTCTRL,KEY_PAGEUP)",
+        "name": "personal-dotfiles tab-previous",
+        "mapping_type": "key_macro",
+        "release_combination_keys": true
+    },
+    {
+        "input_combination": [
+            {
+                "type": 1,
+                "code": 29
+            },
+            {
+                "type": 1,
+                "code": 126
+            },
+            {
+                "type": 1,
+                "code": 105
+            }
+        ],
+        "target_uinput": "keyboard",
+        "output_symbol": "hold_keys(KEY_LEFTCTRL,KEY_PAGEUP)",
+        "name": "personal-dotfiles tab-previous",
+        "mapping_type": "key_macro",
+        "release_combination_keys": true
+    },
+    {
+        "input_combination": [
+            {
+                "type": 1,
+                "code": 29
+            },
+            {
+                "type": 1,
+                "code": 125
+            },
+            {
+                "type": 1,
+                "code": 106
+            }
+        ],
+        "target_uinput": "keyboard",
+        "output_symbol": "hold_keys(KEY_LEFTCTRL,KEY_PAGEDOWN)",
+        "name": "personal-dotfiles tab-next",
+        "mapping_type": "key_macro",
+        "release_combination_keys": true
+    },
+    {
+        "input_combination": [
+            {
+                "type": 1,
+                "code": 29
+            },
+            {
+                "type": 1,
+                "code": 126
+            },
+            {
+                "type": 1,
+                "code": 106
+            }
+        ],
+        "target_uinput": "keyboard",
+        "output_symbol": "hold_keys(KEY_LEFTCTRL,KEY_PAGEDOWN)",
+        "name": "personal-dotfiles tab-next",
+        "mapping_type": "key_macro",
+        "release_combination_keys": true
+    }
+]

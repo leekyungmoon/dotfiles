@@ -1,0 +1,27 @@
+{
+    "macros": {
+        "keystroke_sleep_ms": 25
+    },
+    "mapping": {
+        "1,58,1": [
+            "Escape",
+            "keyboard"
+        ],
+        "1,125,1+1,105,1": [
+            "Home",
+            "keyboard"
+        ],
+        "1,29,1+1,125,1+1,103,1": [
+            "End",
+            "keyboard"
+        ],
+        "1,183,1": [
+            "key(KEY_A).key(KEY_B)",
+            "keyboard"
+        ],
+        "1,29,1+1,125,1+1,105,1": [
+            "Home",
+            "keyboard"
+        ]
+    }
+}

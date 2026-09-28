@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Personal dotfiles desktop settings
+Comment=Apply pending personal-dotfiles GNOME settings once at login, then exit
+Exec=@EXEC@
+TryExec=/usr/bin/python3
+Terminal=false
+NoDisplay=true
+OnlyShowIn=GNOME;
+X-GNOME-Autostart-enabled=true
+X-GNOME-Autostart-Delay=0
