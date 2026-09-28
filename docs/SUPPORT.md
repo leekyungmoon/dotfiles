@@ -17,7 +17,7 @@ Status values:
 
 | Ubuntu | Arch | One-liner install | `dotfiles update` | `restore --baseline` | GNOME settings | input-remapper tabs | Verified on |
 | ------ | ---- | ----------------- | ----------------- | -------------------- | -------------- | ------------------- | ----------- |
-| 24.04 | amd64 | pending verification | pending verification | pending verification | pending verification | pending verification | — |
+| 24.04 | amd64 | pass (over an existing wookayin/dotfiles install) | pending verification | pending verification | pending verification | pending verification | 2026-09-28, 24.04.5 amd64, over SSH |
 | 24.04 | arm64 | pending verification | pending verification | pending verification | pending verification | pending verification | — |
 | 22.04 | amd64 | pending verification | pending verification | pending verification | pending verification | pending verification | — |
 | 22.04 | arm64 | pending verification | pending verification | pending verification | pending verification | pending verification | — |
