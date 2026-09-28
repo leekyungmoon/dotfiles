@@ -1,0 +1,1493 @@
+{
+  "schema": 1,
+  "description": "Reviewed inventory of runtime references into the dotfiles checkout and of runtime writers. ~/.dotfiles is the git checkout itself (as in upstream) and is installer-owned source: runtime state must live under the XDG roots. Enforced by tests/unit/test_runtime_references.py.",
+  "path_contract": {
+    "checkout": "~/.dotfiles (the git checkout itself; installer-owned source, read-only at runtime)",
+    "tmux_plugin_root": "${XDG_DATA_HOME:-$HOME/.local/share}/tmux/plugins/ (TPM at tmux/plugins/tpm)",
+    "tmux_resurrect_dir": "${XDG_DATA_HOME:-$HOME/.local/share}/tmux/resurrect",
+    "vim_plugin_root": "${XDG_DATA_HOME:-$HOME/.local/share}/vim/plugged ($VIMPLUG; lazy.nvim and vim-plug)",
+    "lazy_lockfile": "${XDG_DATA_HOME:-$HOME/.local/share}/vim/lazy-lock.json",
+    "antidote_home": "${XDG_DATA_HOME:-$HOME/.local/share}/antidote",
+    "antidote_bundle": "${XDG_CACHE_HOME:-$HOME/.cache}/zsh/antidote.bundled.zsh",
+    "python_bytecode": "${XDG_CACHE_HOME:-$HOME/.cache}/nvim/pycache (UltiSnips python host)",
+    "xdg_rule": "an XDG_* value that is unset or not absolute falls back to the default",
+    "tools_bin": "${XDG_DATA_HOME:-$HOME/.local/share}/personal-dotfiles/bin (first on $PATH via zsh/zshenv)",
+    "nvim_python_host": "${XDG_DATA_HOME:-$HOME/.local/share}/personal-dotfiles/venvs/nvim/bin/python (g:python3_host_prog when present)",
+    "staging": "${XDG_DATA_HOME:-$HOME/.local/share}/personal-dotfiles/staging (scratch clones only)"
+  },
+  "scan": {
+    "roots": [
+      "."
+    ],
+    "exclude": [
+      {
+        "pattern": "tests/",
+        "reason": "test code and fixtures: they run only against disposable HOME/XDG roots and temp copies of the tree (their ~/.dotfiles is the test's own), are never installed or executed as configuration, and fixtures imitate foreign or legacy trees on purpose; the audit's own self-tests quote sample references"
+      },
+      {
+        "pattern": "*.md",
+        "reason": "prose (README, docs/, per-directory notes); documentation may name ~/.dotfiles freely and is never executed"
+      },
+      {
+        "pattern": "manifests/runtime-references.json",
+        "reason": "this inventory quotes every listed line"
+      }
+    ],
+    "notes": "Every tracked or untracked-but-not-ignored text file is scanned. Submodule paths from .gitmodules, symlinks (config/nvim, vim/colors), binary and git-ignored files are skipped. Exclude patterns use fnmatch ('*' also matches '/'); a pattern ending in '/' excludes a directory."
+  },
+  "classifications": {
+    "runtime-link": "executable/config dependency that intentionally resolves through ~/.dotfiles (read-only use)",
+    "guidance": "executable line that only shows the path to the user",
+    "comment": "comment or example in an executable/config file",
+    "documentation": "prose in a non-executed document",
+    "identifier": "name containing DOTFILES, not a path",
+    "pending-owner-change": "executable reference in a file owned by another lane that must change there (see owner)"
+  },
+  "references": [
+    {
+      "file": "bin/dotfiles",
+      "line": "+ list(args), cwd=dotfiles_dir)",
+      "kind": "identifier",
+      "classification": "identifier",
+      "purpose": "install.py delegation runs with cwd = the checkout"
+    },
+    {
+      "file": "bin/dotfiles",
+      "line": "def _dotfiles_dir():",
+      "kind": "identifier",
+      "classification": "identifier",
+      "purpose": "helper returning the checkout path"
+    },
+    {
+      "file": "bin/dotfiles",
+      "line": "dotfiles_dir = _dotfiles_dir()",
+      "kind": "identifier",
+      "classification": "identifier",
+      "purpose": "local variable holding the checkout path",
+      "count": 2
+    },
+    {
+      "file": "bin/dotfiles",
+      "line": "git stash push -m \"DOTFILES_UPDATE\" && stashed=1",
+      "kind": "identifier",
+      "classification": "identifier",
+      "purpose": "stash label used by 'dotfiles update' (see writer dotfiles-update)"
+    },
+    {
+      "file": "bin/dotfiles",
+      "line": "path = os.path.join(_dotfiles_dir(), 'manifests', 'tools.json')",
+      "kind": "identifier",
+      "classification": "identifier",
+      "purpose": "reads the pinned tool manifest from the checkout (read-only)"
+    },
+    {
+      "file": "bin/dotfiles",
+      "line": "ret = subprocess.call(['bash', '-c', action], cwd=dotfiles_dir)",
+      "kind": "identifier",
+      "classification": "identifier",
+      "purpose": "'dotfiles update' runs its git/install steps with cwd = the checkout"
+    },
+    {
+      "file": "bin/dotfiles",
+      "line": "return subprocess.call([_python(), '-B', os.path.join(dotfiles_dir, 'install.py')]",
+      "kind": "identifier",
+      "classification": "identifier",
+      "purpose": "delegates to install.py with -B (no bytecode in the checkout)"
+    },
+    {
+      "file": "bin/dotfiles",
+      "line": "shell=True, cwd=dotfiles_dir)",
+      "kind": "identifier",
+      "classification": "identifier",
+      "purpose": "git commands run in the checkout",
+      "count": 2
+    },
+    {
+      "file": "bin/dotfiles",
+      "line": "'''Delegate to ~/.dotfiles/install.py (bytecode off: nothing lands in the checkout).'''",
+      "kind": "link",
+      "classification": "comment",
+      "purpose": "docstring"
+    },
+    {
+      "file": "bin/dotfiles",
+      "line": "'''Reapply ~/.dotfiles without pulling (install.py repair).'''",
+      "kind": "link",
+      "classification": "comment",
+      "purpose": "docstring"
+    },
+    {
+      "file": "bin/dotfiles",
+      "line": "@add_argument('target', nargs='*', help='pinned tool to install, see ~/.dotfiles/manifests/tools.json for list')",
+      "kind": "link",
+      "classification": "guidance",
+      "purpose": "help text naming the pinned tool list"
+    },
+    {
+      "file": "bin/dotfiles",
+      "line": "return os.path.expanduser('~/.dotfiles')",
+      "kind": "link",
+      "classification": "runtime-link",
+      "purpose": "the checkout path (~/.dotfiles is the checkout, as in upstream)"
+    },
+    {
+      "file": "bin/git-fixup",
+      "line": "source ~/.zsh/antidote-plugins/junegunn/fzf-git.sh/fzf-git.sh && \\",
+      "kind": "legacy-mutable-root",
+      "classification": "pending-owner-change",
+      "purpose": "reads fzf-git.sh from the old in-checkout antidote root; switch to \"${ANTIDOTE_HOME:-${XDG_DATA_HOME:-$HOME/.local/share}/antidote}/junegunn/fzf-git.sh/fzf-git.sh\"",
+      "owner": "bin/git-fixup owner (shell lane)"
+    },
+    {
+      "file": "config/kitty/kitty.conf",
+      "line": "# ┃ ~/.dotfiles/config/kitty/kitty.conf         ┃",
+      "kind": "link",
+      "classification": "comment",
+      "purpose": "file banner"
+    },
+    {
+      "file": "etc/install",
+      "line": "# Environment: DOTFILES_REPO_URL (clone source), DOTFILES_REF (branch, tag or",
+      "kind": "identifier",
+      "classification": "comment",
+      "purpose": "documents the bootstrap environment variables"
+    },
+    {
+      "file": "etc/install",
+      "line": "# _DOTFILES_INSTALL_SIMULATE_ROOT can only add this refusal (tests).",
+      "kind": "identifier",
+      "classification": "comment",
+      "purpose": "documents the test-only root simulation"
+    },
+    {
+      "file": "etc/install",
+      "line": "if [[ \"${EUID:-$(id -u)}\" -eq 0 || \"${_DOTFILES_INSTALL_SIMULATE_ROOT:-0}\" == 1 ]]; then",
+      "kind": "identifier",
+      "classification": "identifier",
+      "purpose": "refuse to run as root; the variable lets tests exercise the refusal"
+    },
+    {
+      "file": "etc/install",
+      "line": "local ref=\"${DOTFILES_REF:-}\"",
+      "kind": "identifier",
+      "classification": "identifier",
+      "purpose": "DOTFILES_REF: optional branch/tag/commit for the bootstrap clone"
+    },
+    {
+      "file": "etc/install",
+      "line": "local repo_url=\"${DOTFILES_REPO_URL:-",
+      "kind": "identifier",
+      "classification": "identifier",
+      "purpose": "DOTFILES_REPO_URL: clone source override (default: the project's public repository URL)",
+      "match": "prefix"
+    },
+    {
+      "file": "etc/install",
+      "line": "# Clones the repository into ~/.dotfiles (like upstream) and runs install.py",
+      "kind": "link",
+      "classification": "comment",
+      "purpose": "bootstrap header"
+    },
+    {
+      "file": "etc/install",
+      "line": "# there. An existing ~/.dotfiles that is a clean clone of this repository is",
+      "kind": "link",
+      "classification": "comment",
+      "purpose": "bootstrap header"
+    },
+    {
+      "file": "etc/install",
+      "line": "local dest=\"${HOME}/.dotfiles\"",
+      "kind": "link",
+      "classification": "runtime-link",
+      "purpose": "bootstrap clone destination (the checkout)"
+    },
+    {
+      "file": "etc/install-neovim.sh",
+      "line": "$HOME/.dotfiles/bin/dotfiles install neovim && exit 0;",
+      "kind": "link",
+      "classification": "runtime-link",
+      "purpose": "calls the dotfiles CLI through the link to install neovim locally"
+    },
+    {
+      "file": "etc/linux-locals.sh",
+      "line": "DOTFILES_TMPDIR=\"${TMPDIR:-/tmp}/$USER/linux-locals\"",
+      "kind": "identifier",
+      "classification": "identifier",
+      "purpose": "DOTFILES_TMPDIR: per-user build scratch under $TMPDIR, not the checkout"
+    },
+    {
+      "file": "etc/linux-locals.sh",
+      "line": "TMP_GO_DIR=\"$DOTFILES_TMPDIR/go/\"",
+      "kind": "identifier",
+      "classification": "identifier",
+      "purpose": "DOTFILES_TMPDIR: per-user build scratch under $TMPDIR, not the checkout"
+    },
+    {
+      "file": "etc/linux-locals.sh",
+      "line": "local TMP_BAZEL_DIR=\"$DOTFILES_TMPDIR/bazel/\"",
+      "kind": "identifier",
+      "classification": "identifier",
+      "purpose": "DOTFILES_TMPDIR: per-user build scratch under $TMPDIR, not the checkout"
+    },
+    {
+      "file": "etc/linux-locals.sh",
+      "line": "local TMP_DIR=\"$DOTFILES_TMPDIR/cmake\";",
+      "kind": "identifier",
+      "classification": "identifier",
+      "purpose": "DOTFILES_TMPDIR: per-user build scratch under $TMPDIR, not the checkout"
+    },
+    {
+      "file": "etc/linux-locals.sh",
+      "line": "local TMP_DIR=\"$DOTFILES_TMPDIR/mosh\"; mkdir -p $TMP_DIR",
+      "kind": "identifier",
+      "classification": "identifier",
+      "purpose": "DOTFILES_TMPDIR: per-user build scratch under $TMPDIR, not the checkout"
+    },
+    {
+      "file": "etc/linux-locals.sh",
+      "line": "local TMP_DIR=\"$DOTFILES_TMPDIR/ncdu\"; mkdir -p $TMP_DIR",
+      "kind": "identifier",
+      "classification": "identifier",
+      "purpose": "DOTFILES_TMPDIR: per-user build scratch under $TMPDIR, not the checkout"
+    },
+    {
+      "file": "etc/linux-locals.sh",
+      "line": "local TMP_DIR=\"$DOTFILES_TMPDIR/rsync\"; mkdir -p $TMP_DIR",
+      "kind": "identifier",
+      "classification": "identifier",
+      "purpose": "DOTFILES_TMPDIR: per-user build scratch under $TMPDIR, not the checkout"
+    },
+    {
+      "file": "etc/linux-locals.sh",
+      "line": "local TMP_GIT_DIR=\"$DOTFILES_TMPDIR/git\"; mkdir -p $TMP_GIT_DIR",
+      "kind": "identifier",
+      "classification": "identifier",
+      "purpose": "DOTFILES_TMPDIR: per-user build scratch under $TMPDIR, not the checkout"
+    },
+    {
+      "file": "etc/linux-locals.sh",
+      "line": "local TMP_NCURSES_DIR=\"$DOTFILES_TMPDIR/ncurses/\"; mkdir -p $TMP_NCURSES_DIR",
+      "kind": "identifier",
+      "classification": "identifier",
+      "purpose": "DOTFILES_TMPDIR: per-user build scratch under $TMPDIR, not the checkout"
+    },
+    {
+      "file": "etc/linux-locals.sh",
+      "line": "local TMP_NVIM_DIR=\"$DOTFILES_TMPDIR/neovim\"; mkdir -p $TMP_NVIM_DIR",
+      "kind": "identifier",
+      "classification": "identifier",
+      "purpose": "DOTFILES_TMPDIR: per-user build scratch under $TMPDIR, not the checkout"
+    },
+    {
+      "file": "etc/linux-locals.sh",
+      "line": "local TMP_VIM_DIR=\"$DOTFILES_TMPDIR/vim/\"; mkdir -p $TMP_VIM_DIR",
+      "kind": "identifier",
+      "classification": "identifier",
+      "purpose": "DOTFILES_TMPDIR: per-user build scratch under $TMPDIR, not the checkout"
+    },
+    {
+      "file": "etc/linux-locals.sh",
+      "line": "local TMP_ZSH_DIR=\"$DOTFILES_TMPDIR/zsh/\"; mkdir -p \"$TMP_ZSH_DIR\"",
+      "kind": "identifier",
+      "classification": "identifier",
+      "purpose": "DOTFILES_TMPDIR: per-user build scratch under $TMPDIR, not the checkout"
+    },
+    {
+      "file": "etc/linux-locals.sh",
+      "line": "local tmpdir=\"$DOTFILES_TMPDIR/$name\"",
+      "kind": "identifier",
+      "classification": "identifier",
+      "purpose": "DOTFILES_TMPDIR: per-user build scratch under $TMPDIR, not the checkout"
+    },
+    {
+      "file": "etc/linux-locals.sh",
+      "line": "local tmpdir=\"$DOTFILES_TMPDIR/mujoco\"",
+      "kind": "identifier",
+      "classification": "identifier",
+      "purpose": "DOTFILES_TMPDIR: per-user build scratch under $TMPDIR, not the checkout"
+    },
+    {
+      "file": "etc/terminfo/tmux-256color.terminfo",
+      "line": "# Install (see ~/.dotfiles/etc/terminfo.sh):",
+      "kind": "link",
+      "classification": "comment",
+      "purpose": "install hint"
+    },
+    {
+      "file": "git/gitconfig.stub",
+      "line": "# (not tracked; included at the end of ~/.dotfiles/git/gitconfig), e.g.:",
+      "kind": "link",
+      "classification": "comment",
+      "purpose": "explains where ~/.gitconfig.secret is included"
+    },
+    {
+      "file": "git/gitconfig.stub",
+      "line": "# ~/.dotfiles/git/gitconfig is never modified by tools.",
+      "kind": "link",
+      "classification": "comment",
+      "purpose": "explains why ~/.gitconfig is a machine-owned stub"
+    },
+    {
+      "file": "git/gitconfig.stub",
+      "line": "path = ~/.dotfiles/git/gitconfig",
+      "kind": "link",
+      "classification": "runtime-link",
+      "purpose": "the machine-owned ~/.gitconfig stub includes the shared git config through the link (read-only)"
+    },
+    {
+      "file": "install.py",
+      "line": "\"    cd ~/.dotfiles && python3 install.py\\n\\n\"",
+      "kind": "link",
+      "classification": "guidance",
+      "purpose": "usage/error text: install.py runs from the ~/.dotfiles checkout (clone instructions)"
+    },
+    {
+      "file": "install.py",
+      "line": "\"\"\"Why ``here`` is not the ``~/.dotfiles`` checkout, or None.\"\"\"",
+      "kind": "link",
+      "classification": "comment",
+      "purpose": "docstring"
+    },
+    {
+      "file": "install.py",
+      "line": "\"Clone the repository into ~/.dotfiles and run it from there:\\n\\n\"",
+      "kind": "link",
+      "classification": "guidance",
+      "purpose": "usage/error text: install.py runs from the ~/.dotfiles checkout (clone instructions)"
+    },
+    {
+      "file": "install.py",
+      "line": "Install the dotfiles from this checkout, which must be ~/.dotfiles:",
+      "kind": "link",
+      "classification": "guidance",
+      "purpose": "usage/error text: install.py runs from the ~/.dotfiles checkout (clone instructions)"
+    },
+    {
+      "file": "install.py",
+      "line": "cd ~/.dotfiles && python3 install.py",
+      "kind": "link",
+      "classification": "guidance",
+      "purpose": "usage/error text: install.py runs from the ~/.dotfiles checkout (clone instructions)"
+    },
+    {
+      "file": "install.py",
+      "line": "f\"    git clone --recursive {repo.DEFAULT_REPO_URL} ~/.dotfiles\\n\"",
+      "kind": "link",
+      "classification": "guidance",
+      "purpose": "usage/error text: install.py runs from the ~/.dotfiles checkout (clone instructions)"
+    },
+    {
+      "file": "install.py",
+      "line": "git clone --recursive https://github.com/",
+      "kind": "link",
+      "classification": "guidance",
+      "purpose": "usage/error text: install.py runs from the ~/.dotfiles checkout (clone instructions)",
+      "match": "prefix"
+    },
+    {
+      "file": "installer/phases.py",
+      "line": "\"DOTFILES_UPDATE=1 __p9k_instant_prompt_disabled=1 source ${HOME}/.zshrc; \"",
+      "kind": "identifier",
+      "classification": "identifier",
+      "purpose": "installer plugin phase sources ~/.zshrc non-interactively with upstream's DOTFILES_UPDATE marker to run antidote update/reset"
+    },
+    {
+      "file": "installer/platform.py",
+      "line": "\"\"\"The git checkout itself: ``~/.dotfiles`` (as in upstream).\"\"\"",
+      "kind": "link",
+      "classification": "comment",
+      "purpose": "docstring: Target.repo_root is the checkout at ~/.dotfiles"
+    },
+    {
+      "file": "installer/repo.py",
+      "line": "return env.get(\"DOTFILES_REF\", \"\").strip() or None",
+      "kind": "identifier",
+      "classification": "identifier",
+      "purpose": "reads the DOTFILES_REF bootstrap override"
+    },
+    {
+      "file": "installer/repo.py",
+      "line": "return env.get(\"DOTFILES_REPO_URL\", \"\").strip() or DEFAULT_REPO_URL",
+      "kind": "identifier",
+      "classification": "identifier",
+      "purpose": "reads the DOTFILES_REPO_URL bootstrap override"
+    },
+    {
+      "file": "installer/repo.py",
+      "line": "\"\"\"Read-only helpers for the ``~/.dotfiles`` git checkout.",
+      "kind": "link",
+      "classification": "comment",
+      "purpose": "module docstring"
+    },
+    {
+      "file": "installer/repo.py",
+      "line": "As in upstream, ``~/.dotfiles`` *is* the git checkout: ``etc/install``",
+      "kind": "link",
+      "classification": "comment",
+      "purpose": "module docstring"
+    },
+    {
+      "file": "manifests/managed-paths.json",
+      "line": "\"description\": \"a small machine-owned file that includes ~/.dotfiles/git/gitconfig, so 'git config --global' never writes into the checkout\"",
+      "kind": "link",
+      "classification": "guidance",
+      "purpose": "managed-path description of the ~/.gitconfig stub entry"
+    },
+    {
+      "file": "nvim/after/ftplugin/lua.lua",
+      "line": "-- ~/.hammerspoon/init.lua or ~/.dotfiles/hammerspoon/init.lua",
+      "kind": "link",
+      "classification": "comment",
+      "purpose": "example path"
+    },
+    {
+      "file": "nvim/after/ftplugin/lua.lua",
+      "line": "setlocal.path:append('~/.dotfiles/nvim/lua')",
+      "kind": "link",
+      "classification": "runtime-link",
+      "purpose": "'path' for gf/:find in lua buffers (read-only)"
+    },
+    {
+      "file": "nvim/after/ftplugin/python.lua",
+      "line": "-- More Keymaps (see $DOTVIM/lua/lib/python.lua)",
+      "kind": "identifier",
+      "classification": "comment",
+      "purpose": "comment naming a file under $DOTVIM (the nvim config dir, ~/.config/nvim)"
+    },
+    {
+      "file": "nvim/after/indent/python.vim",
+      "line": "\" DEPRECATED: Use treesitter indent. see $DOTVIM/after/indent/python.lua",
+      "kind": "identifier",
+      "classification": "comment",
+      "purpose": "comment naming a file under $DOTVIM (the nvim config dir, ~/.config/nvim)"
+    },
+    {
+      "file": "nvim/after/lsp/lua_ls.lua",
+      "line": "library[vim.env.DOTVIM .. '/lua'] = true",
+      "kind": "identifier",
+      "classification": "runtime-link",
+      "purpose": "lua_ls reads the config's lua/ tree as a library (read-only)"
+    },
+    {
+      "file": "nvim/after/queries/lua/highlights.scm",
+      "line": "; see $DOTVIM/after/queries/lua/injections.scm",
+      "kind": "identifier",
+      "classification": "comment",
+      "purpose": "comment naming a file under $DOTVIM (the nvim config dir, ~/.config/nvim)"
+    },
+    {
+      "file": "nvim/after/queries/lua/highlights.scm",
+      "line": "; see also $DOTVIM/after/queries/lua/injections.scm",
+      "kind": "identifier",
+      "classification": "comment",
+      "purpose": "comment naming a file under $DOTVIM (the nvim config dir, ~/.config/nvim)"
+    },
+    {
+      "file": "nvim/after/queries/lua/injections.scm",
+      "line": "; see $DOTVIM/after/queries/lua/highlights.scm",
+      "kind": "identifier",
+      "classification": "comment",
+      "purpose": "comment naming a file under $DOTVIM (the nvim config dir, ~/.config/nvim)"
+    },
+    {
+      "file": "nvim/ftplugin/python.vim",
+      "line": "\" Oops, were you looking for $DOTVIM/after/ftplugin/python.vim ?",
+      "kind": "identifier",
+      "classification": "comment",
+      "purpose": "comment naming a file under $DOTVIM (the nvim config dir, ~/.config/nvim)"
+    },
+    {
+      "file": "nvim/init.lua",
+      "line": "'use `export DOTFILES_SUPPRESS_NEOVIM_VERSION_WARNING=1` in your shell (e.g. `~/.zshrc.local`).'",
+      "kind": "identifier",
+      "classification": "identifier",
+      "purpose": "user opt-out variable / deprecation cache name, not a path"
+    },
+    {
+      "file": "nvim/init.lua",
+      "line": "if not like_false(vim.env.DOTFILES_SUPPRESS_NEOVIM_VERSION_WARNING) then return end",
+      "kind": "identifier",
+      "classification": "identifier",
+      "purpose": "user opt-out variable / deprecation cache name, not a path"
+    },
+    {
+      "file": "nvim/init.lua",
+      "line": "local cache = vim.g.DOTFILES_DEPRECATION_CACHE or {}",
+      "kind": "identifier",
+      "classification": "identifier",
+      "purpose": "user opt-out variable / deprecation cache name, not a path"
+    },
+    {
+      "file": "nvim/init.lua",
+      "line": "vim.env.DOTVIM = vim.fn.expand('~/.config/nvim')",
+      "kind": "identifier",
+      "classification": "runtime-link",
+      "purpose": "defines $DOTVIM as the nvim config dir (~/.config/nvim, a link into the checkout's nvim/); read-only use"
+    },
+    {
+      "file": "nvim/init.lua",
+      "line": "vim.g.DOTFILES_DEPRECATION_CACHE = { version = nvim_version, timestamp = os.time() }",
+      "kind": "identifier",
+      "classification": "identifier",
+      "purpose": "user opt-out variable / deprecation cache name, not a path"
+    },
+    {
+      "file": "nvim/init.lua",
+      "line": "-- NOTE: Also update ~/.dotfiles/etc/install-neovim.sh",
+      "kind": "link",
+      "classification": "comment",
+      "purpose": "maintenance note"
+    },
+    {
+      "file": "nvim/init.testing.lua",
+      "line": "nvim [--headless] --clean -u ~/.dotfiles/nvim/init.testing.lua",
+      "kind": "link",
+      "classification": "comment",
+      "purpose": "usage example inside the header block comment"
+    },
+    {
+      "file": "nvim/lua/config/commands/Config.lua",
+      "line": "['init.lua'] = vim.fn.expand('$DOTVIM/init.lua'),",
+      "kind": "identifier",
+      "classification": "runtime-link",
+      "purpose": ":Config opens the user's own init.lua for editing (deliberate user edit of the source)"
+    },
+    {
+      "file": "nvim/lua/config/dap.lua",
+      "line": "-- ~/.vim/plugged/nvim-dap-ui/lua/dapui/config/init.lua",
+      "kind": "legacy-mutable-root",
+      "classification": "comment",
+      "purpose": "pointer to plugin source ($VIMPLUG now)"
+    },
+    {
+      "file": "nvim/lua/config/formatting.lua",
+      "line": "--- for the project. See $DOTVIM/after/ftplugin/python.lua for an example.",
+      "kind": "identifier",
+      "classification": "comment",
+      "purpose": "comment naming a file under $DOTVIM (the nvim config dir, ~/.config/nvim)"
+    },
+    {
+      "file": "nvim/lua/config/fzf.lua",
+      "line": "-- :RgConfig [query] => search ~/.dotfiles, excluding vim plugins",
+      "kind": "link",
+      "classification": "comment",
+      "purpose": "command description"
+    },
+    {
+      "file": "nvim/lua/config/fzf.lua",
+      "line": "RgPath(vim.fn.expand(\"$HOME/.dotfiles\"), vim.trim(e.args), extra_args)",
+      "kind": "link",
+      "classification": "runtime-link",
+      "purpose": ":RgConfig searches the dotfiles source (read-only)"
+    },
+    {
+      "file": "nvim/lua/config/fzf.lua",
+      "line": "command(\"RgConfig\", { nargs = \"*\", bang = true, desc = \"RgPath on ~/.dotfiles\" }, function(e)",
+      "kind": "link",
+      "classification": "guidance",
+      "purpose": ":RgConfig command description string"
+    },
+    {
+      "file": "nvim/lua/config/git.lua",
+      "line": "-- For highlights, see $DOTVIM/colors/xoria256-wook.vim",
+      "kind": "identifier",
+      "classification": "comment",
+      "purpose": "comment naming a file under $DOTVIM (the nvim config dir, ~/.config/nvim)"
+    },
+    {
+      "file": "nvim/lua/config/lsp.lua",
+      "line": "-- $DOTVIM/lua/config/completion.lua: <Tab> imap",
+      "kind": "identifier",
+      "classification": "comment",
+      "purpose": "comment naming a file under $DOTVIM (the nvim config dir, ~/.config/nvim)"
+    },
+    {
+      "file": "nvim/lua/config/lsp.lua",
+      "line": "-- $DOTVIM/lua/config/statusline.lua: statusline integration",
+      "kind": "identifier",
+      "classification": "comment",
+      "purpose": "comment naming a file under $DOTVIM (the nvim config dir, ~/.config/nvim)"
+    },
+    {
+      "file": "nvim/lua/config/lsp.lua",
+      "line": "-- See $DOTVIM/after/lsp/ for individual LSP config overrides",
+      "kind": "identifier",
+      "classification": "comment",
+      "purpose": "comment naming a file under $DOTVIM (the nvim config dir, ~/.config/nvim)"
+    },
+    {
+      "file": "nvim/lua/config/lsp.lua",
+      "line": "---  See the `$DOTVIM/after/lsp/` directory. `lsp/*.lua` files will be sourced at the time",
+      "kind": "identifier",
+      "classification": "comment",
+      "purpose": "comment naming a file under $DOTVIM (the nvim config dir, ~/.config/nvim)"
+    },
+    {
+      "file": "nvim/lua/config/pynvim.lua",
+      "line": "-- See also $DOTVIM/ftplugin/python.vim to ensure config.pynvim on startup",
+      "kind": "identifier",
+      "classification": "comment",
+      "purpose": "comment naming a file under $DOTVIM (the nvim config dir, ~/.config/nvim)"
+    },
+    {
+      "file": "nvim/lua/config/telescope.lua",
+      "line": "-- NOTE: see $DOTVIM/lua/config/fzf.lua -- we prefer fzf-lua to telescope for many of the finders",
+      "kind": "identifier",
+      "classification": "comment",
+      "purpose": "comment naming a file under $DOTVIM (the nvim config dir, ~/.config/nvim)"
+    },
+    {
+      "file": "nvim/lua/config/testing.lua",
+      "line": "-- See also $DOTVIM/after/ftplugin/python.vim for filetype-specfic mapping to neotest commands",
+      "kind": "identifier",
+      "classification": "comment",
+      "purpose": "comment naming a file under $DOTVIM (the nvim config dir, ~/.config/nvim)"
+    },
+    {
+      "file": "nvim/lua/config/testing.lua",
+      "line": "-- see $DOTVIM/after/ftplugin/python.vim as well",
+      "kind": "identifier",
+      "classification": "comment",
+      "purpose": "comment naming a file under $DOTVIM (the nvim config dir, ~/.config/nvim)"
+    },
+    {
+      "file": "nvim/lua/config/testing.lua",
+      "line": "min_init = vim.fn.expand(\"$DOTVIM/init.testing.lua\"),",
+      "kind": "identifier",
+      "classification": "runtime-link",
+      "purpose": "plenary test runner reads init.testing.lua (read-only)"
+    },
+    {
+      "file": "nvim/lua/config/tex.lua",
+      "line": "-- Use treesitter highlights for tex, see $DOTVIM/after/syntax/tex.vim",
+      "kind": "identifier",
+      "classification": "comment",
+      "purpose": "comment naming a file under $DOTVIM (the nvim config dir, ~/.config/nvim)"
+    },
+    {
+      "file": "nvim/lua/config/tex.lua",
+      "line": "-- TexShop: ~/.dotfiles/bin/texshop",
+      "kind": "link",
+      "classification": "comment",
+      "purpose": "pointer to helper script"
+    },
+    {
+      "file": "nvim/lua/config/treesitter.lua",
+      "line": "--    $DOTVIM/after/queries => \"extends\" nvim-treesitter's query files",
+      "kind": "identifier",
+      "classification": "comment",
+      "purpose": "comment naming a file under $DOTVIM (the nvim config dir, ~/.config/nvim)"
+    },
+    {
+      "file": "nvim/lua/config/treesitter.lua",
+      "line": "--    $DOTVIM/queries       => \"overrides\" query files.",
+      "kind": "identifier",
+      "classification": "comment",
+      "purpose": "comment naming a file under $DOTVIM (the nvim config dir, ~/.config/nvim)"
+    },
+    {
+      "file": "nvim/lua/config/treesitter.lua",
+      "line": "-- See $DOTVIM/lua/plugins/treesitter.lua",
+      "kind": "identifier",
+      "classification": "comment",
+      "purpose": "comment naming a file under $DOTVIM (the nvim config dir, ~/.config/nvim)"
+    },
+    {
+      "file": "nvim/lua/lib/python.lua",
+      "line": "--[[ Implementations for $DOTVIM/after/ftplugin/python.lua ]]",
+      "kind": "identifier",
+      "classification": "comment",
+      "purpose": "comment naming a file under $DOTVIM (the nvim config dir, ~/.config/nvim)"
+    },
+    {
+      "file": "nvim/lua/plugins/ide.lua",
+      "line": "-- snippets import $DOTVIM/pythonx/px from the dotfiles checkout; write its bytecode",
+      "kind": "identifier",
+      "classification": "comment",
+      "purpose": "comment naming a file under $DOTVIM (the nvim config dir, ~/.config/nvim)"
+    },
+    {
+      "file": "nvim/pythonx/px/snippets_helper.py",
+      "line": "# See $DOTVIM/UltiSnips/python.snippets",
+      "kind": "identifier",
+      "classification": "comment",
+      "purpose": "comment naming a file under $DOTVIM (the nvim config dir, ~/.config/nvim)"
+    },
+    {
+      "file": "systemd/user/tmux-resurrect-autosave.service",
+      "line": "ExecStart=%h/.dotfiles/tmux/resurrect-save",
+      "kind": "link",
+      "classification": "runtime-link",
+      "purpose": "autosave timer runs the save wrapper from the checkout (read-only)"
+    },
+    {
+      "file": "systemd/user/tmux.service",
+      "line": "ExecStop=-%h/.dotfiles/tmux/resurrect-save",
+      "kind": "link",
+      "classification": "runtime-link",
+      "purpose": "tmux.service saves through the wrapper before stopping (read-only)"
+    },
+    {
+      "file": "tmux/resurrect.conf",
+      "line": "# Paths: ~/.dotfiles is the checkout itself, as in upstream wookayin/dotfiles.",
+      "kind": "link",
+      "classification": "comment",
+      "purpose": "explains the link-based script paths"
+    },
+    {
+      "file": "tmux/resurrect.conf",
+      "line": "bind-key C-s run-shell '\"$HOME/.dotfiles/tmux/resurrect-save\" && tmux display-message \"tmux environment saved\"'",
+      "kind": "link",
+      "classification": "runtime-link",
+      "purpose": "prefix + C-s runs the locked save wrapper from the checkout (read-only; writes go to the resurrect dir)"
+    },
+    {
+      "file": "tmux/resurrect.conf",
+      "line": "run-shell 'tmux set-option -g @resurrect-hook-post-save-layout \"\\\"$HOME/.dotfiles/tmux/resurrect-ai-session.py\\\"\"'",
+      "kind": "link",
+      "classification": "runtime-link",
+      "purpose": "post-save hook script executed from the checkout (run as a script, so no bytecode)"
+    },
+    {
+      "file": "tmux/statusbar.tmux",
+      "line": "# see ~/.dotfiles/bin/cpu-usage",
+      "kind": "link",
+      "classification": "comment",
+      "purpose": "pointer to helper script"
+    },
+    {
+      "file": "tmux/tmux.conf",
+      "line": "# Advanced terminal SGR/OSC features, see ~/.dotfiles/etc/terminfo.sh",
+      "kind": "link",
+      "classification": "comment",
+      "purpose": "pointer to terminfo helper"
+    },
+    {
+      "file": "tmux/tmux.conf",
+      "line": "# See also ~/.dotfiles/etc/terminfo/tmux-256color.terminfo",
+      "kind": "link",
+      "classification": "comment",
+      "purpose": "pointer to terminfo helper"
+    },
+    {
+      "file": "tmux/tmux.conf",
+      "line": "bind-key -n C-v run-shell \"$HOME/.dotfiles/bin/tmux-smart-paste '#{pane_id}'\"",
+      "kind": "link",
+      "classification": "runtime-link",
+      "purpose": "Ctrl-V smart paste helper executed through the link"
+    },
+    {
+      "file": "tmux/tmux.conf",
+      "line": "bind-key S display-popup -E -w 60% -h 60% '$HOME/.dotfiles/bin/tmux-attach || true'",
+      "kind": "link",
+      "classification": "runtime-link",
+      "purpose": "prefix-S session picker on tmux < 3.3 (plain fzf in display-popup; fzf --tmux needs 3.3+)"
+    },
+    {
+      "file": "tmux/tmux.conf",
+      "line": "bind-key S run-shell '$HOME/.dotfiles/bin/tmux-attach || true'",
+      "kind": "link",
+      "classification": "runtime-link",
+      "purpose": "prefix+S session chooser executed through the link"
+    },
+    {
+      "file": "vim/vimrc",
+      "line": "\" Prevent scanning the entire home directory, move to DOTFILES.",
+      "kind": "identifier",
+      "classification": "comment",
+      "purpose": "comment: the word DOTFILES names the checkout directory"
+    },
+    {
+      "file": "vim/vimrc",
+      "line": "\" see $DOTVIM/lua/config/build.lua",
+      "kind": "identifier",
+      "classification": "comment",
+      "purpose": "comment naming a file under $DOTVIM (the nvim config dir, ~/.config/nvim)"
+    },
+    {
+      "file": "vim/vimrc",
+      "line": "if l:fzf_lua  \" see $DOTVIM/lua/config/fzf.lua",
+      "kind": "identifier",
+      "classification": "identifier",
+      "purpose": "trailing comment naming $DOTVIM/lua/config/fzf.lua on an executable line; not a path use"
+    },
+    {
+      "file": "vim/vimrc",
+      "line": "source $DOTVIM/lua/config/neovide.lua",
+      "kind": "identifier",
+      "classification": "runtime-link",
+      "purpose": "sources the neovide settings from the nvim config dir (read-only)"
+    },
+    {
+      "file": "vim/vimrc",
+      "line": "\" See ~/.vim/plugged/vim-airline/autoload/airline/init.vim -> airline#init#sections() to see defaults {{{",
+      "kind": "legacy-mutable-root",
+      "classification": "comment",
+      "purpose": "pointer to plugin source ($VIMPLUG now)"
+    },
+    {
+      "file": "vim/vimrc",
+      "line": "\" Add ~/.local/bin and ~/.dotfiles/bin to $PATH even if haven't (e.g., using bash shell)",
+      "kind": "link",
+      "classification": "comment",
+      "purpose": "pointer/comment"
+    },
+    {
+      "file": "vim/vimrc",
+      "line": "\" See ~/.dotfiles/nvim/lua/config/commands/Makeprg.lua for nvim+lua version",
+      "kind": "link",
+      "classification": "comment",
+      "purpose": "pointer/comment"
+    },
+    {
+      "file": "vim/vimrc",
+      "line": "\" See ~/.dotfiles/nvim/lua/config/quickfix.lua",
+      "kind": "link",
+      "classification": "comment",
+      "purpose": "pointer/comment"
+    },
+    {
+      "file": "vim/vimrc",
+      "line": "call CommandAlias('FC', 'F ~/.dotfiles/', v:true)",
+      "kind": "link",
+      "classification": "runtime-link",
+      "purpose": ":FC fuzzy-finds the dotfiles source (read-only)"
+    },
+    {
+      "file": "vim/vimrc",
+      "line": "call s:ensure_PATH('~/.dotfiles/bin')",
+      "kind": "link",
+      "classification": "runtime-link",
+      "purpose": "puts the repository bin/ on $PATH inside vim"
+    },
+    {
+      "file": "vim/vimrc",
+      "line": "cd $HOME/.dotfiles",
+      "kind": "link",
+      "classification": "runtime-link",
+      "purpose": "GUI vim starting in $HOME changes cwd to the dotfiles source (read-only)"
+    },
+    {
+      "file": "zsh/functions/_plugged",
+      "line": "_files -W $HOME/.vim/plugged/",
+      "kind": "legacy-mutable-root",
+      "classification": "pending-owner-change",
+      "purpose": "completion for plugged(); must read ${XDG_DATA_HOME:-$HOME/.local/share}/vim/plugged",
+      "owner": "zsh/functions owner (shell lane)"
+    },
+    {
+      "file": "zsh/plugins.zsh",
+      "line": "# theme file (XDG:wook) is at ~/.dotfiles/config/f-sy-h",
+      "kind": "link",
+      "classification": "comment",
+      "purpose": "pointer to the F-Sy-H theme file"
+    },
+    {
+      "file": "zsh/zsh.d/alias.zsh",
+      "line": "&& (( $+aliases[$_dotfiles_helper] )); then",
+      "kind": "identifier",
+      "classification": "identifier",
+      "purpose": "loop/helper variable names of the pbcopy/pbpaste alias cleanup"
+    },
+    {
+      "file": "zsh/zsh.d/alias.zsh",
+      "line": "[[ -d \"$_dotfiles_bin_dir\" ]] || _dotfiles_bin_dir=\"$HOME/.dotfiles/bin\"",
+      "kind": "identifier",
+      "classification": "identifier",
+      "purpose": "loop/helper variable names of the pbcopy/pbpaste alias cleanup"
+    },
+    {
+      "file": "zsh/zsh.d/alias.zsh",
+      "line": "_dotfiles_bin_dir=${0:A:h:h:h}/bin",
+      "kind": "identifier",
+      "classification": "identifier",
+      "purpose": "loop/helper variable names of the pbcopy/pbpaste alias cleanup"
+    },
+    {
+      "file": "zsh/zsh.d/alias.zsh",
+      "line": "for _dotfiles_helper in pbcopy pbpaste; do",
+      "kind": "identifier",
+      "classification": "identifier",
+      "purpose": "loop/helper variable names of the pbcopy/pbpaste alias cleanup"
+    },
+    {
+      "file": "zsh/zsh.d/alias.zsh",
+      "line": "if [[ -x \"$_dotfiles_bin_dir/$_dotfiles_helper\" ]] \\",
+      "kind": "identifier",
+      "classification": "identifier",
+      "purpose": "loop/helper variable names of the pbcopy/pbpaste alias cleanup"
+    },
+    {
+      "file": "zsh/zsh.d/alias.zsh",
+      "line": "unalias \"$_dotfiles_helper\"",
+      "kind": "identifier",
+      "classification": "identifier",
+      "purpose": "loop/helper variable names of the pbcopy/pbpaste alias cleanup"
+    },
+    {
+      "file": "zsh/zsh.d/alias.zsh",
+      "line": "unset _dotfiles_bin_dir _dotfiles_helper",
+      "kind": "identifier",
+      "classification": "identifier",
+      "purpose": "loop/helper variable names of the pbcopy/pbpaste alias cleanup"
+    },
+    {
+      "file": "zsh/zsh.d/alias.zsh",
+      "line": "--preview 'tree -C --gitignore $HOME/.vim/plugged/{}' --bind 'ctrl-/:toggle-preview' \\",
+      "kind": "legacy-mutable-root",
+      "classification": "pending-owner-change",
+      "purpose": "plugged() lists/cds into the old in-checkout plugin root; must use ${XDG_DATA_HOME:-$HOME/.local/share}/vim/plugged",
+      "owner": "zsh/zsh.d/alias.zsh owner (shell lane)"
+    },
+    {
+      "file": "zsh/zsh.d/alias.zsh",
+      "line": "cd \"$HOME/.vim/plugged/$selected\"",
+      "kind": "legacy-mutable-root",
+      "classification": "pending-owner-change",
+      "purpose": "plugged() lists/cds into the old in-checkout plugin root; must use ${XDG_DATA_HOME:-$HOME/.local/share}/vim/plugged",
+      "owner": "zsh/zsh.d/alias.zsh owner (shell lane)"
+    },
+    {
+      "file": "zsh/zsh.d/alias.zsh",
+      "line": "selected=$(ls -1 \"$HOME/.vim/plugged\" \\",
+      "kind": "legacy-mutable-root",
+      "classification": "pending-owner-change",
+      "purpose": "plugged() lists/cds into the old in-checkout plugin root; must use ${XDG_DATA_HOME:-$HOME/.local/share}/vim/plugged",
+      "owner": "zsh/zsh.d/alias.zsh owner (shell lane)"
+    },
+    {
+      "file": "zsh/zsh.d/alias.zsh",
+      "line": "# see also ~/.dotfiles/bin: pid.fzf, rg.fzf, etc.",
+      "kind": "link",
+      "classification": "comment",
+      "purpose": "pointer to helper scripts"
+    },
+    {
+      "file": "zsh/zsh.d/alias.zsh",
+      "line": "# see ~/.dotfiles/bin/tmux-attach",
+      "kind": "link",
+      "classification": "comment",
+      "purpose": "pointer to helper scripts"
+    },
+    {
+      "file": "zsh/zsh.d/alias.zsh",
+      "line": "[[ -d \"$_dotfiles_bin_dir\" ]] || _dotfiles_bin_dir=\"$HOME/.dotfiles/bin\"",
+      "kind": "link",
+      "classification": "runtime-link",
+      "purpose": "fallback repository bin/ for the pbcopy/pbpaste alias cleanup"
+    },
+    {
+      "file": "zsh/zsh.d/alias.zsh",
+      "line": "alias plugs='vim +\"cd ~/.dotfiles\" ~/.dotfiles/vim/plugins.vim'",
+      "kind": "link",
+      "classification": "runtime-link",
+      "purpose": "opens tracked vim/plugins.vim for deliberate editing of the source"
+    },
+    {
+      "file": "zsh/zsh.d/alias.zsh",
+      "line": "alias vimrc='vim +\"cd ~/.dotfiles\" +Vimrc +tabclose\\ 1'",
+      "kind": "link",
+      "classification": "runtime-link",
+      "purpose": "opens the tracked vimrc for deliberate editing of the source"
+    },
+    {
+      "file": "zsh/zsh.d/alias.zsh",
+      "line": "nvim --headless --clean -u ~/.dotfiles/nvim/init.testing.lua -c \"PlenaryBustedDirectory $f\" || return 1;",
+      "kind": "link",
+      "classification": "runtime-link",
+      "purpose": "runs the plenary test init from the source (reads $XDG_DATA_HOME/vim/plugged/plenary.nvim)"
+    },
+    {
+      "file": "zsh/zsh.d/fzf-widgets.zsh",
+      "line": "# Like _fzf_complete_kill, but using ~/.dotfiles/bin/pid.fzf",
+      "kind": "link",
+      "classification": "comment",
+      "purpose": "pointer to helper script"
+    },
+    {
+      "file": "zsh/zshenv",
+      "line": "prepend_path \"$HOME/.dotfiles/bin\"",
+      "kind": "link",
+      "classification": "runtime-link",
+      "purpose": "puts the repository bin/ (pbcopy, pbpaste, tmux helpers, dotfiles) on $PATH"
+    },
+    {
+      "file": "zsh/zshrc",
+      "line": "echo -e \" Run ~/.dotfiles/etc/terminfo.sh and restart shell.\"'\\033[0m'",
+      "kind": "link",
+      "classification": "guidance",
+      "purpose": "missing-terminfo hint pointing at the terminfo installer script"
+    },
+    {
+      "file": "zsh/zshrc",
+      "line": "fast-theme \"$HOME/.dotfiles/config/f-sy-h/wook.ini\"",
+      "kind": "link",
+      "classification": "runtime-link",
+      "purpose": "F-Sy-H theme file read from the source (only when _ANTIDOTE_SAVING is set; normally dead code)"
+    },
+    {
+      "file": "tmux/resurrect-save",
+      "line": "# data. Unlike upstream's helpers.sh, never fall back to ~/.tmux/resurrect:",
+      "kind": "legacy-mutable-root",
+      "classification": "comment",
+      "purpose": "explains why snapshots never fall back into the checkout through the ~/.tmux link",
+      "count": 1
+    },
+    {
+      "file": "install.py",
+      "line": "\"'python3 ~/.dotfiles/install.py restore --baseline' again \"",
+      "kind": "link",
+      "classification": "runtime-link",
+      "purpose": "user-facing hint naming the restore command in the ~/.dotfiles checkout",
+      "count": 1
+    }
+  ],
+  "writers": [
+    {
+      "id": "tmux-tpm-plugins",
+      "entrypoint": "tmux.conf `run-shell` of TPM at config load; TPM keys prefix+I (install), prefix+U (update), prefix+M-u (clean)",
+      "before": "TPM default TMUX_PLUGIN_MANAGER_PATH=~/.tmux/plugins/ -> <checkout>/tmux/plugins/ (clones gitignored inside the checkout); TPM itself was the tracked submodule tmux/plugins/tpm, so prefix+U 'all' ran git pull inside it",
+      "after": "TMUX_PLUGIN_MANAGER_PATH=${XDG_DATA_HOME:-$HOME/.local/share}/tmux/plugins/ (set unconditionally before TPM runs, so a server that already carries the old value is switched on reload); TPM is loaded from .../tmux/plugins/tpm/tpm; if missing, tmux prints 'run: dotfiles repair'",
+      "status": "redirected",
+      "evidence": "isolated tmux server: TPM keys bound to <XDG_DATA_HOME>/tmux/plugins/tpm/bindings/*; install/update/clean acted only there; no change under tmux/ in the checkout",
+      "checks": [
+        {
+          "file": "tmux/tmux.conf",
+          "require": [
+            "tmux set-environment -g TMUX_PLUGIN_MANAGER_PATH \"\\$d/tmux/plugins/\"",
+            "\"\\$d/tmux/plugins/tpm/tpm\"",
+            "set -g @plugin 'tmux-plugins/tpm'"
+          ],
+          "forbid": [
+            "run-shell\\s+'~/\\.tmux/plugins/tpm/tpm'"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "tmux-resurrect-dir",
+      "entrypoint": "tmux-resurrect save/restore (plugin keys)",
+      "before": "@resurrect-dir unset: ~/.tmux/resurrect (-> <checkout>/tmux/resurrect, gitignored) whenever that directory exists, else ${XDG_DATA_HOME:-~/.local/share}/tmux/resurrect",
+      "after": "@resurrect-dir=${XDG_DATA_HOME:-$HOME/.local/share}/tmux/resurrect, set explicitly",
+      "status": "redirected",
+      "evidence": "isolated tmux server: save.sh wrote last + tmux_resurrect_*.txt under <XDG_DATA_HOME>/tmux/resurrect",
+      "checks": [
+        {
+          "file": "tmux/tmux.conf",
+          "require": [
+            "tmux set-option -g @resurrect-dir \"\\$d/tmux/resurrect\""
+          ]
+        }
+      ]
+    },
+    {
+      "id": "antidote-bundle-clones",
+      "entrypoint": "first interactive zsh start (static bundle generation), antidote bundle, antidote update (bundles)",
+      "before": "ANTIDOTE_HOME=$HOME/.zsh/antidote-plugins -> <checkout>/zsh/antidote-plugins (gitignored)",
+      "after": "ANTIDOTE_HOME=${XDG_DATA_HOME:-$HOME/.local/share}/antidote (relative XDG values fall back to the default)",
+      "status": "redirected",
+      "evidence": "isolated zsh -i: 9 bundles cloned under <XDG_DATA_HOME>/antidote; nothing written under zsh/ of the checkout copy",
+      "checks": [
+        {
+          "file": "zsh/zshrc",
+          "require": [
+            "export ANTIDOTE_HOME=\"\\$_xdg_data/antidote\""
+          ],
+          "forbid": [
+            "ANTIDOTE_HOME=\"\\$HOME/\\.zsh/"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "antidote-static-bundle",
+      "entrypoint": "zshrc _antidote_compile_bundles, antidote-reset",
+      "before": "ANTIDOTE_BUNDLE=$HOME/.zsh/antidote.bundled.zsh -> <checkout>/zsh/antidote.bundled.zsh (gitignored)",
+      "after": "ANTIDOTE_BUNDLE=${XDG_CACHE_HOME:-$HOME/.cache}/zsh/antidote.bundled.zsh (directory created on demand); antidote-reset removes it there",
+      "status": "redirected",
+      "checks": [
+        {
+          "file": "zsh/zshrc",
+          "require": [
+            "export ANTIDOTE_BUNDLE=\"\\$_xdg_cache/zsh/antidote\\.bundled\\.zsh\"",
+            "mkdir -p \"\\$\\{ANTIDOTE_BUNDLE:h\\}\""
+          ],
+          "forbid": [
+            "ANTIDOTE_BUNDLE=\"\\$HOME/\\.zsh/"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "antidote-self-update",
+      "entrypoint": "antidote update (no flags) / antidote update --self",
+      "before": "antidote 1.9.2 self-update runs `git -C <antidote dir> pull` only when <antidote dir>/.git is a directory",
+      "after": "unchanged code; inert because the pinned submodule zsh/antidote has a .git gitfile, so it prints 'Self updating is disabled in this build.' Installer must keep antidote as a gitfile submodule (or without any .git directory)",
+      "status": "inert",
+      "owner": "installer lane (bin/dotfiles, install.py, etc/*)",
+      "evidence": "isolated zsh -i with antidote 16e88d93 as gitfile checkout: 'antidote update' updated bundles only and reported self-update disabled"
+    },
+    {
+      "id": "zsh-recovery-guidance",
+      "entrypoint": "zshrc message when antidote.zsh is missing",
+      "before": "told the user to run `cd ~/.dotfiles && python install.py` or `git submodule update --init --recursive` inside the checkout",
+      "after": "tells the user to run `dotfiles repair` (installer restores the installed generation's pinned submodules)",
+      "status": "redirected",
+      "checks": [
+        {
+          "file": "zsh/zshrc",
+          "require": [
+            "\\$ dotfiles repair"
+          ],
+          "forbid": [
+            "cd ~/\\.dotfiles && (python|git)"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "zsh-compdump-history",
+      "entrypoint": "prezto completion/history modules, zlogin zcompile",
+      "before": "${XDG_CACHE_HOME:-~/.cache}/prezto/{zcompdump,zcompcache,fasd-cache.zsh}; ~/.zcompdump(.zwc) from zlogin; HISTFILE=${HISTFILE:-~/.zsh_history} (ZDOTDIR unset)",
+      "after": "unchanged (outside the checkout)",
+      "status": "outside-checkout",
+      "evidence": "isolated zsh -l -i: writes only under HOME and XDG cache"
+    },
+    {
+      "id": "p10k-caches",
+      "entrypoint": "powerlevel10k instant prompt and gitstatus",
+      "before": "${XDG_CACHE_HOME:-~/.cache}/p10k-instant-prompt-*.zsh and ${XDG_CACHE_HOME:-~/.cache}/gitstatus/",
+      "after": "unchanged (outside the checkout)",
+      "status": "outside-checkout"
+    },
+    {
+      "id": "p10k-configure",
+      "entrypoint": "user-invoked `p10k configure`",
+      "before": "writes ~/.p10k.zsh and, only after an interactive confirmation, appends a source line to ~/.zshrc; with ~/.zshrc linked to tracked zsh/zshrc that would edit tracked source",
+      "after": "covered by shell-rc-appenders: once ~/.zshrc is a machine-owned copy, an accepted append lands in that copy, never in tracked zsh/zshrc",
+      "status": "installer-delegation",
+      "owner": "integrator (manifests/managed-paths.json)"
+    },
+    {
+      "id": "fasd-data",
+      "entrypoint": "fasd hooks",
+      "before": "_FASD_DATA default ~/.fasd; fasd binary link ~/.local/bin/fasd -> zsh/fasd/fasd (read-only)",
+      "after": "unchanged (outside the checkout)",
+      "status": "outside-checkout"
+    },
+    {
+      "id": "fzf-clone",
+      "entrypoint": "legacy install.py post-action, vim-plug Plug 'junegunn/fzf' {'dir': '~/.fzf'}; formerly zshrc sourced ~/.fzf.zsh and prepended ~/.fzf/bin",
+      "before": "~/.fzf clone plus `./install --all --no-update-rc` (writes ~/.fzf.zsh/~/.fzf.bash, never ~/.zshrc)",
+      "after": "zshrc evaluates `fzf --zsh` from the fzf on $PATH (the installer's pinned fzf, first on $PATH via zshenv) and no longer reads ~/.fzf; an existing ~/.fzf clone is left alone (outside the checkout)",
+      "status": "outside-checkout",
+      "owner": "installer lane (bin/dotfiles, install.py, etc/*)",
+      "checks": [
+        {
+          "file": "zsh/zshrc",
+          "require": [
+            "command fzf --zsh"
+          ],
+          "forbid": [
+            "source ~/\\.fzf\\.zsh",
+            "\\$HOME/\\.fzf/bin \\$path"
+          ]
+        },
+        {
+          "file": "zsh/zshenv",
+          "require": [
+            "personal-dotfiles/bin"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "fast-theme",
+      "entrypoint": "zshrc `fast-theme` (only when _ANTIDOTE_SAVING is non-empty, i.e. never by default)",
+      "before": "F-Sy-H writes theme state to FAST_WORK_DIR (defaults to its plugin dir inside ANTIDOTE_HOME)",
+      "after": "follows ANTIDOTE_HOME to ${XDG_DATA_HOME:-$HOME/.local/share}/antidote",
+      "status": "outside-checkout"
+    },
+    {
+      "id": "lazy-plugin-root",
+      "entrypoint": "nvim startup (lazy.nvim bootstrap clone, install.missing), :Lazy install/update/sync/build",
+      "before": "root=$HOME/.vim/plugged -> <checkout>/vim/plugged (clones and *.cloning markers)",
+      "after": "root=$VIMPLUG=${XDG_DATA_HOME:-$HOME/.local/share}/vim/plugged, computed once in nvim/init.lua (shared with vim-plug); :Lazy clean stays disabled",
+      "status": "redirected",
+      "evidence": "headless nvim with temporary HOME/XDG roots and git network blocked: baseline wrote vim/plugged/*.cloning into the checkout copy; candidate wrote only under <XDG_DATA_HOME>/vim/plugged",
+      "checks": [
+        {
+          "file": "nvim/init.lua",
+          "require": [
+            "vim\\.env\\.VIMPLUG = data_home \\.\\. '/vim/plugged'"
+          ]
+        },
+        {
+          "file": "nvim/lua/config/plugins.lua",
+          "require": [
+            "root = VIMPLUG,"
+          ],
+          "forbid": [
+            "expand\\('\\$HOME/\\.vim/plugged'\\)"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "lazy-lockfile",
+      "entrypoint": "lazy.nvim after install/update/restore",
+      "before": "stdpath('config')/lazy-lock.json = ~/.config/nvim -> <checkout>/nvim/lazy-lock.json (gitignored)",
+      "after": "lockfile=${XDG_DATA_HOME:-$HOME/.local/share}/vim/lazy-lock.json (next to the plugin root)",
+      "status": "redirected",
+      "evidence": "headless nvim: baseline created nvim/lazy-lock.json in the checkout copy; candidate reported lockfile=<XDG_DATA_HOME>/vim/lazy-lock.json and wrote it there",
+      "checks": [
+        {
+          "file": "nvim/lua/config/plugins.lua",
+          "require": [
+            "local LOCKFILE = vim\\.fs\\.dirname\\(VIMPLUG\\) \\.\\. \"/lazy-lock\\.json\"",
+            "lockfile = LOCKFILE,"
+          ]
+        }
+      ],
+      "migration": "Existing checkouts may still hold a gitignored nvim/lazy-lock.json (and vim/plugged/). Nothing reads the old path any more; the installer should move nvim/lazy-lock.json to ${XDG_DATA_HOME:-$HOME/.local/share}/vim/lazy-lock.json only when the new file is absent, so the pinned plugin revisions survive the switch (otherwise the first :Lazy sync records fresh ones).",
+      "owner": "installer lane (bin/dotfiles, install.py, etc/*)"
+    },
+    {
+      "id": "lazy-state-cache",
+      "entrypoint": "lazy.nvim state/readme/rocks, vim.loader",
+      "before": "stdpath('state')/lazy/*, stdpath('data')/lazy-rocks, stdpath('cache')/nvim/luac",
+      "after": "unchanged (outside the checkout)",
+      "status": "outside-checkout"
+    },
+    {
+      "id": "nvim-data-writers",
+      "entrypoint": "mason.nvim, nvim-treesitter, :UpdateRemotePlugins, shada/undo/log",
+      "before": "stdpath('data')/mason, stdpath('data')/treesitter, ~/.local/share/nvim/rplugin.vim, stdpath('state')/{shada,undo,*.log}",
+      "after": "unchanged (outside the checkout)",
+      "status": "outside-checkout"
+    },
+    {
+      "id": "vim-plug-plugins",
+      "entrypoint": "vim startup (PlugInstall --sync when missing), :PlugInstall/:PlugUpdate/:PlugClean",
+      "before": "g:plug_home=~/.vim/plugged -> <checkout>/vim/plugged",
+      "after": "g:plug_home=$VIMPLUG=${XDG_DATA_HOME:-~/.local/share}/vim/plugged",
+      "status": "redirected",
+      "evidence": "headless vim with temporary HOME/XDG roots: plug_home=<XDG_DATA_HOME>/vim/plugged; no file written in the checkout copy",
+      "checks": [
+        {
+          "file": "vim/plugins.vim",
+          "require": [
+            "let \\$VIMPLUG = \\(\\$XDG_DATA_HOME =~# '\\^/' \\? \\$XDG_DATA_HOME : expand\\('~/\\.local/share'\\)\\) \\. '/vim/plugged'"
+          ],
+          "forbid": [
+            "let \\$VIMPLUG='~/\\.vim/plugged'"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "vim-plug-upgrade",
+      "entrypoint": ":PlugUpgrade",
+      "before": "rewrites s:me = resolve(plug.vim), i.e. the tracked submodule file vim/bundle/vim-plug/plug.vim",
+      "after": "command overridden after plug#end() to an error that points at `dotfiles update`",
+      "status": "redirected",
+      "evidence": "headless vim: `command PlugUpgrade` shows the override",
+      "checks": [
+        {
+          "file": "vim/plugins.vim",
+          "require": [
+            "command! -nargs=0 -bar PlugUpgrade echoerr"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "vim-plug-autoload-link",
+      "entrypoint": "legacy install.py task '~/.vim/autoload/plug.vim'",
+      "before": "symlink created at <checkout>/vim/autoload/plug.vim because ~/.vim links to vim/",
+      "after": "plugins.vim sources vim/bundle/vim-plug/plug.vim directly when no autoload/plug.vim is on 'runtimepath'; the installer must not create the link",
+      "status": "installer-delegation",
+      "owner": "installer lane (bin/dotfiles, install.py, etc/*)",
+      "evidence": "headless vim on a checkout copy without the link: plug#begin worked",
+      "checks": [
+        {
+          "file": "vim/plugins.vim",
+          "require": [
+            "bundle/vim-plug/plug\\.vim"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "python-bytecode",
+      "entrypoint": "UltiSnips snippets `import px` (nvim/pythonx/px)",
+      "before": "<checkout>/nvim/pythonx/px/__pycache__/*.pyc",
+      "after": "UltiSnips config sets sys.pycache_prefix (unless already set) to stdpath('cache')/pycache before any snippet imports px",
+      "status": "redirected",
+      "evidence": "python3 import of px: baseline created px/__pycache__; with the prefix no __pycache__ appeared in the checkout. In-editor UltiSnips path UNVERIFIED (needs pynvim + UltiSnips)",
+      "notes": "python/pythonrc.py and ptpython config are exec'd, not imported, so they write no bytecode.",
+      "checks": [
+        {
+          "file": "nvim/lua/plugins/ide.lua",
+          "require": [
+            "sys\\.pycache_prefix = sys\\.pycache_prefix or"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "spellfile",
+      "entrypoint": "user `zg`/`zw` in vim or nvim",
+      "before": "default 'spellfile' is the first writable 'runtimepath' dir: ~/.config/nvim/spell or ~/.vim/spell -> <checkout>/nvim/spell, vim/spell (gitignored)",
+      "after": "unchanged",
+      "status": "open-question",
+      "notes": "Redirecting needs a 'spellfile' under XDG data plus migration of existing word lists; left for review."
+    },
+    {
+      "id": "netrw-history",
+      "entrypoint": "vim netrw browsing (nvim disables netrw)",
+      "before": "g:netrw_home defaults to the first 'runtimepath' dir ~/.vim -> <checkout>/vim/.netrwhist",
+      "after": "unchanged",
+      "status": "open-question",
+      "notes": "Not observed in the headless run; setting g:netrw_home to XDG data would close it."
+    },
+    {
+      "id": "user-local-overrides",
+      "entrypoint": "user-created local files read from the checkout",
+      "before": "nvim/lua/config/local.lua, nvim/lua/plugins/local.lua, vim/plugins.local.vim, zsh/zsh.d/*.local.zsh (all gitignored)",
+      "after": "unchanged",
+      "status": "open-question",
+      "notes": "Not runtime writers, but user state stored inside the checkout; the installer must preserve or relocate them across generations."
+    },
+    {
+      "id": "dotfiles-update",
+      "entrypoint": "bin/dotfiles update [--fast|--skip-zplug|--skip-vimplug]",
+      "before": "cd ~/.dotfiles; git fetch origin; git stash push; git merge --ff-only; python3 install.py; git stash pop (direct mutation of the live checkout)",
+      "after": "must delegate to the installer update transaction (staged fetch, verification, promotion, rollback)",
+      "status": "installer-delegation",
+      "owner": "installer lane (bin/dotfiles, install.py, etc/*)"
+    },
+    {
+      "id": "dotfiles-install",
+      "entrypoint": "bin/dotfiles install <target> [--force]",
+      "before": "runs ./etc/linux-locals.sh install_<target> with cwd ~/.dotfiles; writes ~/.local and ${TMPDIR:-/tmp}/$USER/linux-locals, not the checkout",
+      "after": "must delegate to the installer package phase for manifest-allowed targets only",
+      "status": "installer-delegation",
+      "owner": "installer lane (bin/dotfiles, install.py, etc/*)"
+    },
+    {
+      "id": "dotfiles-repair",
+      "entrypoint": "bin/dotfiles repair (referenced by zsh/zshrc and tmux/tmux.conf messages)",
+      "before": "does not exist yet",
+      "after": "must restore the installed generation's declared pins: checkout submodules (antidote, fasd, vim-plug) and the external TPM + tmux plugins, without upgrading",
+      "status": "installer-delegation",
+      "owner": "installer lane (bin/dotfiles, install.py, etc/*)"
+    },
+    {
+      "id": "legacy-install-py",
+      "entrypoint": "python install.py",
+      "before": "git submodule update --init in the checkout, symlinks (incl. ~/.vim/autoload/plug.vim inside the checkout), antidote update+reset, ~/.tmux/plugins/tpm/bin/install_plugins, lazy update, rm ~/.vim/plugged/*.cloning, etc/terminfo.sh",
+      "after": "replaced by the installer",
+      "status": "installer-delegation",
+      "owner": "installer lane (bin/dotfiles, install.py, etc/*)"
+    },
+    {
+      "id": "legacy-bootstrap",
+      "entrypoint": "etc/install",
+      "before": "git clone --recursive into ~/.dotfiles, then install.py",
+      "after": "unchanged layout (git clone --recursive into ~/.dotfiles, then python3 install.py), plus prerequisite bootstrap and moving an unrelated ~/.dotfiles aside to a pre-install backup",
+      "status": "installer-delegation",
+      "owner": "installer lane (bin/dotfiles, install.py, etc/*)"
+    },
+    {
+      "id": "terminfo",
+      "entrypoint": "etc/terminfo.sh install (zshrc hint)",
+      "before": "tic -x -o ~/.terminfo",
+      "after": "unchanged (outside the checkout)",
+      "status": "outside-checkout"
+    },
+    {
+      "id": "gitconfig-global-writes",
+      "entrypoint": "`git config --global ...` (user.name/email, credential helpers, `gh auth setup-git`, IDEs, git-lfs install)",
+      "before": "~/.gitconfig -> <checkout>/git/gitconfig (link): every --global write edits the tracked file",
+      "after": "~/.gitconfig is a regular, machine-owned file installed from git/gitconfig.stub; it [include]s ~/.dotfiles/git/gitconfig, so --global writes land in the stub; identity goes to ~/.gitconfig.secret (included at the end of git/gitconfig)",
+      "status": "installer-delegation",
+      "owner": "integrator (manifests/managed-paths.json): gitconfig entry symlink git/gitconfig -> copy git/gitconfig.stub; install only when absent or still the old link, never overwrite a stub the user or tools edited",
+      "checks": [
+        {
+          "file": "git/gitconfig.stub",
+          "require": [
+            "path = ~/\\.dotfiles/git/gitconfig",
+            "git config --file ~/\\.gitconfig\\.secret"
+          ]
+        },
+        {
+          "file": "git/gitconfig",
+          "require": [
+            "path = ~/\\.gitconfig\\.secret"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "shell-rc-appenders",
+      "entrypoint": "tool installers and init commands that append to rc files: `conda init`, nvm/rustup/pixi/bun/uv installers, `p10k configure`, `fzf/install`, `broot --install`",
+      "before": "~/.zshrc, ~/.zshenv, ~/.zprofile, ~/.bashrc link to zsh/zshrc, zsh/zshenv, zsh/zprofile, bashrc: appends edit tracked source",
+      "after": "integrator installs these rc files as 'copy' entries (transaction backup/restore on update), so appends stay machine-local; local additions belong in ~/.zshrc.local / ~/.zshenv.local, which zshrc/zshenv source",
+      "status": "installer-delegation",
+      "owner": "integrator (manifests/managed-paths.json): zshrc, zshenv, zprofile, bashrc entries symlink -> copy"
+    },
+    {
+      "id": "pudb-config",
+      "entrypoint": "pudb (preferences dialog; rewrites the file when saving settings or after a version change)",
+      "before": "~/.config/pudb/pudb.cfg -> <checkout>/config/pudb/pudb.cfg (link): rewrites edit tracked source",
+      "after": "integrator installs pudb.cfg as a 'copy' entry",
+      "status": "installer-delegation",
+      "owner": "integrator (manifests/managed-paths.json): pudb entry symlink -> copy"
+    },
+    {
+      "id": "terminator-config",
+      "entrypoint": "Terminator Preferences dialog (saves ~/.config/terminator/config)",
+      "before": "~/.config/terminator -> <checkout>/config/terminator (directory link): saves edit tracked config/terminator/config",
+      "after": "integrator installs config/terminator/config as a 'copy' of the file (not a directory link)",
+      "status": "installer-delegation",
+      "owner": "integrator (manifests/managed-paths.json): terminator entry symlink(dir) -> copy {config}/terminator/config"
+    },
+    {
+      "id": "python-bytecode-checkout",
+      "entrypoint": "python imports of modules inside the checkout: bin/dotfiles and etc/install -> install.py -> installer/*.py; tests importing tools/, tmux/resurrect-ai-session.py, desktop/input-remapper/",
+      "before": "__pycache__/ under installer/, tools/, tmux/, desktop/, tests/ of the checkout (gitignored, but writes into installer-owned source)",
+      "after": "install.py sets sys.dont_write_bytecode before importing installer/ and bin/dotfiles runs it with -B; zsh/ and tmux.conf start no python from the checkout; resurrect.conf runs resurrect-ai-session.py as a script (a __main__ script writes no bytecode). Test runners must use python -B / PYTHONDONTWRITEBYTECODE=1",
+      "status": "redirected",
+      "evidence": "static: markers below. Dev-time test runs without -B still create __pycache__ (seen for tests/unit, tmux/, tools/, installer/ during the parallel lane work)",
+      "checks": [
+        {
+          "file": "install.py",
+          "require": [
+            "sys\\.dont_write_bytecode = True"
+          ]
+        },
+        {
+          "file": "bin/dotfiles",
+          "require": [
+            "sys\\.dont_write_bytecode = True",
+            "'-B'"
+          ]
+        },
+        {
+          "file": "zsh/zshrc",
+          "forbid": [
+            "python3? [^\\n]*\\.dotfiles/(installer|tools|tmux)/"
+          ]
+        },
+        {
+          "file": "tmux/tmux.conf",
+          "forbid": [
+            "python3? [^\\n]*\\.dotfiles/"
+          ]
+        }
+      ]
+    }
+  ]
+}

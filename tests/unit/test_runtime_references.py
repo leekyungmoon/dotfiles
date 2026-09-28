@@ -1,0 +1,438 @@
+"""Static audit of runtime references into the dotfiles checkout.
+
+``manifests/runtime-references.json`` is the reviewed inventory of every place
+where executable/config sources reach the installed checkout through the
+``~/.dotfiles`` compatibility link, use a DOTFILES-style identifier, or name
+one of the old mutable roots that used to live inside the checkout (plugin
+clones, generated bundles, lockfiles). It also records the runtime writers and
+where they write.
+
+The checkout is installer-owned source, so this test fails when:
+
+- a scanned file gains a reference that the manifest does not list;
+- a listed reference no longer exists (the inventory went stale);
+- a reference is classified as a comment but is executable, or the reverse;
+- a writer's redirection marker disappears or its old in-checkout path returns.
+
+To accept a new reference, add an entry with its exact stripped line text, a
+classification and a purpose; the failure message prints a ready-made entry.
+"""
+
+from __future__ import annotations
+
+import collections
+import fnmatch
+import json
+import os
+import re
+import subprocess
+import unittest
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+MANIFEST_PATH = REPO_ROOT / "manifests" / "runtime-references.json"
+
+# Each kind of reference the audit looks for. A line may match several kinds;
+# each (line, kind) pair must be covered by its own manifest entry.
+KIND_PATTERNS = {
+    # ~/.dotfiles, $HOME/.dotfiles, ${HOME}/.dotfiles, systemd's %h/.dotfiles
+    # (the compatibility link)
+    "link": re.compile(r"(?:~|\$HOME|\$\{HOME\}|%h)/\.dotfiles(?![\w.-])"),
+    # DOTFILES_UPDATE, DOTFILES_TMPDIR, _dotfiles_bin_dir, dotfiles_dir, ...
+    # plus $DOTFILES / ${DOTFILES} / $DOTVIM style variables and the bare
+    # DOTFILES / DOTVIM names (e.g. `export DOTVIM=...`, vim's $DOTVIM)
+    "identifier": re.compile(
+        r"(?<![\w-])_?(?:DOTFILES|dotfiles)_[A-Za-z0-9_]+"
+        r"|(?<![\w-])\$\{?_?(?:DOTFILES|DOTVIM|dotfiles)\w*"
+        r"|(?<![\w$-])(?:DOTFILES|DOTVIM)(?![\w-])"
+    ),
+    # mutable roots that used to be written inside the checkout through the
+    # repository-backed ~/.vim, ~/.zsh, ~/.tmux and ~/.config/nvim links
+    "legacy-mutable-root": re.compile(
+        r"(?:(?:~|\$HOME|\$\{HOME\}|\$\{ZDOTDIR:-\$HOME\})/"
+        r"\.(?:vim/plugged|zsh/antidote-plugins|zsh/antidote\.bundled\.zsh"
+        r"|tmux/plugins|tmux/resurrect|config/nvim/lazy-lock\.json))(?![\w.-])"
+        r"|\.dotfiles/vim/plugged(?![\w.-])"
+    ),
+}
+
+CLASSIFICATIONS = {
+    # executable/config dependency that intentionally resolves through the link
+    "runtime-link",
+    # executable line that only shows the path to the user (echo, notify, help)
+    "guidance",
+    # comment or example text in an executable/config file
+    "comment",
+    # prose in a non-executed document shipped inside a config directory
+    "documentation",
+    # an identifier that merely contains DOTFILES; not a path
+    "identifier",
+    # executable reference in a file another lane owns; must change there
+    "pending-owner-change",
+}
+EXECUTABLE_CLASSES = {"runtime-link", "guidance", "identifier", "pending-owner-change"}
+DOC_SUFFIXES = {".md", ".txt"}
+
+
+SYSTEMD_SUFFIXES = {".service", ".timer", ".socket", ".target", ".path", ".mount"}
+
+
+def comment_style(path: str):
+    """Return (line prefixes, block comment support) for a repository path."""
+    name = os.path.basename(path)
+    suffix = os.path.splitext(name)[1]
+    if suffix == ".lua":
+        return ("--",), True
+    if suffix == ".vim" or name in ("vimrc", "gvimrc"):
+        return ('"',), False
+    if suffix == ".scm":
+        return (";",), False
+    if suffix == ".json":
+        return (), False
+    if suffix in SYSTEMD_SUFFIXES or suffix == ".ini":
+        return ("#", ";"), False
+    return ("#",), False
+
+
+def is_python(path: str, text: str) -> bool:
+    if path.endswith(".py"):
+        return True
+    first = text.split("\n", 1)[0]
+    return first.startswith("#!") and "python" in first
+
+
+_LUA_BLOCK_OPEN = re.compile(r"^\s*--\[(=*)\[")
+_PY_TRIPLE = re.compile(r'"""|\'\'\'')
+_PY_DOCSTRING_OPEN = re.compile(r'^\s*[rRuU]?("""|\'\'\')')
+
+
+def classify_lines(path: str, text: str):
+    """Yield (stripped line, is_comment) for every line of a file.
+
+    Python docstrings (a triple-quoted string that starts a line) count as
+    comments; other triple-quoted string literals stay executable.
+    """
+    prefixes, lua_blocks = comment_style(path)
+    python = is_python(path, text)
+    block_close = None
+    py_string = None  # (closing quote, is docstring) inside a triple-quoted string
+    for raw in text.splitlines():
+        line = raw.strip()
+        if py_string is not None:
+            yield line, py_string[1]
+            if py_string[0] in raw:
+                py_string = None
+            continue
+        if block_close is not None:
+            yield line, True
+            if block_close in raw:
+                block_close = None
+            continue
+        if python:
+            quote = _PY_TRIPLE.search(raw)
+            if quote and "#" not in raw[:quote.start()]:
+                docstring = bool(_PY_DOCSTRING_OPEN.match(raw))
+                if quote.group(0) not in raw[quote.end():]:
+                    py_string = (quote.group(0), docstring)
+                if docstring:
+                    yield line, True
+                    continue
+        if lua_blocks:
+            match = _LUA_BLOCK_OPEN.match(raw)
+            if match:
+                close = "]" + match.group(1) + "]"
+                if close not in raw[match.end():]:
+                    block_close = close
+                yield line, True
+                continue
+        yield line, bool(prefixes) and line.startswith(prefixes)
+
+
+def submodule_paths(repo: Path):
+    gitmodules = repo / ".gitmodules"
+    if not gitmodules.exists():
+        return set()
+    return set(re.findall(r"^\s*path\s*=\s*(\S+)\s*$", gitmodules.read_text(), re.M))
+
+
+def exclude_patterns(excludes):
+    """Exclude entries are {"pattern", "reason"} objects (or bare patterns)."""
+    return [e["pattern"] if isinstance(e, dict) else e for e in excludes]
+
+
+def is_excluded(rel: str, patterns) -> bool:
+    """fnmatch patterns ('*' also matches '/'); a pattern ending in '/' is a dir."""
+    for pattern in patterns:
+        if pattern.endswith("/"):
+            if rel.startswith(pattern):
+                return True
+        elif fnmatch.fnmatchcase(rel, pattern):
+            return True
+    return False
+
+
+def candidate_files(repo: Path, roots, excludes):
+    """Tracked plus untracked-but-not-ignored files under the scan roots."""
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(repo), "ls-files", "-z", "--cached", "--others",
+             "--exclude-standard", "--", *roots],
+            check=True, capture_output=True,
+        ).stdout.decode("utf-8", "surrogateescape")
+        paths = sorted({p for p in out.split("\0") if p})
+    except (OSError, subprocess.CalledProcessError):
+        paths = []
+        for root in roots:
+            base = repo / root
+            if base.is_file():
+                paths.append(root)
+                continue
+            for dirpath, dirnames, filenames in os.walk(base):
+                dirnames[:] = [d for d in dirnames if d != ".git"]
+                for filename in filenames:
+                    paths.append(os.path.relpath(os.path.join(dirpath, filename), repo))
+        paths.sort()
+    skipped = submodule_paths(repo)
+    patterns = exclude_patterns(excludes)
+    for rel in paths:
+        if any(rel == s or rel.startswith(s.rstrip("/") + "/") for s in skipped):
+            continue
+        if is_excluded(rel, patterns):
+            continue
+        full = repo / rel
+        if full.is_symlink() or not full.is_file():
+            continue
+        try:
+            text = full.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            continue
+        yield rel, text
+
+
+def scan(repo: Path, manifest):
+    """Return Counter[(file, line, kind)] -> occurrences, plus comment flags."""
+    scope = manifest["scan"]
+    found = collections.Counter()
+    is_comment = {}
+    for rel, text in candidate_files(repo, scope["roots"], scope.get("exclude", [])):
+        for line, comment in classify_lines(rel, text):
+            for kind, pattern in KIND_PATTERNS.items():
+                if pattern.search(line):
+                    key = (rel, line, kind)
+                    found[key] += 1
+                    is_comment[key] = comment
+    return found, is_comment
+
+
+def load_manifest():
+    with MANIFEST_PATH.open(encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def resolve_line(entry, found):
+    """The full line an entry stands for.
+
+    ``"match": "prefix"`` entries quote only the start of the line (used where
+    the rest must not be copied into this public inventory); the prefix must
+    identify exactly one scanned line of that file and kind.
+    """
+    if entry.get("match", "exact") == "exact":
+        return entry["line"]
+    lines = sorted({line for (rel, line, kind) in found
+                    if rel == entry["file"] and kind == entry["kind"]
+                    and line.startswith(entry["line"])})
+    return lines[0] if len(lines) == 1 else None
+
+
+class RuntimeReferenceInventoryTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.manifest = load_manifest()
+        cls.found, cls.is_comment = scan(REPO_ROOT, cls.manifest)
+        cls.expected = collections.Counter()
+        cls.entries = {}
+        cls.unresolved = []
+        for entry in cls.manifest["references"]:
+            line = resolve_line(entry, cls.found)
+            if line is None:
+                cls.unresolved.append((entry["file"], entry["line"], entry["kind"]))
+                continue
+            key = (entry["file"], line, entry["kind"])
+            cls.expected[key] += int(entry.get("count", 1))
+            cls.entries[key] = entry
+
+    def test_prefix_entries_resolve(self):
+        self.assertFalse(self.unresolved, "prefix entries matching no line, or "
+                                          "more than one: " + json.dumps(self.unresolved))
+
+    def test_entries_are_well_formed(self):
+        seen = set()
+        for entry in self.manifest["references"]:
+            key = (entry["file"], entry["line"], entry["kind"])
+            with self.subTest(entry=key):
+                self.assertNotIn(key, seen, "duplicate entry; use 'count' instead")
+                seen.add(key)
+                self.assertIn(entry["kind"], KIND_PATTERNS)
+                self.assertIn(entry.get("match", "exact"), {"exact", "prefix"})
+                self.assertIn(entry["classification"], CLASSIFICATIONS)
+                self.assertTrue(entry.get("purpose", "").strip(), "purpose is required")
+                resolved = resolve_line(entry, self.found) or entry["line"]
+                self.assertRegex(resolved, KIND_PATTERNS[entry["kind"]])
+                if entry["classification"] == "pending-owner-change":
+                    self.assertTrue(entry.get("owner", "").strip(), "owner is required")
+                if entry["kind"] == "legacy-mutable-root":
+                    self.assertIn(
+                        entry["classification"], {"comment", "pending-owner-change"},
+                        "executable references to in-checkout mutable roots must be "
+                        "redirected, or tracked as pending with an owner")
+
+    def test_every_reference_is_listed(self):
+        missing = []
+        for key, count in sorted(self.found.items()):
+            if self.expected.get(key, 0) < count:
+                rel, line, kind = key
+                missing.append(json.dumps({
+                    "file": rel, "line": line, "kind": kind,
+                    "classification": "comment" if self.is_comment[key] else "runtime-link",
+                    "purpose": "TODO", "count": count,
+                }, ensure_ascii=False))
+        self.assertFalse(missing, "unlisted runtime references:\n" + "\n".join(missing))
+
+    def test_no_stale_entries(self):
+        stale = [
+            key for key, count in sorted(self.expected.items())
+            if self.found.get(key, 0) != count
+        ]
+        self.assertFalse(stale, "manifest entries no longer match the tree "
+                                "(update the line text or count, or remove them): "
+                                + json.dumps(stale, ensure_ascii=False, indent=1))
+
+    def test_comment_classification_matches_syntax(self):
+        for key, entry in sorted(self.entries.items()):
+            if key not in self.is_comment:
+                continue  # reported by test_no_stale_entries
+            rel = key[0]
+            with self.subTest(entry=key):
+                cls = entry["classification"]
+                if cls == "documentation":
+                    self.assertIn(os.path.splitext(rel)[1], DOC_SUFFIXES)
+                elif cls == "comment":
+                    self.assertTrue(self.is_comment[key], "classified as comment but executable")
+                elif cls in EXECUTABLE_CLASSES:
+                    self.assertFalse(self.is_comment[key], "executable class on a comment line")
+
+    def test_scan_scope(self):
+        """Everything is scanned except a short, justified exclude list."""
+        scope = self.manifest["scan"]
+        self.assertEqual(scope["roots"], ["."])
+        try:
+            listed = subprocess.run(
+                ["git", "-C", str(REPO_ROOT), "ls-files", "--cached", "--others",
+                 "--exclude-standard"], check=True, capture_output=True, text=True,
+            ).stdout.split("\n")
+        except (OSError, subprocess.CalledProcessError):
+            self.skipTest("git is not available")
+        for entry in scope["exclude"]:
+            with self.subTest(exclude=entry):
+                self.assertIsInstance(entry, dict)
+                self.assertTrue(entry.get("reason", "").strip(), "reason is required")
+                self.assertTrue(
+                    any(is_excluded(rel, [entry["pattern"]]) for rel in listed if rel),
+                    "exclude pattern matches no file (stale)")
+
+    def test_manifest_is_public_safe(self):
+        text = MANIFEST_PATH.read_text(encoding="utf-8")
+        self.assertNotRegex(text, r"/home/[^/\s\"]+|/Users/[^/\s\"]+")
+
+
+class RuntimeWriterAuditTests(unittest.TestCase):
+    """Each retained writer keeps its redirection out of the checkout."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.manifest = load_manifest()
+
+    def test_writers_are_well_formed(self):
+        ids = set()
+        for writer in self.manifest["writers"]:
+            with self.subTest(writer=writer.get("id")):
+                self.assertNotIn(writer["id"], ids)
+                ids.add(writer["id"])
+                for field in ("entrypoint", "before", "after", "status"):
+                    self.assertTrue(str(writer.get(field, "")).strip(), field)
+                self.assertIn(writer["status"], {
+                    "redirected", "outside-checkout", "installer-delegation",
+                    "pending-owner-change", "open-question", "inert"})
+                if writer["status"] in {"installer-delegation", "pending-owner-change"}:
+                    self.assertTrue(writer.get("owner", "").strip(), "owner is required")
+
+    def test_writer_markers(self):
+        for writer in self.manifest["writers"]:
+            for check in writer.get("checks", []):
+                path = REPO_ROOT / check["file"]
+                with self.subTest(writer=writer["id"], file=check["file"]):
+                    text = path.read_text(encoding="utf-8")
+                    for needle in check.get("require", []):
+                        self.assertRegex(text, needle)
+                    for needle in check.get("forbid", []):
+                        self.assertNotRegex(text, needle)
+
+
+class CommentDetectionTests(unittest.TestCase):
+    def test_hash_comments(self):
+        lines = list(classify_lines("zsh/zshrc", "# see ~/.dotfiles\necho ~/.dotfiles\n"))
+        self.assertEqual(lines, [("# see ~/.dotfiles", True), ("echo ~/.dotfiles", False)])
+
+    def test_vim_comments(self):
+        lines = list(classify_lines("vim/vimrc", '" see ~/.dotfiles\ncd ~/.dotfiles\n'))
+        self.assertEqual([c for _, c in lines], [True, False])
+
+    def test_lua_block_comment(self):
+        text = "--[[\n  nvim -u ~/.dotfiles/x\n]]\nlocal x = '~/.dotfiles'\n"
+        self.assertEqual([c for _, c in classify_lines("a.lua", text)], [True, True, True, False])
+
+    def test_lua_single_line_block(self):
+        text = "--[[ one line ]]\nprint(1)\n"
+        self.assertEqual([c for _, c in classify_lines("a.lua", text)], [True, False])
+
+    def test_python_docstrings(self):
+        text = '#!/usr/bin/env python3\n"""Doc ~/.dotfiles\nmore\n"""\nx = "~/.dotfiles"\n'
+        self.assertEqual([c for _, c in classify_lines("bin/tool", text)],
+                         [True, True, True, True, False])
+        self.assertEqual([c for _, c in classify_lines("a.sh", '"""\nx\n')], [False, False])
+        text = "x = '''\n~/.dotfiles\n''' % y\nz = '~/.dotfiles'\n"
+        self.assertEqual([c for _, c in classify_lines("a.py", text)], [False, False, False, False])
+
+    def test_excludes(self):
+        patterns = ["tests/fixtures/", "*.md"]
+        self.assertTrue(is_excluded("tests/fixtures/a/b.txt", patterns))
+        self.assertTrue(is_excluded("docs/SUPPORT.md", patterns))
+        self.assertTrue(is_excluded("README.md", patterns))
+        self.assertFalse(is_excluded("tests/unit/test_x.py", patterns))
+
+    def test_patterns(self):
+        link = KIND_PATTERNS["link"]
+        self.assertRegex("$HOME/.dotfiles/bin", link)
+        self.assertRegex("${HOME}/.dotfiles", link)
+        self.assertRegex("ExecStart=%h/.dotfiles/tmux/resurrect-save", link)
+        self.assertNotRegex("~/.dotfiles.bak", link)
+        ident = KIND_PATTERNS["identifier"]
+        self.assertRegex("DOTFILES_UPDATE=1", ident)
+        self.assertNotRegex("personal-dotfiles_x", ident)
+        self.assertRegex("source $DOTVIM/init.lua", ident)
+        self.assertRegex("cd ${DOTFILES}/bin", ident)
+        self.assertRegex("export DOTFILES=~/x", ident)
+        self.assertRegex("See $DOTVIM/lua", ident)
+        self.assertNotRegex("personal-dotfiles", ident)
+        self.assertNotRegex("DOTFILESX", ident)
+        legacy = KIND_PATTERNS["legacy-mutable-root"]
+        self.assertRegex('ls "$HOME/.vim/plugged"', legacy)
+        self.assertRegex("~/.tmux/plugins/tpm/tpm", legacy)
+        self.assertNotRegex("$XDG_DATA_HOME/vim/plugged", legacy)
+        self.assertRegex('d="$HOME/.tmux/resurrect"', legacy)
+        self.assertNotRegex("source-file -q ~/.tmux/resurrect.conf", legacy)
+        self.assertNotRegex("~/.tmux/resurrect-save", legacy)
+
+
+if __name__ == "__main__":
+    unittest.main()

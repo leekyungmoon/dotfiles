@@ -16,3 +16,7 @@
 
 email | <commit-metadata> | Co-Authored-By: Claude | AI co-author trailer; vendor noreply address, identifies no person
 generic-secret | tests/test-clipboard-helpers.sh | CLIPBOARD_CANARY_ | synthetic canary payload proving the clipboard helpers never log contents
+email | manifests/packages.json | Linux Packages Signing Authority | UID of Google's public package-signing key, recorded next to the pinned fingerprint
+email | manifests/tools.json | Claude Code Release Signing | UID of Anthropic's public release-signing key, recorded next to the pinned fingerprint
+email | zsh/zshenv | Sorin Ionescu | upstream author credit (prezto) carried over from wookayin/dotfiles
+email | zsh/zshenv | Jongwook Choi | upstream author credit carried over from wookayin/dotfiles
