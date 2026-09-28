@@ -15,19 +15,35 @@ difference between an explicit user value and an unset key (``dconf read``
 prints nothing for an unset key). :func:`restore_gui` returns explicit keys
 with ``gsettings set`` and unset keys with ``gsettings reset``.
 
+Apply, autostart attempts and restore run under an exclusive per-user
+``flock`` on ``gui/gui.lock``, so two runs can never interleave their
+reads and writes of the backups (a slower run would otherwise record the
+faster run's installed values as the user's originals). A value that would
+be overwritten without being recoverable from an existing backup (a value
+the user set after an apply or a restore) is saved to a new backup set
+first and reported.
+
 State layout (dirs 0700, files 0600, atomic writes)::
 
+    gui/gui.lock                             exclusive lock of every GUI run
     gui/state.json                           generation, components, keys
     gui/remapper-records.json                adapter restore records per group
     gui/backups/baseline/gsettings.json      first value ever seen per key
     gui/backups/<generation>/gsettings.json  values before that generation
     gui/backups/<generation>/remapper/       files before the adapter wrote them
+    gui/backups/reapply-<ts>/gsettings.json  user values an apply overwrote
+    gui/backups/restore-<ts>/gsettings.json  values a restore overwrote
+    gui/backups/restore-<ts>/remapper/       files a restore replaced
+
+Every ``gsettings.json`` set can be passed to :func:`restore_gui` as the
+``generation`` to return to it.
 """
 
 from __future__ import annotations
 
 import dataclasses
 import datetime
+import fcntl
 import hashlib
 import importlib.util
 import json
@@ -69,6 +85,13 @@ DEADLINE = 65.0
 MIN_CALL_TIMEOUT = 0.5
 TIMEOUTS = {"probe": 5.0, "gsettings": 10.0, "dconf": 5.0, "dpkg": 10.0, "control": 15.0}
 
+# gui/gui.lock: interactive apply and restore wait up to LOCK_WAIT seconds
+# for a concurrent run (an autostart attempt holds it for seconds); an
+# autostart run waits at most until its own deadline.
+LOCK_NAME = "gui.lock"
+LOCK_WAIT = 120.0
+LOCK_POLL = 0.2
+
 # Key / component statuses.
 APPLIED = "applied"
 PENDING = "pending"
@@ -90,6 +113,10 @@ PENDING_GUI = "PENDING_GUI"
 
 class GuiError(Exception):
     """GUI state or inputs cannot be used safely."""
+
+
+class GuiBusy(GuiError):
+    """Another GUI apply, autostart or restore holds ``gui/gui.lock``."""
 
 
 class _DeadlineReached(Exception):
@@ -166,6 +193,58 @@ def _read_json(path: Path, default):
         raise GuiError(f"{path} is corrupted: {exc}") from None
 
 
+class _GuiLock:
+    """Exclusive ``flock`` on ``<gui_root>/gui.lock``, polled up to ``wait`` s.
+
+    ``flock`` locks belong to the open file description, so two runs in one
+    process exclude each other exactly like two processes do.
+    """
+
+    def __init__(self, gui_root: Path, *, wait: float, now: Callable[[], float],
+                 sleep: Callable[[float], None]) -> None:
+        self.path = Path(gui_root) / LOCK_NAME
+        self.wait = max(0.0, float(wait))
+        self.now = now
+        self.sleep = sleep
+        self._fd: int | None = None
+
+    def __enter__(self) -> "_GuiLock":
+        _ensure_dir(self.path.parent)
+        fd = os.open(self.path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+        try:
+            give_up = self.now() + self.wait
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    remaining = give_up - self.now()
+                    if remaining <= 0:
+                        raise GuiBusy(f"another GUI apply or restore holds {self.path}; "
+                                      "run it again when that one has finished") from None
+                    self.sleep(min(LOCK_POLL, remaining))
+        except BaseException:
+            os.close(fd)
+            raise
+        self._fd = fd
+        return self
+
+    def __exit__(self, *exc_info) -> None:
+        if self._fd is not None:
+            try:
+                fcntl.flock(self._fd, fcntl.LOCK_UN)
+            finally:
+                os.close(self._fd)
+                self._fd = None
+
+
+def _stamp(prefix: str) -> str:
+    """Unique backup set name, e.g. ``restore-20260928T150424Z-1a2b3c``."""
+
+    now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    return f"{prefix}-{now}-{secrets.token_hex(3)}"
+
+
 def _tail(data, limit: int = 300) -> str:
     if not data:
         return ""
@@ -230,6 +309,8 @@ class _Ctx:
     now: Callable[[], float]
     deadline_at: float | None
     proc_devices: Path
+    # Things this run did that the user should hear about (see _result).
+    notes: list = dataclasses.field(default_factory=list)
 
     def timeout(self, kind: str) -> float:
         wanted = TIMEOUTS[kind]
@@ -428,6 +509,23 @@ def _load_key_backup(path: Path) -> dict:
     return data
 
 
+def _snapshot(target: str, key: str, dconf_key: str, value: str) -> dict:
+    """Backup record of a ``dconf read`` result (``""`` means unset)."""
+
+    return {
+        "target": target,
+        "key": key,
+        "dconf_key": dconf_key,
+        "explicit": value != "",
+        "value": value if value != "" else None,
+        "recorded": _utc_now(),
+    }
+
+
+def _snap_value(snap: dict) -> tuple:
+    return (True, snap.get("value")) if snap.get("explicit") else (False, None)
+
+
 def _dconf_read(ctx: _Ctx, dconf_key: str):
     """Current explicit value text, ``""`` when unset, None when unreadable."""
 
@@ -508,32 +606,41 @@ def _apply_gnome(ctx: _Ctx, state: dict, generation: str, retry_failed: bool) ->
 
     baseline_path = _backup_file(ctx, "baseline")
     generation_path = _backup_file(ctx, generation)
+    # Read under gui.lock (the caller holds it), so no other run can write
+    # these files between this read and the writes below.
     baseline = _load_key_backup(baseline_path)
     gen_backup = _load_key_backup(generation_path)
+    user_values: dict = {}
     writable = []
     for entry, dconf_key in ready:
         ident = entry["id"]
-        if ident in gen_backup["keys"] and ident in baseline["keys"]:
-            writable.append((entry, dconf_key))
-            continue
+        # Always read the live value: after a restore (or a failed set) the
+        # key may hold a value the user set since, which no backup has yet.
         previous = _dconf_read(ctx, dconf_key)
         if previous is None:
             keys[ident] = _pending_key(entry["value"], "dconf-read-failed")
             continue
-        snapshot = {
-            "target": gsettings_target(entry),
-            "key": entry["key"],
-            "dconf_key": dconf_key,
-            "explicit": previous != "",
-            "value": previous if previous != "" else None,
-            "recorded": _utc_now(),
-        }
+        snapshot = _snapshot(gsettings_target(entry), entry["key"], dconf_key, previous)
         baseline["keys"].setdefault(ident, snapshot)
-        gen_backup["keys"].setdefault(ident, snapshot)
+        known = gen_backup["keys"].setdefault(ident, snapshot)
+        recoverable = {_snap_value(baseline["keys"][ident]), _snap_value(known),
+                       (True, entry["value"])}
+        if _snap_value(snapshot) not in recoverable:
+            user_values[ident] = snapshot
         writable.append((entry, dconf_key))
     if writable:
         _write_json(baseline_path, baseline)
         _write_json(generation_path, gen_backup)
+    if user_values:
+        name = _stamp("reapply")
+        _write_json(_backup_file(ctx, name),
+                    {"schema": STATE_SCHEMA, "keys": user_values, "reason":
+                     "values set since the last apply or restore, before re-applying"})
+        state["saved_user_values"] = {"backup": name, "keys": sorted(user_values),
+                                      "at": _utc_now()}
+        ctx.notes.append(f"{COMPONENT_GNOME}: values set since the last apply or restore "
+                         f"({', '.join(sorted(user_values))}) saved to backup {name} "
+                         "before re-applying")
 
     for entry, dconf_key in writable:
         ident = entry["id"]
@@ -833,7 +940,7 @@ def _mark_deadline(state: dict, components: Iterable[str]) -> None:
 
 
 def _result(state: dict, components: Iterable[str], *, phase: str = "gui",
-            extra: dict | None = None) -> dict:
+            extra: dict | None = None, notes: Iterable[str] = ()) -> dict:
     components = tuple(components)
     reasons: list = []
     any_failed = any_pending = False
@@ -861,12 +968,20 @@ def _result(state: dict, components: Iterable[str], *, phase: str = "gui",
         reasons.append("no GUI component selected")
     else:
         status = PASS
+    notes = list(notes)
+    if notes and status != PENDING_GUI:
+        # A pending result's reasons are what is still to do; keep notes out.
+        reasons += notes
     details = {
         "generation": state.get("generation"),
         "attempts": state.get("attempts", 0),
         "components": {n: state["components"][n] for n in COMPONENTS},
         "keys": {k: v.get("status") for k, v in sorted(state.get("keys", {}).items())},
     }
+    if notes:
+        details["notes"] = notes
+    if state.get("saved_user_values"):
+        details["saved_user_values"] = state["saved_user_values"]
     if extra:
         details.update(extra)
     return {"phase": phase, "status": status, "reasons": reasons, "details": details}
@@ -891,7 +1006,8 @@ def apply_or_defer(target: Target, runner, env: Mapping[str, str], *,
 
     With ``PERSONAL_DOTFILES_GUI_AUTOSTART=1`` in ``env`` this is the login
     autostart mode (:func:`run_autostart`). Interactive runs also retry keys
-    that failed before; autostart runs never do.
+    that failed before; autostart runs never do. The state and backups are
+    read and written under ``gui/gui.lock`` (waiting up to LOCK_WAIT).
     """
 
     env = dict(env)
@@ -905,19 +1021,28 @@ def apply_or_defer(target: Target, runner, env: Mapping[str, str], *,
         ctx = _make_ctx(target, runner, env, platform=platform, components=components,
                         now=now, deadline_at=None, proc_devices=proc_devices)
         generation = generation_id(ctx.platform.release)
-        state, same = _load_state(ctx, generation)
     except (GuiError, PlatformError, OSError, ValueError) as exc:
         return _error("gui", exc, mode="interactive")
-    if same and state.get("restored"):
-        state = _fresh_state(generation, ctx.platform.release)
     try:
-        if _needs_attempt(state, ctx.components, retry_failed=True):
-            _attempt(ctx, state, generation, retry_failed=True)
-        _save_state(ctx, state)
-    except (GuiError, OSError) as exc:
+        with _GuiLock(ctx.gui_root, wait=LOCK_WAIT, now=now, sleep=sleep):
+            state, same = _load_state(ctx, generation)
+            if same and state.get("restored"):
+                state = _fresh_state(generation, ctx.platform.release)
+            if _needs_attempt(state, ctx.components, retry_failed=True):
+                _attempt(ctx, state, generation, retry_failed=True)
+            _save_state(ctx, state)
+    except GuiBusy as exc:
+        return _error("gui", exc, mode="interactive", busy=True)
+    except (GuiError, OSError, ValueError) as exc:
         return _error("gui", exc, mode="interactive")
-    return _result(state, ctx.components,
+    return _result(state, ctx.components, notes=ctx.notes,
                    extra={"mode": "interactive", "state_path": str(_state_path(ctx))})
+
+
+def _handled(state: dict, same: bool, components: Iterable[str]) -> bool:
+    """True when autostart has nothing to do for this generation."""
+
+    return same and bool(state.get("restored") or not _needs_attempt(state, components, False))
 
 
 def run_autostart(target: Target, runner, env: Mapping[str, str], *,
@@ -926,7 +1051,12 @@ def run_autostart(target: Target, runner, env: Mapping[str, str], *,
                   platform: Platform | None = None,
                   components: Iterable[str] | None = None,
                   proc_devices: Path = PROC_INPUT_DEVICES) -> dict:
-    """Login mode: retry readiness gaps at RETRY_OFFSETS within DEADLINE."""
+    """Login mode: retry readiness gaps at RETRY_OFFSETS within DEADLINE.
+
+    Each attempt takes ``gui/gui.lock`` and re-reads the state under it; the
+    lock is released while waiting for the next offset, so a manual
+    ``gui-apply`` is never blocked for the whole schedule.
+    """
 
     start = now()
     deadline_at = start + DEADLINE
@@ -934,15 +1064,17 @@ def run_autostart(target: Target, runner, env: Mapping[str, str], *,
         ctx = _make_ctx(target, runner, env, platform=platform, components=components,
                         now=now, deadline_at=deadline_at, proc_devices=proc_devices)
         generation = generation_id(ctx.platform.release)
+        # Unlocked peek (state.json is replaced atomically): skip cheaply.
         state, same = _load_state(ctx, generation)
     except (GuiError, PlatformError, OSError, ValueError) as exc:
         return _error("gui", exc, mode="autostart")
-    if same and (state.get("restored") or not _needs_attempt(state, ctx.components, False)):
+    if _handled(state, same, ctx.components):
         return _result(state, ctx.components,
                        extra={"mode": "autostart", "tries": 0,
                               "skipped": "generation already handled"})
 
     tries = 0
+    busy = None
     try:
         for offset in RETRY_OFFSETS:
             at = start + offset
@@ -953,32 +1085,59 @@ def run_autostart(target: Target, runner, env: Mapping[str, str], *,
                 sleep(wait)
             if now() >= deadline_at:
                 break
-            tries += 1
+            reached = False
             try:
-                _attempt(ctx, state, generation, retry_failed=False)
-            except _DeadlineReached:
+                with _GuiLock(ctx.gui_root, wait=deadline_at - now(), now=now, sleep=sleep):
+                    state, same = _load_state(ctx, generation)
+                    if _handled(state, same, ctx.components):
+                        break  # a concurrent run finished (or restored) it
+                    tries += 1
+                    try:
+                        _attempt(ctx, state, generation, retry_failed=False)
+                    except _DeadlineReached:
+                        reached = True
+                    _save_state(ctx, state)
+            except GuiBusy as exc:
+                busy = str(exc)
                 break
-            _save_state(ctx, state)
-            if not _retryable_pending(state, ctx.components):
+            if reached or not _retryable_pending(state, ctx.components):
                 break
-        if _retryable_pending(state, ctx.components):
-            _mark_deadline(state, ctx.components)
-        state["last_autostart"] = {"at": _utc_now(), "tries": tries,
-                                   "elapsed": round(now() - start, 3)}
-        _save_state(ctx, state)
-    except (GuiError, OSError) as exc:
+        if busy is None:
+            try:
+                with _GuiLock(ctx.gui_root, wait=deadline_at - now(), now=now, sleep=sleep):
+                    state, _ = _load_state(ctx, generation)
+                    if _retryable_pending(state, ctx.components):
+                        _mark_deadline(state, ctx.components)
+                    state["last_autostart"] = {"at": _utc_now(), "tries": tries,
+                                               "elapsed": round(now() - start, 3)}
+                    _save_state(ctx, state)
+            except GuiBusy as exc:
+                busy = str(exc)
+        if busy is not None:
+            # Another run owns the state now; report what it last saved.
+            state, _ = _load_state(ctx, generation)
+    except (GuiError, OSError, ValueError) as exc:
         return _error("gui", exc, mode="autostart", tries=tries)
-    return _result(state, ctx.components,
-                   extra={"mode": "autostart", "tries": tries,
-                          "elapsed": round(now() - start, 3)})
+    extra = {"mode": "autostart", "tries": tries, "elapsed": round(now() - start, 3)}
+    if busy is not None:
+        extra["busy"] = busy
+    return _result(state, ctx.components, notes=ctx.notes, extra=extra)
 
 
 def restore_gui(target: Target, runner, env: Mapping[str, str],
                 generation: str | None = None, *,
                 platform: Platform | None = None,
-                components: Iterable[str] | None = None) -> dict:
+                components: Iterable[str] | None = None,
+                now: Callable[[], float] = time.monotonic,
+                sleep: Callable[[float], None] = time.sleep) -> dict:
     """Restore managed keys from the baseline (or ``generation``) backup and
-    the input-remapper groups from their restore records."""
+    the input-remapper groups from their restore records.
+
+    Runs under ``gui/gui.lock``. Every current value the restore replaces is
+    saved first to ``backups/restore-<ts>/`` (pass that name as
+    ``generation`` to undo), and keys the user changed after the install are
+    reported.
+    """
 
     phase = "gui-restore"
     env = dict(env)
@@ -987,10 +1146,26 @@ def restore_gui(target: Target, runner, env: Mapping[str, str],
         if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", name):
             raise GuiError(f"invalid generation {name!r}")
         ctx = _make_ctx(target, runner, env, platform=platform, components=components,
-                        now=time.monotonic, deadline_at=None, proc_devices=PROC_INPUT_DEVICES)
+                        now=now, deadline_at=None, proc_devices=PROC_INPUT_DEVICES)
+    except (GuiError, PlatformError, OSError, ValueError) as exc:
+        return _error(phase, exc)
+    if not os.path.isdir(ctx.gui_root):
+        return {"phase": phase, "status": SKIPPED, "reasons": [f"no GUI backup for {name}"],
+                "details": {"backup": name}}
+    try:
+        with _GuiLock(ctx.gui_root, wait=LOCK_WAIT, now=now, sleep=sleep):
+            return _restore_locked(ctx, phase, name)
+    except GuiBusy as exc:
+        return _error(phase, exc, backup=name, busy=True)
+    except (GuiError, OSError, ValueError) as exc:
+        return _error(phase, exc, backup=name)
+
+
+def _restore_locked(ctx: _Ctx, phase: str, name: str) -> dict:
+    try:
         backup = _load_key_backup(_backup_file(ctx, name))
         records = _load_records(ctx)
-    except (GuiError, PlatformError, OSError, ValueError) as exc:
+    except (GuiError, OSError, ValueError) as exc:
         return _error(phase, exc)
     if not backup["keys"] and not records["records"]:
         return {"phase": phase, "status": SKIPPED, "reasons": [f"no GUI backup for {name}"],
@@ -1001,16 +1176,49 @@ def restore_gui(target: Target, runner, env: Mapping[str, str],
                 "reasons": [r for r, _ in gaps] + ["restore needs the GNOME desktop session"],
                 "details": {"backup": name}}
 
+    stamp = _stamp("restore")
+    try:
+        applied_keys = _load_state(ctx, generation_id(ctx.platform.release))[0]["keys"]
+    except (GuiError, OSError, ValueError):
+        applied_keys = {}
     outcomes: dict = {}
     reasons: list = []
+    details: dict = {"backup": name}
     if COMPONENT_GNOME in ctx.components:
+        # Save every current value this restore replaces before the first
+        # write, so a GNOME restore can be undone like a file restore.
+        plan = []
+        saved: dict = {}
+        changed = []
         for ident, snap in sorted(backup["keys"].items()):
+            expected = snap["value"] if snap.get("explicit") else ""
+            current = _dconf_read(ctx, snap["dconf_key"])
+            if current is None:
+                outcomes[ident] = FAILED
+                reasons.append(f"{COMPONENT_GNOME}: {ident}: current value unreadable; "
+                               "not restored")
+                continue
+            plan.append((ident, snap, expected))
+            if current == expected:
+                continue
+            saved[ident] = _snapshot(snap["target"], snap["key"], snap["dconf_key"], current)
+            record = applied_keys.get(ident, {})
+            if not (record.get("status") == APPLIED and record.get("value") == current):
+                changed.append(ident)
+        if saved:
+            _write_json(_backup_file(ctx, stamp),
+                        {"schema": STATE_SCHEMA, "keys": saved,
+                         "reason": f"values before restoring {name}"})
+            details["saved_current"] = {"backup": stamp, "keys": sorted(saved),
+                                        "changed_since_install": changed}
+        if changed:
+            reasons.append(f"{COMPONENT_GNOME}: values changed since the install "
+                           f"({', '.join(changed)}) saved to backup {stamp} before restoring")
+        for ident, snap, expected in plan:
             if snap.get("explicit"):
                 argv = ["gsettings", "set", snap["target"], snap["key"], snap["value"]]
-                expected = snap["value"]
             else:
                 argv = ["gsettings", "reset", snap["target"], snap["key"]]
-                expected = ""
             try:
                 done = ctx.run(argv, "gsettings", read_only=False)
                 ok, detail = done.returncode == 0, _tail(done.stderr)
@@ -1025,8 +1233,6 @@ def restore_gui(target: Target, runner, env: Mapping[str, str],
     remapper_outcome = None
     if COMPONENT_REMAPPER in ctx.components and records["records"]:
         ad = load_adapters()
-        stamp = "restore-" + datetime.datetime.now(datetime.timezone.utc).strftime(
-            "%Y%m%dT%H%M%SZ")
         remapper_outcome = RESTORED
         for record_key, record in sorted(records["records"].items()):
             family = record_key.split(":", 1)[0]
@@ -1053,11 +1259,12 @@ def restore_gui(target: Target, runner, env: Mapping[str, str],
     except (GuiError, OSError) as exc:
         reasons.append(f"state not updated: {exc}")
     failed = any(v == FAILED for v in outcomes.values()) or remapper_outcome == FAILED
+    details.update({"keys": outcomes, "input-remapper": remapper_outcome})
     return {
         "phase": phase,
         "status": FAIL if failed else PASS,
         "reasons": reasons,
-        "details": {"backup": name, "keys": outcomes, "input-remapper": remapper_outcome},
+        "details": details,
     }
 
 

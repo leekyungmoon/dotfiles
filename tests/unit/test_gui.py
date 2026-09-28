@@ -68,6 +68,9 @@ class FakeDesktop:
         self.control_rc = 0
         self.calls: list[list[str]] = []
         self.timeouts: list[tuple[float, float]] = []  # (now, timeout)
+        # Called (once, then cleared) before the first ``dconf read``: lets a
+        # test start a second GUI run in the middle of this one.
+        self.before_first_read = None
 
     # Runner API ----------------------------------------------------------
     def which(self, name: str):
@@ -132,6 +135,9 @@ class FakeDesktop:
 
     def _dconf(self, args):
         assert args[0] == "read", args
+        hook, self.before_first_read = self.before_first_read, None
+        if hook is not None:
+            hook()
         value = self.store.get(args[1])
         return 0, (value + "\n") if value is not None else "", ""
 
@@ -197,7 +203,15 @@ class GuiTestCase(unittest.TestCase):
 
     def restore(self, generation=None, components=("gnome-settings",)):
         return gui.restore_gui(self.target, self.desk, dict(SESSION_ENV), generation,
-                               platform=self.platform, components=components)
+                               platform=self.platform, components=components,
+                               now=self.clock.now, sleep=self.clock.sleep)
+
+    def backup_sets(self, prefix: str) -> list[Path]:
+        return sorted((self.target.state_root / "gui" / "backups").glob(prefix + "-*"))
+
+    def backup_keys(self, name: str) -> dict:
+        path = self.target.state_root / "gui" / "backups" / name / "gsettings.json"
+        return json.loads(path.read_text())["keys"]
 
     def state(self) -> dict:
         return json.loads((self.target.state_root / "gui" / "state.json").read_text())
@@ -393,6 +407,155 @@ class BackupRestoreTests(GuiTestCase):
 
     def test_restore_rejects_path_like_generation(self):
         self.assertEqual(self.restore("../x")["status"], "FAIL")
+
+
+class LockTests(GuiTestCase):
+    """DS-6: GNOME apply, autostart and restore never interleave."""
+
+    def hold_lock(self):
+        """Hold gui/gui.lock from another process until the test ends."""
+
+        gui_root = self.target.state_root / "gui"
+        gui_root.mkdir(parents=True, exist_ok=True)
+        code = ("import fcntl, os, sys\n"
+                "fd = os.open(sys.argv[1], os.O_RDWR | os.O_CREAT, 0o600)\n"
+                "fcntl.flock(fd, fcntl.LOCK_EX)\n"
+                "print('locked', flush=True)\n"
+                "sys.stdin.read()\n")
+        holder = subprocess.Popen([sys.executable, "-B", "-c", code, str(gui_root / "gui.lock")],
+                                  stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+        self.addCleanup(holder.stdout.close)
+        self.addCleanup(holder.wait, 30)
+        self.addCleanup(holder.stdin.close)
+        self.assertEqual(holder.stdout.readline().strip(), "locked")
+
+    def test_overlapping_autostart_cannot_record_installed_values_as_baseline(self):
+        original = {dkey(e): "['<Super>ORIGINAL']" for e in available("24.04")
+                    if e["value"].startswith("[")}
+        self.desk.store.update(original)
+        before = dict(self.desk.store)
+        inner = {}
+
+        def login_autostart_starts_now():
+            inner["result"] = self.autostart()
+            inner["sets"] = len(self.desk.sets())
+
+        # The login autostart starts while this manual gui-apply is between
+        # loading the backups and its first dconf read.
+        self.desk.before_first_read = login_autostart_starts_now
+        result = self.apply()
+        self.assertEqual(result["status"], "PASS", result["reasons"])
+        self.assertIn("busy", inner["result"]["details"])
+        self.assertEqual(inner["sets"], 0, "the overlapping run wrote GNOME keys")
+        baseline = self.backup_keys("baseline")
+        wrong = [ident for ident, snap in baseline.items()
+                 if (snap["value"] if snap["explicit"] else None) != before.get(snap["dconf_key"])]
+        self.assertEqual(wrong, [], "baseline recorded installed values as the originals")
+        self.assertEqual(self.restore()["status"], "PASS")
+        self.assertEqual(self.desk.store, before)
+
+    def test_overlapping_manual_apply_waits_for_autostart_and_writes_nothing(self):
+        inner = {}
+        other = FakeClock()  # the manual run's own process clock
+
+        def manual_apply_starts_now():
+            inner["result"] = gui.apply_or_defer(
+                self.target, self.desk, dict(SESSION_ENV), now=other.now, sleep=other.sleep,
+                platform=self.platform, components=("gnome-settings",),
+                proc_devices=PROC_FIXTURE)
+            inner["waited"] = other.t - 1000.0
+
+        self.desk.before_first_read = manual_apply_starts_now
+        self.assertEqual(self.autostart()["status"], "PASS")
+        self.assertGreaterEqual(inner["waited"], gui.LOCK_WAIT)
+        self.assertEqual(inner["result"]["status"], "FAIL")
+        self.assertTrue(inner["result"]["details"]["busy"])
+        self.assertIn("another GUI apply or restore holds", inner["result"]["reasons"][0])
+        self.assertEqual(len(self.desk.sets()), len(available("24.04")))
+
+    def test_lock_held_by_another_process_blocks_apply_and_restore(self):
+        self.assertEqual(self.apply()["status"], "PASS")
+        store = dict(self.desk.store)
+        self.desk.calls.clear()
+        self.hold_lock()
+        start = self.clock.t
+        state_before = self.state()
+        with mock.patch.object(gui, "generation_id", return_value="gnext0000000000000"):
+            applied = self.apply()
+        self.assertEqual(applied["status"], "FAIL")
+        self.assertTrue(applied["details"]["busy"])
+        self.assertGreaterEqual(self.clock.t - start, gui.LOCK_WAIT)
+        restored = self.restore()
+        self.assertEqual(restored["status"], "FAIL")
+        self.assertTrue(restored["details"]["busy"])
+        self.assertEqual(self.desk.calls, [])
+        self.assertEqual(self.desk.store, store)
+        self.assertEqual(self.state(), state_before)
+
+    def test_autostart_gives_up_at_its_deadline_when_locked(self):
+        self.hold_lock()
+        start = self.clock.t
+        result = self.autostart()
+        self.assertIn("busy", result["details"])
+        self.assertEqual(result["details"]["tries"], 0)
+        self.assertEqual(self.desk.calls, [])
+        self.assert_within_deadline(start)
+
+    def test_lock_file_is_private(self):
+        self.apply()
+        lock = self.target.state_root / "gui" / "gui.lock"
+        self.assertEqual(stat.S_IMODE(lock.stat().st_mode), 0o600)
+
+
+class UserValueBackupTests(GuiTestCase):
+    """DS-7: a restore or a re-apply never discards a value without a backup."""
+
+    def test_restore_saves_current_values_and_reports_user_changes(self):
+        close, other = available("24.04")[0], available("24.04")[1]
+        self.desk.store[dkey(close)] = "['<Super>ORIGINAL']"
+        self.assertEqual(self.apply()["status"], "PASS")
+        self.desk.store[dkey(other)] = "['<Super>USER']"  # changed after the install
+        after_install = dict(self.desk.store)
+        result = self.restore()
+        self.assertEqual(result["status"], "PASS", result["reasons"])
+        self.assertEqual(self.desk.store[dkey(close)], "['<Super>ORIGINAL']")
+        saved = result["details"]["saved_current"]
+        self.assertEqual(saved["changed_since_install"], [other["id"]])
+        self.assertEqual(len(saved["keys"]), len(available("24.04")))
+        self.assertTrue(any(other["id"] in r and saved["backup"] in r for r in result["reasons"]),
+                        result["reasons"])
+        keys = self.backup_keys(saved["backup"])
+        self.assertEqual(keys[other["id"]]["value"], "['<Super>USER']")
+        self.assertEqual(keys[close["id"]]["value"], close["value"])
+        # The saved set undoes the restore.
+        self.assertEqual(self.restore(saved["backup"])["status"], "PASS")
+        self.assertEqual(self.desk.store, after_install)
+
+    def test_reapply_after_restore_backs_up_a_value_set_since(self):
+        close = available("24.04")[0]
+        self.desk.store[dkey(close)] = "['<Super>ORIGINAL']"
+        self.apply()
+        self.assertEqual(self.restore()["status"], "PASS")
+        self.desk.store[dkey(close)] = "['<Super>q']"  # the user's own choice
+        result = self.apply()  # e.g. dotfiles repair in the same generation
+        self.assertEqual(result["status"], "PASS", result["reasons"])
+        self.assertEqual(self.desk.store[dkey(close)], close["value"])
+        saved = result["details"]["saved_user_values"]
+        self.assertEqual(saved["keys"], [close["id"]])
+        self.assertEqual(self.backup_keys(saved["backup"])[close["id"]]["value"], "['<Super>q']")
+        self.assertTrue(any(saved["backup"] in r for r in result["reasons"]), result["reasons"])
+        reapplied = dict(self.desk.store)
+        self.assertEqual(self.restore(saved["backup"])["status"], "PASS")
+        self.assertEqual(self.desk.store, dict(reapplied, **{dkey(close): "['<Super>q']"}))
+
+    def test_reapply_after_plain_restore_saves_nothing_new(self):
+        self.apply()
+        self.restore()
+        result = self.apply()
+        self.assertEqual(result["status"], "PASS")
+        self.assertNotIn("saved_user_values", result["details"])
+        self.assertEqual(result["reasons"], [])
+        self.assertEqual(self.backup_sets("reapply"), [])
 
 
 class AutostartTests(GuiTestCase):
