@@ -1,0 +1,550 @@
+{
+  "schema": 1,
+  "description": "Pinned tool artifacts for the personal-dotfiles bootstrap on Ubuntu 22.04/24.04 x amd64/arm64. Every download is checked against the recorded sha256 (or sha512 for npm) before anything is extracted, and a mismatch fails the install. Versions change only by editing this file.",
+  "keys": {
+    "placeholders": "{home}, {data_home}, {codex_home} come from installer/platform.Target and $CODEX_HOME (default {home}/.codex). {prefix_root} and {bin_dir} are the top-level values below. {version} is the entry's version, {target} the selected artifact's target, {prefix} the entry's resolved prefix, {download} the verified local download, {keyring} a private keyring built from the pinned signer key. Nothing here is a host path.",
+    "prefix_root": "Installer-owned root. Each tool lives in its own versioned directory beneath it, so an upgrade is a new directory plus a link switch.",
+    "bin_dir": "Installer-owned directory of symlinks into the tool prefixes. The shell configuration adds it to PATH explicitly.",
+    "tools.<id>.artifacts": "Keyed by dpkg architecture (amd64, arm64). url is the exact download, sha256 the expected digest, archive the format, strip_components how many leading directories to drop on extraction.",
+    "tools.<id>.integrity": "Where the recorded digests came from and what, if anything, authenticates that source. checksum_source.type is one of: signed-checksum-file, signed-manifest, checksum-file, github-release-asset-digest, npm-registry-integrity.",
+    "tools.<id>.install": "method is one of: extract (unpack into prefix), vendor-self-install (run the verified binary's own install subcommand), npm-global-prefix (npm install --global --prefix).",
+    "tools.<id>.links": "Link name in bin_dir -> path relative to the prefix.",
+    "tools.<id>.verify": "argv to run after installation, and a regular expression its stdout must match. Runs with a clean HOME in tests; must not need authentication or network.",
+    "tools.<id>.verification": "What was actually checked on 2026-09-28 and where. arm64 artifacts were never executed on this amd64 host.",
+    "home_links": "bin_dir link names that must also resolve outside zsh (systemd, GUI launchers, non-login shells). The packages phase returns them as symlink requests for {home}/.local/bin -> {bin_dir}/<name>; the dotfiles transaction owns those links.",
+    "python_venvs": "Installer-owned virtual environments. pip runs only inside them (PIP_CONFIG_FILE=/dev/null, PIP_REQUIRE_VIRTUALENV=1); never --user, never --break-system-packages. only_binary refuses source builds, since no compiler is installed.",
+    "tools.<id>.group": "packages.json group the tool belongs to; default shell-core."
+  },
+  "prefix_root": "{data_home}/personal-dotfiles/tools",
+  "bin_dir": "{data_home}/personal-dotfiles/bin",
+  "home_links": [
+    "node",
+    "npm",
+    "npx",
+    "nvim",
+    "fzf",
+    "codex",
+    "omx"
+  ],
+  "python_venvs": {
+    "nvim": {
+      "path": "{data_home}/personal-dotfiles/venvs/nvim",
+      "requirements": [
+        "pynvim"
+      ],
+      "only_binary": [
+        "greenlet",
+        "msgpack"
+      ],
+      "consumer": "nvim g:python3_host_prog = <path>/bin/python",
+      "note": "pynvim is not version-pinned; the installed version is recorded in the phase details and state."
+    }
+  },
+  "tools": {
+    "node": {
+      "version": "24.21.0",
+      "channel": "Active LTS 'Krypton' (maintenance from 2026-10-20, end of life 2028-04-30)",
+      "selection": "Newest LTS line satisfying oh-my-codex engines.node '>=20'. Node 26 is not LTS until 2026-10-28; Node 20 reached end of life on 2026-04-30.",
+      "license": "MIT",
+      "requires": {
+        "glibc": "2.28"
+      },
+      "artifacts": {
+        "amd64": {
+          "url": "https://nodejs.org/dist/v24.21.0/node-v24.21.0-linux-x64.tar.xz",
+          "sha256": "fd8e59d5a511510f6a298afb548f18c7d2b1be404d8b4a27d94fbe49f56cb2d6",
+          "archive": "tar.xz",
+          "strip_components": 1
+        },
+        "arm64": {
+          "url": "https://nodejs.org/dist/v24.21.0/node-v24.21.0-linux-arm64.tar.xz",
+          "sha256": "6ad1325edbdb5649c379b75a237147a666c95d4f9ae8d340fef2d1575d289ad2",
+          "archive": "tar.xz",
+          "strip_components": 1
+        }
+      },
+      "integrity": {
+        "checksum_source": {
+          "type": "signed-checksum-file",
+          "url": "https://nodejs.org/dist/v24.21.0/SHASUMS256.txt",
+          "sha256": "f410428039e2c922a14058df067a4482691c9304a5c01a75847f9f3f2d3307f6",
+          "signature_url": "https://nodejs.org/dist/v24.21.0/SHASUMS256.txt.sig",
+          "signature_type": "openpgp-detached",
+          "clearsigned_url": "https://nodejs.org/dist/v24.21.0/SHASUMS256.txt.asc"
+        },
+        "signer_fingerprints": [
+          "5BE8A3F6C8A5C01D106C0AD820B1A390B168D356"
+        ],
+        "signer_key_url": "https://raw.githubusercontent.com/nodejs/release-keys/main/keys/5BE8A3F6C8A5C01D106C0AD820B1A390B168D356.asc",
+        "keyring_project": "https://github.com/nodejs/release-keys",
+        "verify_signature": [
+          "gpgv",
+          "--keyring",
+          "{keyring}",
+          "SHASUMS256.txt.sig",
+          "SHASUMS256.txt"
+        ],
+        "note": "The signer is the Node.js releaser who built v24.21.0 and is listed in the nodejs/node README release keys. gpgv (always present with apt) is enough; gnupg is not required."
+      },
+      "install": {
+        "method": "extract"
+      },
+      "prefix": "{prefix_root}/node/{version}",
+      "links": {
+        "node": "bin/node",
+        "npm": "bin/npm",
+        "npx": "bin/npx"
+      },
+      "bundled": {
+        "npm": "11.19.0",
+        "corepack": "present, not enabled"
+      },
+      "verify": [
+        {
+          "argv": [
+            "{bin_dir}/node",
+            "--version"
+          ],
+          "stdout": "^v24\\.21\\.0$"
+        },
+        {
+          "argv": [
+            "{bin_dir}/npm",
+            "--version"
+          ],
+          "stdout": "^11\\.19\\.0$"
+        }
+      ],
+      "verification": {
+        "amd64": "PASS: downloaded, sha256 matched SHASUMS256.txt, SHASUMS256.txt.sig verified with gpgv against the pinned key, node --version = v24.21.0 and bundled npm 11.19.0 ran on an amd64 host.",
+        "arm64": "Checksum entry present in the signed SHASUMS256.txt; URL answered HTTP 200. Execution UNVERIFIED."
+      }
+    },
+    "neovim": {
+      "version": "0.12.5",
+      "selection": "nvim/init.lua disables plugins below 0.11 and warns below 0.12; etc/install-neovim.sh recommends 0.12.2. 0.12.5 is the current stable release.",
+      "license": "Apache-2.0 AND Vim",
+      "requires": {
+        "glibc": "2.34"
+      },
+      "artifacts": {
+        "amd64": {
+          "url": "https://github.com/neovim/neovim/releases/download/v0.12.5/nvim-linux-x86_64.tar.gz",
+          "sha256": "bce0f56eda1f1b1db6eee8f4133d7a38813ea07933837dd1777411ca384c6875",
+          "archive": "tar.gz",
+          "strip_components": 1
+        },
+        "arm64": {
+          "url": "https://github.com/neovim/neovim/releases/download/v0.12.5/nvim-linux-arm64.tar.gz",
+          "sha256": "1aa5ca085249580ae0f91eb14f27ec0919773ff2d99a163d03f3d6c21ac29725",
+          "archive": "tar.gz",
+          "strip_components": 1
+        }
+      },
+      "integrity": {
+        "checksum_source": {
+          "type": "github-release-asset-digest",
+          "url": "https://api.github.com/repos/neovim/neovim/releases/tags/v0.12.5",
+          "field": "assets[].digest"
+        },
+        "note": "Neovim 0.12.x releases publish no checksum file or signature; the recorded digests are GitHub's server-side sha256 for the uploaded assets. This authenticates the transfer against the pinned value, not the publisher."
+      },
+      "install": {
+        "method": "extract"
+      },
+      "prefix": "{prefix_root}/neovim/{version}",
+      "links": {
+        "nvim": "bin/nvim"
+      },
+      "bundled": {
+        "treesitter_parsers": [
+          "c",
+          "lua",
+          "markdown",
+          "markdown_inline",
+          "query",
+          "vim",
+          "vimdoc"
+        ]
+      },
+      "verify": [
+        {
+          "argv": [
+            "{bin_dir}/nvim",
+            "--version"
+          ],
+          "stdout": "^NVIM v0\\.12\\.5"
+        }
+      ],
+      "caveats": [
+        "nvim/lua/config/treesitter.lua uses nvim-treesitter main, which compiles extra parsers with the tree-sitter CLI and a C compiler. Neither is installed, so only the bundled parsers are available.",
+        "nvim/lua/config/pynvim.lua may try to install pynvim with pip; that conflicts with the venv-only Python policy and needs a decision in the editor lane."
+      ],
+      "verification": {
+        "amd64": "PASS: downloaded, sha256 matched the recorded asset digest, nvim --version = v0.12.5 and a headless run with a temporary HOME reported has('nvim-0.12') = 1.",
+        "arm64": "Asset digest recorded from the GitHub release API; URL answered HTTP 200. Execution UNVERIFIED."
+      }
+    },
+    "fzf": {
+      "version": "0.74.4",
+      "selection": "Needs >= 0.66 for fzf --raw (zsh/zsh.d/alias.zsh), --accept-nth (bin/tmux-attach) and --tmux popups (tmux/tmux.conf, bin/tmux-attach). Built-in `fzf --zsh` integration replaces the ~/.fzf clone that upstream install.py used.",
+      "license": "MIT",
+      "requires": {
+        "glibc": "none (statically linked)"
+      },
+      "artifacts": {
+        "amd64": {
+          "url": "https://github.com/junegunn/fzf/releases/download/v0.74.4/fzf-0.74.4-linux_amd64.tar.gz",
+          "sha256": "05e6813a337cc722c3ed07e54a764b75cc5d671e2e60459db0ba696ee5fa7504",
+          "archive": "tar.gz",
+          "strip_components": 0
+        },
+        "arm64": {
+          "url": "https://github.com/junegunn/fzf/releases/download/v0.74.4/fzf-0.74.4-linux_arm64.tar.gz",
+          "sha256": "5d673b849f494f0d64ec471d8640b153ca8849e3846a31da17abdcfce8df6b46",
+          "archive": "tar.gz",
+          "strip_components": 0
+        }
+      },
+      "extra_files": {
+        "fzf-preview.sh": {
+          "url": "https://raw.githubusercontent.com/junegunn/fzf/v0.74.4/bin/fzf-preview.sh",
+          "sha256": "5181e2638181bce97ba44e55dab19aa91a76a9e86a98c1e04e1c4eb503baca84",
+          "dest": "bin/fzf-preview.sh",
+          "mode": "0755",
+          "reason": "tmux/tmux.conf prefix-@ picker previews with fzf-preview.sh, which is not in the release tarball."
+        }
+      },
+      "integrity": {
+        "checksum_source": {
+          "type": "checksum-file",
+          "url": "https://github.com/junegunn/fzf/releases/download/v0.74.4/fzf_0.74.4_checksums.txt",
+          "sha256": "93b9cb6e68b97601268cc7afe17d89ce9364f6277f30b4193c725aa7dc3ededf"
+        },
+        "note": "Unsigned checksum file published with the release; its entries equal GitHub's asset digests. fzf-preview.sh is pinned by tag and sha256 only."
+      },
+      "install": {
+        "method": "extract"
+      },
+      "prefix": "{prefix_root}/fzf/{version}",
+      "links": {
+        "fzf": "fzf",
+        "fzf-preview.sh": "bin/fzf-preview.sh"
+      },
+      "shell_integration": [
+        "{bin_dir}/fzf",
+        "--zsh"
+      ],
+      "verify": [
+        {
+          "argv": [
+            "{bin_dir}/fzf",
+            "--version"
+          ],
+          "stdout": "^0\\.74\\.4 "
+        }
+      ],
+      "verification": {
+        "amd64": "PASS: downloaded, sha256 matched the checksum file, fzf --version = 0.74.4, fzf --zsh produced integration code, --accept-nth and --raw were accepted. On a tmux 3.2a server fzf --tmux failed (display-popup usage error); on tmux 3.4 the options were accepted but no popup was rendered because no client was attached (UNVERIFIED rendering).",
+        "arm64": "Checksum entry present in the checksum file; URL answered HTTP 200. Execution UNVERIFIED."
+      }
+    },
+    "codex": {
+      "version": "0.157.1",
+      "selection": "Latest non-prerelease openai/codex release (tag rust-v0.157.1, 2026-09-26).",
+      "license": "Apache-2.0",
+      "requires": {
+        "glibc": "none (musl static)"
+      },
+      "artifacts": {
+        "amd64": {
+          "url": "https://github.com/openai/codex/releases/download/rust-v0.157.1/codex-package-x86_64-unknown-linux-musl.tar.gz",
+          "sha256": "0e211868c9fd73cb49ad35ac675b5eafdf6b9f453df8a493df980c59a590fe5f",
+          "archive": "tar.gz",
+          "strip_components": 0,
+          "target": "x86_64-unknown-linux-musl"
+        },
+        "arm64": {
+          "url": "https://github.com/openai/codex/releases/download/rust-v0.157.1/codex-package-aarch64-unknown-linux-musl.tar.gz",
+          "sha256": "499fe70d70f4e4904b6a5a4ec1b1edf6c4a1a47a075ea7e2ec2b5262ba47b471",
+          "archive": "tar.gz",
+          "strip_components": 0,
+          "target": "aarch64-unknown-linux-musl"
+        }
+      },
+      "integrity": {
+        "checksum_source": {
+          "type": "checksum-file",
+          "url": "https://github.com/openai/codex/releases/download/rust-v0.157.1/codex-package_SHA256SUMS",
+          "sha256": "d41a49f53d5e8cb572250929260d92455f2f5a22a5dfd082e31f8c165cd11717",
+          "mirror": "https://releases.openai.com/codex/releases/0.157.1/codex-package_SHA256SUMS"
+        },
+        "sigstore_bundles": "codex-package-<target>.tar.gz.sigstore is published next to each archive. Checking it needs cosign or sigstore tooling, which this profile does not install, so it is not part of the default verification.",
+        "note": "This is the same archive and checksum file the official install.sh uses. The installer does not run install.sh, because install.sh edits shell profile files that this repository manages."
+      },
+      "archive_layout": {
+        "manifest": "codex-package.json (layoutVersion 1, entrypoint bin/codex)",
+        "entries": [
+          "bin/codex",
+          "bin/codex-code-mode-host",
+          "codex-path/rg",
+          "codex-resources/bwrap",
+          "codex-resources/zsh",
+          "codex-resources/voice"
+        ]
+      },
+      "install": {
+        "method": "extract"
+      },
+      "prefix": "{prefix_root}/codex/{version}-{target}",
+      "links": {
+        "codex": "bin/codex"
+      },
+      "self_update": "Codex's own updater manages {codex_home}/packages/standalone; it does not manage this prefix. Upgrades go through this manifest.",
+      "verify": [
+        {
+          "argv": [
+            "{bin_dir}/codex",
+            "--version"
+          ],
+          "stdout": "^codex-cli 0\\.157\\.1$"
+        }
+      ],
+      "verification": {
+        "amd64": "PASS: downloaded, sha256 matched codex-package_SHA256SUMS, codex --version = codex-cli 0.157.1 with an empty temporary HOME and CODEX_HOME (it warned that CODEX_HOME did not exist, and wrote nothing else).",
+        "arm64": "Checksum entry present in codex-package_SHA256SUMS; URL answered HTTP 200. Execution UNVERIFIED."
+      }
+    },
+    "claude-code": {
+      "version": "2.1.274",
+      "channel": "stable",
+      "selection": "Current 'stable' channel build (downloads.claude.ai/claude-code-releases/stable). The 'latest' channel was 2.1.283 on 2026-09-28.",
+      "license": "Proprietary (Anthropic). Not redistributed; downloaded from Anthropic on the target.",
+      "artifacts": {
+        "amd64": {
+          "url": "https://downloads.claude.ai/claude-code-releases/2.1.274/linux-x64/claude",
+          "sha256": "15e2d05148f801b5774032faad87e624ecd172e9903288bda448b892eb58fa07",
+          "size": 230580536,
+          "archive": "none",
+          "platform": "linux-x64"
+        },
+        "arm64": {
+          "url": "https://downloads.claude.ai/claude-code-releases/2.1.274/linux-arm64/claude",
+          "sha256": "2db904daea17addff9de557ba26a725916888aa7b546e2c5dd989c20d9d49ab3",
+          "size": 230482160,
+          "archive": "none",
+          "platform": "linux-arm64"
+        }
+      },
+      "integrity": {
+        "checksum_source": {
+          "type": "signed-manifest",
+          "url": "https://downloads.claude.ai/claude-code-releases/2.1.274/manifest.json",
+          "sha256": "5d6fb056dfa62483d690629a59057469ebc3f659f4948d48329358c31b823da5",
+          "field": "platforms.<platform>.checksum",
+          "signature_url": "https://downloads.claude.ai/claude-code-releases/2.1.274/manifest.json.sig",
+          "signature_type": "openpgp-detached"
+        },
+        "signer_fingerprints": [
+          "31DDDE24DDFAB679F42D7BD2BAA929FF1A7ECACE"
+        ],
+        "signer_key_url": "https://downloads.claude.ai/keys/claude-code.asc",
+        "signer_uid": "Anthropic Claude Code Release Signing <security@anthropic.com>",
+        "verify_signature": [
+          "gpgv",
+          "--keyring",
+          "{keyring}",
+          "manifest.json.sig",
+          "manifest.json"
+        ],
+        "documentation": "https://code.claude.com/docs/en/setup (Binary integrity and code signing)"
+      },
+      "install": {
+        "method": "vendor-self-install",
+        "argv": [
+          "{download}",
+          "install",
+          "{version}"
+        ],
+        "steps": [
+          "download manifest.json and manifest.json.sig; gpgv against the pinned key",
+          "read platforms.<platform>.checksum and size from the verified manifest and compare with this entry",
+          "download the binary to a private temporary directory; check size and sha256",
+          "run '<binary> install 2.1.274'; delete the temporary binary"
+        ],
+        "no_pipe_to_shell": "claude.ai/install.sh is not executed. It always resolves 'latest' for its own download and then runs the same install subcommand."
+      },
+      "vendor_layout": {
+        "binary": "{home}/.local/share/claude/versions/{version}",
+        "launcher": "{home}/.local/bin/claude",
+        "state": [
+          "{home}/.claude.json",
+          "{home}/.claude/"
+        ],
+        "shell_files_modified": false
+      },
+      "auto_update": "The native build updates itself in the background. The recorded stable channel keeps it on the delayed track; DISABLE_AUTOUPDATER=1 or DISABLE_UPDATES stop it, which is a user setting decision, not set here.",
+      "verify": [
+        {
+          "argv": [
+            "{home}/.local/bin/claude",
+            "--version"
+          ],
+          "stdout": "^2\\.1\\.274 \\(Claude Code\\)$"
+        }
+      ],
+      "verification": {
+        "amd64": "PASS: manifest.json.sig verified with gpgv against key 31DDDE24DDFAB679F42D7BD2BAA929FF1A7ECACE (fingerprint matches the setup documentation), binary sha256 matched the manifest, claude --version = 2.1.274, and 'claude install 2.1.274' in a temporary HOME created only the vendor_layout paths and left sentinel .zshrc, .bashrc and .profile byte-identical.",
+        "arm64": "Checksum present in the signed manifest; URL answered HTTP 200 with the manifest's size. Execution UNVERIFIED."
+      }
+    },
+    "oh-my-codex": {
+      "package": "oh-my-codex",
+      "version": "0.21.6",
+      "selection": "npm dist-tag latest (published 2026-09-21). The source machine ran 0.20.5; both declare the same engines.",
+      "license": "MIT",
+      "engines": {
+        "node": ">=20"
+      },
+      "artifacts": {
+        "any": {
+          "url": "https://registry.npmjs.org/oh-my-codex/-/oh-my-codex-0.21.6.tgz",
+          "sha512": "sha512-/L3DS+/qhgLmw2nmACCCK2Veodte0pYW1ObSViqBZ5xwa+LPs6ZdCwi8xw0e6E1WEqaxaLn1D5r+zrOlwReHDQ==",
+          "sha256": "732c0c4bcd798c1063dc50eeff798bb1d8b0c9f527fdf892e53baff276f41a6c",
+          "archive": "npm-tarball"
+        }
+      },
+      "integrity": {
+        "checksum_source": {
+          "type": "npm-registry-integrity",
+          "url": "https://registry.npmjs.org/oh-my-codex/0.21.6",
+          "field": "dist.integrity"
+        },
+        "provenance": "The registry lists npm publish and SLSA v1 provenance attestations for this version; 'npm audit signatures' can check them.",
+        "note": "Install from the verified local tarball so the top-level package cannot differ from the pinned integrity. npm checks every dependency tarball against registry integrity, but a global install has no lockfile, so transitive versions resolve within their semver ranges at install time."
+      },
+      "dependencies": {
+        "direct": {
+          "zod": "^4.3.6",
+          "yauzl": "3.4.0",
+          "tar-stream": "3.2.0",
+          "@iarna/toml": "^2.2.5",
+          "@napi-rs/lzma": "1.4.1",
+          "@modelcontextprotocol/sdk": "^1.26.0"
+        },
+        "closure_size": "112 packages installed (isolated --ignore-scripts install, 2026-09-28)",
+        "native": {
+          "@napi-rs/lzma-linux-x64-gnu": {
+            "version": "1.4.1",
+            "integrity": "sha512-Sxu7aJxU1sDbUTqjqLVDV3DCOAlbsFKvmuCN/S5uXBJd1IF2wJ9jK3NbFzfqTAo5Hudx8Y7kOb6+3K+fYPI1KQ=="
+          },
+          "@napi-rs/lzma-linux-arm64-gnu": {
+            "version": "1.4.1",
+            "integrity": "sha512-1XdFGKyTS9m+VrRQYs9uz+ToHf4Jwm0ejHU48k9lT9MPl8jSqzKdVtFzZBPzronHteSynBfKmUq0+HeWmjrsOQ=="
+          },
+          "note": "Prebuilt N-API binaries selected by npm through optionalDependencies (os/cpu/libc). No node-gyp and no compiler."
+        },
+        "install_scripts": "Only oh-my-codex itself has one (postinstall). No dependency declares install scripts."
+      },
+      "postinstall": {
+        "runs_when": "npm_config_global is true (a --global install); otherwise it is a no-op.",
+        "effect": "Downloads the omx-runtime native helper for the platform from the matching GitHub release, checking sha256 from native-release-manifest.json. Failures are non-fatal (native runtime features stay off).",
+        "native_manifest": {
+          "url": "https://github.com/Yeachan-Heo/oh-my-codex/releases/download/v0.21.6/native-release-manifest.json",
+          "sha256": "ac1e97228a8631a0efcff7314a7ffc52c34a0eeb06f374689d7023ec3f4ea2d2",
+          "signed": false
+        },
+        "omx-runtime": {
+          "amd64": {
+            "url": "https://github.com/Yeachan-Heo/oh-my-codex/releases/download/v0.21.6/omx-runtime-x86_64-unknown-linux-gnu.tar.xz",
+            "sha256": "77a732a21cdf017559c58c27038938436b525862a69ff29c67b1cb2442b0fe2b"
+          },
+          "arm64": {
+            "url": "https://github.com/Yeachan-Heo/oh-my-codex/releases/download/v0.21.6/omx-runtime-aarch64-unknown-linux-gnu.tar.xz",
+            "sha256": "718e5dbcf38b5a8f982414d568be57736dd57636e70e0025c81076fb66f32050"
+          }
+        }
+      },
+      "install": {
+        "method": "npm-global-prefix",
+        "requires_tool": "node",
+        "argv": [
+          "{bin_dir}/npm",
+          "install",
+          "--global",
+          "--prefix",
+          "{prefix}",
+          "--no-fund",
+          "--no-audit",
+          "{download}"
+        ],
+        "env": {
+          "npm_config_update_notifier": "false"
+        },
+        "path": "{bin_dir}:/usr/bin:/bin for npm and omx, so the pinned node is used rather than any system or nvm node."
+      },
+      "prefix": "{prefix_root}/oh-my-codex/{version}",
+      "links": {
+        "omx": "bin/omx"
+      },
+      "verify": [
+        {
+          "argv": [
+            "{bin_dir}/omx",
+            "--version"
+          ],
+          "stdout": "^oh-my-codex v0\\.21\\.6$"
+        }
+      ],
+      "verification": {
+        "amd64": "PASS: tarball sha512 matched dist.integrity; an isolated --ignore-scripts install into a temporary prefix (temporary npm cache, no user config) resolved 112 packages; omx --version printed 'oh-my-codex v0.21.6' with an empty temporary HOME; the amd64 omx-runtime archive matched its manifest sha256. The postinstall hydration itself was not run.",
+        "arm64": "Package is architecture independent. arm64 native lzma integrity and omx-runtime sha256 recorded; both URLs answered HTTP 200. Execution UNVERIFIED."
+      }
+    },
+    "nerd-font": {
+      "version": "3.5.1",
+      "family": "JetBrainsMono Nerd Font",
+      "selection": "zsh/p10k.zsh sets POWERLEVEL9K_MODE=nerdfont-complete and tmux/statusbar.tmux uses private-use glyphs; the README recommends JetBrainsMono Nerd Font. Only needed where a GUI terminal renders text.",
+      "group": "gui",
+      "license": "OFL-1.1 (fonts); nerd-fonts patcher MIT",
+      "artifacts": {
+        "any": {
+          "url": "https://github.com/ryanoasis/nerd-fonts/releases/download/v3.5.1/JetBrainsMono.tar.xz",
+          "sha256": "04d5e8f903693f9dd13e16f867e994834e681eb3c72c0d337a770dcda09010cf",
+          "archive": "tar.xz",
+          "strip_components": 0
+        }
+      },
+      "integrity": {
+        "checksum_source": {
+          "type": "checksum-file",
+          "url": "https://github.com/ryanoasis/nerd-fonts/releases/download/v3.5.1/SHA-256.txt",
+          "sha256": "e03d7ad54547d83f1620719cbc89b5684bc0c6fb028160640aa322b5035a63fb"
+        }
+      },
+      "install": {
+        "method": "extract",
+        "post": [
+          "fc-cache",
+          "-f",
+          "{prefix}"
+        ]
+      },
+      "prefix": "{data_home}/fonts/personal-dotfiles/JetBrainsMonoNerdFont-{version}",
+      "links": {},
+      "verify": [
+        {
+          "argv": [
+            "fc-list",
+            ":family=JetBrainsMono Nerd Font Mono",
+            "family"
+          ],
+          "stdout": "JetBrainsMono Nerd Font Mono"
+        }
+      ],
+      "verification": {
+        "any": "Archive downloaded and sha256 matched SHA-256.txt; it contains 96 TTF files plus OFL.txt and README.md. Font installation and rendering in GNOME Terminal UNVERIFIED."
+      }
+    }
+  }
+}

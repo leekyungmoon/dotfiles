@@ -1,0 +1,271 @@
+{
+  "schema": 1,
+  "description": "Ubuntu apt package profile for the personal-dotfiles bootstrap. Every package is installed with --no-install-recommends. Tools that apt ships too old (fzf, neovim, nodejs) come from manifests/tools.json instead and must not be installed from apt.",
+  "keys": {
+    "targets": "Supported Ubuntu release -> codename. Architectures are the dpkg names; installer/platform.py maps x86_64/aarch64 onto them.",
+    "apt_policy": "How every apt install in this profile is invoked. install_recommends=false is mandatory, see reason.",
+    "forbidden": "Regular expressions matched against the full simulated package list (apt-get -s). Any match is a hard failure before installing anything.",
+    "groups": "Ordered package groups. default=true groups are part of the one-line install. Each package names why the reviewed configuration needs it.",
+    "repositories": "Third-party apt sources the installer writes. Keys are verified by primary fingerprint, never by file hash, because vendors add subkeys over time.",
+    "shims": "Command names the configuration calls that Ubuntu ships under a different name. The installer creates these links in the tools.json bin_dir.",
+    "system_steps": "Root-owned configuration beyond package installation, each guarded by a check so reruns are no-ops.",
+    "not_from_apt": "Packages that exist in the Ubuntu archive but must not be installed from it, and why.",
+    "release_notes": "Per-release differences that change behaviour, including known degraded features.",
+    "evidence": "Where and how this profile was last checked."
+  },
+  "targets": {
+    "22.04": "jammy",
+    "24.04": "noble"
+  },
+  "architectures": [
+    "amd64",
+    "arm64"
+  ],
+  "apt_policy": {
+    "install_recommends": false,
+    "install_command": [
+      "apt-get",
+      "install",
+      "--yes",
+      "--no-install-recommends"
+    ],
+    "simulate_command": [
+      "apt-get",
+      "--simulate",
+      "install",
+      "--no-install-recommends"
+    ],
+    "reason": "With Recommends enabled, python3-pip pulls build-essential, gcc/g++, make and python3-dev on both releases and both architectures, and google-chrome-stable's Ubuntu dependencies pull cpp. gnome-terminal Recommends (gvfs, yelp, nautilus-extension-gnome-terminal) are not needed for the configured behaviour. Without Recommends no forbidden package appears in any of the four cells."
+  },
+  "forbidden": {
+    "patterns": [
+      "^ubuntu-desktop.*$",
+      "^ubuntu-gnome-desktop$",
+      "^gnome-shell(-.*)?$",
+      "^gnome-session(-.*)?$",
+      "^(gdm3|lightdm|sddm)$",
+      "^docker.*$",
+      "^(containerd|runc|podman)$",
+      "^ros-.*$",
+      "^(gh|glab)$",
+      "^build-essential$",
+      "^(gcc|g\\+\\+|cpp|clang)(-[0-9]+)?$",
+      "^(make|binutils|libc6-dev|dpkg-dev)$",
+      "^(python3-dev|libpython3.*-dev|python3\\.[0-9]+-dev)$",
+      "^(nodejs|npm|libnode.*)$",
+      "^(fzf|neovim)$"
+    ],
+    "reason": "Desktop environments, display managers, container stacks, ROS, forge CLIs, a C/C++ toolchain, apt Node.js and the apt fzf/neovim builds are out of scope. nvm, conda and pyenv are not apt packages and are never installed by this profile."
+  },
+  "groups": [
+    {
+      "id": "shell-core",
+      "default": true,
+      "requires_graphical_session": false,
+      "packages": [
+        {
+          "name": "zsh",
+          "reason": "Login and interactive shell (zsh/zshrc, zsh/zshenv)."
+        },
+        {
+          "name": "tmux",
+          "reason": "tmux/tmux.conf, bin/tmux-attach, bin/tmux-smart-paste. 22.04 ships 3.2a, see release_notes."
+        },
+        {
+          "name": "git",
+          "reason": "Repository clone/update, antidote plugin clones, TPM, fzf-git.sh widgets."
+        },
+        {
+          "name": "curl",
+          "reason": "Bootstrap and verified artifact downloads for manifests/tools.json."
+        },
+        {
+          "name": "ca-certificates",
+          "reason": "TLS for git and curl on minimal images."
+        },
+        {
+          "name": "xz-utils",
+          "reason": "Node.js and OMX native assets are .tar.xz archives."
+        },
+        {
+          "name": "gpgv",
+          "reason": "Detached-signature checks for Node.js SHASUMS256.txt and the Claude Code manifest. Already a dependency of apt; listed so the requirement is explicit."
+        },
+        {
+          "name": "locales",
+          "reason": "zsh/zshenv exports LANG/LC_CTYPE=en_US.UTF-8 when unset; see system_steps."
+        },
+        {
+          "name": "wl-clipboard",
+          "reason": "Wayland backend for bin/pbcopy, bin/pbpaste and bin/tmux-smart-paste (wl-copy, wl-paste)."
+        },
+        {
+          "name": "xclip",
+          "reason": "X11 backend for bin/pbcopy, bin/pbpaste and bin/tmux-smart-paste."
+        },
+        {
+          "name": "python3",
+          "reason": "Installer runtime and user Python."
+        },
+        {
+          "name": "python3-pip",
+          "reason": "Requested pip, used inside virtual environments only. Never with --user or --break-system-packages."
+        },
+        {
+          "name": "python3-venv",
+          "reason": "Requested venv."
+        },
+        {
+          "name": "ripgrep",
+          "reason": "zsh/zsh.d/envs.zsh FZF_CTRL_T_COMMAND, bin/rg.fzf, neovim fzf-lua grep."
+        },
+        {
+          "name": "fd-find",
+          "reason": "tmux prefix-@ file picker calls fd (installed as fdfind, see shims)."
+        },
+        {
+          "name": "tree",
+          "reason": "fzf Alt-C preview in zsh/zsh.d/envs.zsh."
+        }
+      ]
+    },
+    {
+      "id": "gui",
+      "default": true,
+      "requires_graphical_session": false,
+      "note": "Installed even without a running desktop; settings are applied later by the GUI phase. None of these pull GNOME Shell, a session or a display manager.",
+      "packages": [
+        {
+          "name": "libglib2.0-bin",
+          "reason": "gsettings and gdbus, used by installer/gui.py to apply GNOME settings and probe the user D-Bus session."
+        },
+        {
+          "name": "dconf-cli",
+          "reason": "installer/gui.py reads dconf to tell explicit GNOME settings from defaults before overwriting them, so restore can reset unset keys instead of pinning defaults."
+        },
+        {
+          "name": "gnome-terminal",
+          "reason": "Default terminal whose tab/window shortcuts are managed."
+        },
+        {
+          "name": "input-remapper",
+          "reason": "Ctrl+Super+Left/Right -> Ctrl+PageUp/PageDown intent. 22.04 ships 1.4.0, 24.04 ships 2.0.1; adapters are version specific. input-remapper-daemon ships a system service, udev rule, D-Bus policy and an XDG autostart entry."
+        },
+        {
+          "name": "google-chrome-stable",
+          "repository": "google-chrome",
+          "reason": "Browser whose tab navigation is part of the managed shortcuts."
+        }
+      ]
+    }
+  ],
+  "repositories": {
+    "google-chrome": {
+      "key_url": "https://dl.google.com/linux/linux_signing_key.pub",
+      "key_primary_fingerprint": "EB4C1BFD4F042F6DDDCCEC917721F63BD38B4796",
+      "key_uid": "Google Inc. (Linux Packages Signing Authority) <linux-packages-keymaster@google.com>",
+      "keyring_path": "/usr/share/keyrings/google-chrome.gpg",
+      "keyring_format": "binary OpenPGP (dearmored)",
+      "sources_path": "/etc/apt/sources.list.d/google-chrome.sources",
+      "sources_deb822": {
+        "Types": "deb",
+        "URIs": "https://dl.google.com/linux/chrome-stable/deb/",
+        "Suites": "stable",
+        "Components": "main",
+        "Architectures": "{architecture}",
+        "Signed-By": "/usr/share/keyrings/google-chrome.gpg"
+      },
+      "reason_for_paths": "google-chrome-stable's postinst rewrites exactly this .sources file and keyring and removes a legacy google-chrome.list. Writing the same paths and values first means the package takes them over instead of leaving a duplicate source with a conflicting Signed-By.",
+      "package_architectures": [
+        "amd64",
+        "arm64"
+      ],
+      "version_pinning": "Not possible: the repository only publishes the current build. The installer records the installed version; it does not pin one.",
+      "observed": {
+        "date": "2026-09-28",
+        "version": "154.0.8037.57-1",
+        "release_signed_by_subkey": "0E225917414670F4442C250DFD533C07C264648F",
+        "depends": "ca-certificates, fonts-liberation, libasound2, libatk-bridge2.0-0, libatk1.0-0, libatspi2.0-0, libc6 (>= 2.25), libcairo2, libcups2, libcurl3-gnutls | libcurl3-nss | libcurl4 | libcurl3, libdbus-1-3, libexpat1, libgbm1, libglib2.0-0, libgtk-3-0 | libgtk-4-1, libnspr4, libnss3, libpango-1.0-0, libudev1, libvulkan1, libx11-6, libxcb1, libxcomposite1, libxdamage1, libxext6, libxfixes3, libxkbcommon0, libxrandr2, wget, xdg-utils",
+        "side_effects": "Installs /etc/cron.daily/google-chrome, which re-checks the repository configuration daily."
+      }
+    }
+  },
+  "shims": [
+    {
+      "name": "fd",
+      "target": "/usr/bin/fdfind",
+      "only_if_missing": true,
+      "reason": "Ubuntu's fd-find installs fdfind; tmux/tmux.conf calls fd."
+    }
+  ],
+  "system_steps": [
+    {
+      "id": "locale-en-us-utf8",
+      "check": [
+        "locale",
+        "-a"
+      ],
+      "present_if_output_matches": "^en_US\\.utf8$",
+      "command": [
+        "locale-gen",
+        "en_US.UTF-8"
+      ],
+      "requires_root": true,
+      "reason": "zsh/zshenv falls back to en_US.UTF-8; minimal images ship only C.UTF-8."
+    }
+  ],
+  "not_from_apt": {
+    "fzf": "jammy 0.29, noble 0.44. The configuration needs >= 0.66 (fzf --raw in zsh/zsh.d/alias.zsh), --accept-nth (0.60+) in bin/tmux-attach and --tmux (0.53+). Use tools.json.",
+    "neovim": "jammy 0.6.1, noble 0.9.5. nvim/init.lua refuses to load plugins below 0.11 and warns below 0.12. Use tools.json.",
+    "nodejs": "jammy 12, noble 18. OMX requires node >= 20. Use tools.json; do not replace an unrelated system Node.",
+    "bat": "Optional preview in zsh/zsh.d/envs.zsh; the configuration checks for it and works without it. Not selected.",
+    "eza": "Optional ls replacement; guarded by command -v. Not selected."
+  },
+  "unavoidable_runtime_dependencies": {
+    "perl, liberror-perl": "git",
+    "libx11-6 and other X11 client libraries, x11-common": "xclip, GTK and Chrome. Client libraries only; no X server.",
+    "GTK 3, VTE, dconf, gsettings-desktop-schemas, fontconfig, fonts-dejavu-core, icon themes": "gnome-terminal and input-remapper-gtk",
+    "dbus-user-session (22.04)": "gnome-terminal/dconf on jammy",
+    "python3-evdev, python3-pydbus, python3-pydantic (24.04), gtksourceview 4": "input-remapper",
+    "python3-setuptools, python3-wheel, python3-distutils (22.04)": "python3-pip Depends",
+    "fonts-liberation, NSS, ALSA, libgbm1, libvulkan1, wget, xdg-utils": "google-chrome-stable Depends",
+    "mesa-libgallium, libllvm20 (24.04 only)": "libgbm1 for google-chrome-stable. A GPU driver runtime library, not a compiler toolchain."
+  },
+  "release_notes": {
+    "22.04": {
+      "tmux": {
+        "version": "3.2a",
+        "decision": "Accept the Ubuntu package. tmux publishes no official prebuilt binaries, the 24.04 package needs glibc 2.38, and building from source would add a C toolchain.",
+        "config_load": "tmux/tmux.conf loads with no errors on 3.2a (parse-only and execute).",
+        "degraded": [
+          "allow-passthrough does not exist before 3.3; set -gq silently ignores it, so terminal passthrough sequences are dropped.",
+          "Window drag-to-reorder on the status line (the %if >= 3.4 block) is not bound.",
+          "fzf --tmux popups fail on 3.2a (display-popup rejects fzf's border options): prefix-S session picker (bin/tmux-attach) and prefix-@ file picker. Needs a tmux < 3.3 fallback in the configuration."
+        ]
+      },
+      "input-remapper": "1.4.0 (configuration format differs from 2.0.1).",
+      "python3": "3.10"
+    },
+    "24.04": {
+      "tmux": {
+        "version": "3.4",
+        "degraded": []
+      },
+      "input-remapper": "2.0.1",
+      "python3": "3.12; pip outside a venv is blocked by PEP 668, which matches the venv-only policy."
+    }
+  },
+  "evidence": {
+    "date": "2026-09-28",
+    "method": "Rootless apt simulation (private Dir, empty dpkg status) against Ubuntu main+universe with -updates and -security for jammy/noble x amd64/arm64, plus a private copy of each root with the Google Chrome repository added. No containers or VMs.",
+    "simulated_package_counts_without_recommends": {
+      "jammy-amd64": 260,
+      "jammy-arm64": 260,
+      "noble-amd64": 284,
+      "noble-arm64": 282
+    },
+    "forbidden_without_recommends": [],
+    "forbidden_with_recommends": "build-essential, gcc, g++, cpp, make, binutils, libc6-dev, python3-dev (all four cells)",
+    "not_proven": "Actual installation, package postinst behaviour, GUI behaviour and arm64 execution were not tested by simulation."
+  }
+}
