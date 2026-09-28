@@ -39,19 +39,29 @@ run_bounded() {
 have() { command -v "$1" >/dev/null 2>&1; }
 
 # wl-copy daemonizes, so it cannot probe itself. wl-paste ships in the same
-# package and answering --list-types proves the compositor is live.
+# package and answering --list-types proves the compositor is live. An empty
+# selection is still a live session: wl-paste then exits 1 with "Nothing is
+# copied", while an unreachable compositor says "Failed to connect".
 probe_wayland() {
   [[ -n ${WAYLAND_DISPLAY:-} ]] || return 1
   have wl-copy || return 1
   have wl-paste || return 0
-  run_bounded "${PBCOPY_PROBE_TIMEOUT}" wl-paste --list-types >/dev/null 2>&1
+  local err
+  err=$(run_bounded "${PBCOPY_PROBE_TIMEOUT}" wl-paste --list-types 2>&1 >/dev/null) \
+    && return 0
+  [[ ${err} == *"Nothing is copied"* ]]
 }
 
+# With no selection owner, the X server answers the TARGETS request with
+# nothing and xclip reports "target TARGETS not available"; only "Can't open
+# display" (or a timeout) means there is no usable X server.
 probe_x11() {
   [[ -n ${DISPLAY:-} ]] || return 1
   have xclip || return 1
-  run_bounded "${PBCOPY_PROBE_TIMEOUT}" \
-    xclip -selection clipboard -out -target TARGETS >/dev/null 2>&1
+  local err
+  err=$(run_bounded "${PBCOPY_PROBE_TIMEOUT}" \
+    xclip -selection clipboard -out -target TARGETS 2>&1 >/dev/null) && return 0
+  [[ ${err} == *"not available"* ]]
 }
 
 backend=osc52

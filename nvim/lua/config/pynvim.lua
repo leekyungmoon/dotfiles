@@ -1,11 +1,11 @@
 --- config.pynvim
 --- @return fun(): boolean
 
--- Set the g:python3_host_prog variable: $PYTHON3_HOST_PROG, else the installer-managed
--- venv ${XDG_DATA_HOME:-~/.local/share}/personal-dotfiles/venvs/nvim (with pynvim), else
--- the "current" python in $PATH.
+-- Set the g:python3_host_prog variable: $PYTHON3_HOST_PROG, else the "current" python
+-- in $PATH. On Ubuntu the installer provides pynvim for the system python3 from apt
+-- (python3-pynvim); no virtualenv is created.
 -- pynvim is automatically installed if it was missing, but only into a virtualenv or conda
--- env; never into the system/user site-packages (use `dotfiles repair` for the managed venv).
+-- env; never into the system/user site-packages.
 
 -- This config must be sourced before any first call of has('python3'), py3eval, etc.
 -- Note: An invocation of has('python3'), py3, py3eval triggers provider#python3#Call()
@@ -36,18 +36,6 @@ end
 -- If the environment variable $PYTHON3_HOST_PROG is set, use that as the python rplugin host.
 if os.getenv('PYTHON3_HOST_PROG') then
   vim.g.python3_host_prog = os.getenv('PYTHON3_HOST_PROG')
-end
-
--- The installer-managed venv for the python3 provider, when it exists.
-if vim.g.python3_host_prog == "" or not vim.g.python3_host_prog then
-  local data_home = os.getenv('XDG_DATA_HOME') or ''
-  if data_home:sub(1, 1) ~= '/' then  -- unset or relative: the XDG default
-    data_home = (os.getenv('HOME') or vim.fn.expand('~')) .. '/.local/share'
-  end
-  local venv_python = data_home .. '/personal-dotfiles/venvs/nvim/bin/python'
-  if vim.fn.executable(venv_python) > 0 then
-    vim.g.python3_host_prog = venv_python
-  end
 end
 
 -- By default, use python3 w.r.t. $PATH as the host python for neovim.
@@ -116,7 +104,7 @@ local function autoinstall_pynvim(skip_check)
     if not skip_check then
       notify_later(
         ("pynvim not installed for " .. vim.g.python3_host_prog .. "\n" ..
-        "please install pynvim into a virtualenv and set $PYTHON3_HOST_PROG (or run `dotfiles repair`)."),
+        "please install pynvim (Ubuntu: `sudo apt install python3-pynvim`) or set $PYTHON3_HOST_PROG."),
         vim.log.levels.ERROR)
     end
     return false  -- neovim < 0.10, give up and don't do anything fancy
@@ -149,9 +137,10 @@ local function autoinstall_pynvim(skip_check)
   end
   local function run_pynvim_install()
     if not host_python_is_isolated() then
-      notify_later(("`pynvim` cannot be imported by `%s`, which is not a virtualenv; " ..
-        "not installing it there. Run `dotfiles repair` to (re)create the managed venv, " ..
-        "or set $PYTHON3_HOST_PROG to a python that has pynvim."):format(vim.g.python3_host_prog))
+      notify_later(("`pynvim` (>= 0.5.0) is not available to `%s`, which is not a virtualenv; " ..
+        "not installing it there. On Ubuntu 24.04 `sudo apt install python3-pynvim` provides it; " ..
+        "Ubuntu 22.04's apt pynvim is 0.4.2, so python-based plugins stay disabled there unless " ..
+        "you set $PYTHON3_HOST_PROG to a virtualenv python that has pynvim."):format(vim.g.python3_host_prog))
       return
     end
     notify_later("`pynvim` cannot be imported. " ..

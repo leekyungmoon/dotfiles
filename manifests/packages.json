@@ -116,6 +116,14 @@
           "reason": "Requested venv."
         },
         {
+          "name": "python-is-python3",
+          "reason": "Makes `python` mean python3 system-wide (also in sh -c and scripts); with python3-pip's /usr/bin/pip, `python`/`pip` are python3/pip3."
+        },
+        {
+          "name": "python3-pynvim",
+          "reason": "Neovim's python3 provider from apt; no virtualenv is created (user decision)."
+        },
+        {
           "name": "ripgrep",
           "reason": "zsh/zsh.d/envs.zsh FZF_CTRL_T_COMMAND, bin/rg.fzf, neovim fzf-lua grep."
         },

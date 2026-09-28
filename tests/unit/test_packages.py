@@ -100,6 +100,9 @@ class FakeRunner:
         self.which_map: dict[str, str | None] = {}
         self.claude_payload: bytes | None = None
         self.pip_done = False
+        self.pynvim_before: str | None = None  # version an existing venv already has
+        self.npm_env: dict | None = None
+        self.requirements: str | None = None
 
     def which(self, name):
         if name in self.which_map:
@@ -157,11 +160,15 @@ class FakeRunner:
             if self.gpgv_rc:
                 return self.ok(argv, b"[GNUPG:] BADSIG 0000 Fixture\n", 1, b"gpgv: BAD signature")
             return self.ok(argv, status.encode())
-        if head.endswith("/npm") and "install" in argv:
+        if head.endswith("/npm") and argv[1:2] in (["ci"], ["install"]):
+            assert argv[1] == "ci", argv
             prefix = Path(argv[argv.index("--prefix") + 1])
             assert env["PATH"].split(":")[0].endswith("personal-dotfiles/bin"), env["PATH"]
-            (prefix / "bin").mkdir(parents=True, exist_ok=True)
-            omx = prefix / "bin" / "omx"
+            assert (prefix / "package.json").is_file() and (prefix / "package-lock.json").is_file()
+            self.npm_env = dict(env)
+            bindir = prefix / "node_modules" / ".bin"
+            bindir.mkdir(parents=True, exist_ok=True)
+            omx = bindir / "omx"
             omx.write_bytes(script("echo 'oh-my-codex v0.21.6'"))
             omx.chmod(0o755)
             return self.ok(argv)
@@ -186,9 +193,15 @@ class FakeRunner:
             return self.ok(argv)
         if head.endswith("/bin/python") and argv[1:4] == ["-m", "pip", "install"]:
             self.pip_done = True
+            if "-r" in argv:
+                self.requirements = Path(argv[argv.index("-r") + 1]).read_text()
             return self.ok(argv)
         if head.endswith("/bin/python") and argv[1] == "-c":
-            return self.ok(argv, b"0.6.0\n") if self.pip_done else self.ok(argv, rc=1)
+            if self.pip_done:
+                return self.ok(argv, b"0.6.0\n")
+            if self.pynvim_before:
+                return self.ok(argv, self.pynvim_before.encode() + b"\n")
+            return self.ok(argv, rc=1)
         if head.startswith(self.sandbox) and os.path.isfile(head):
             return subprocess.run(argv, capture_output=True, env=env, timeout=timeout, check=False)
         raise AssertionError(f"unexpected command {argv}")
@@ -297,16 +310,57 @@ class Fixture:
         }
         tgz = b"npm-tarball-bytes"
         self.files[f"{BASE}/omx.tgz"] = tgz
+        self.omx_tgz = tgz
+        omx_sri = "sha512-" + base64.b64encode(hashlib.sha512(tgz).digest()).decode()
+        tarball = "vendor/oh-my-codex-0.21.6.tgz"
+        project = {"name": "fixture-omx", "private": True,
+                   "dependencies": {"oh-my-codex": f"file:{tarball}"}}
+        lockfile = {"name": "fixture-omx", "lockfileVersion": 3, "requires": True, "packages": {
+            "": {"name": "fixture-omx", "dependencies": {"oh-my-codex": f"file:{tarball}"}},
+            "node_modules/oh-my-codex": {"version": "0.21.6", "resolved": f"file:{tarball}",
+                                         "integrity": omx_sri, "hasInstallScript": True,
+                                         "dependencies": {"zod": "^4.3.6"}},
+            "node_modules/zod": {"version": "4.3.6",
+                                 "resolved": "https://registry.npmjs.org/zod/-/zod-4.3.6.tgz",
+                                 "integrity": "sha512-" + "A" * 86 + "=="},
+        }}
+        runtime_bin = script("echo runtime-schema=1")
+        self.runtime_bin = runtime_bin
+        runtime = {}
+        for arch, triple, key in (("amd64", "x86_64-unknown-linux-musl", "linux-x64-musl"),
+                                  ("arm64", "aarch64-unknown-linux-musl", "linux-arm64-musl")):
+            top = f"omx-runtime-{triple}"
+            data = make_tar({f"{top}/omx-runtime": runtime_bin, f"{top}/README.md": b"readme"}, "xz")
+            url = f"{BASE}/omx/{top}.tar.xz"
+            self.files[url] = data
+            runtime[arch] = {"url": url, "sha256": sha(data), "size": len(data), "archive": "tar.xz",
+                             "member": f"{top}/omx-runtime", "binary_sha256": sha(runtime_bin),
+                             "platform_key": key}
+        native_manifest = json.dumps({"version": "0.21.6", "assets": [
+            {"product": "omx-runtime", "download_url": a["url"], "sha256": a["sha256"]}
+            for a in runtime.values()]}).encode()
+        self.files[f"{BASE}/omx/native-release-manifest.json"] = native_manifest
         tools["oh-my-codex"] = {
+            "package": "oh-my-codex",
             "version": "0.21.6",
-            "artifacts": {"any": {"url": f"{BASE}/omx.tgz", "sha256": sha(tgz),
-                                  "sha512": "sha512-" + base64.b64encode(hashlib.sha512(tgz).digest()).decode(),
+            "artifacts": {"any": {"url": f"{BASE}/omx.tgz", "sha256": sha(tgz), "sha512": omx_sri,
                                   "archive": "npm-tarball"}},
             "integrity": {"checksum_source": {"type": "npm-registry-integrity"}},
-            "install": {"method": "npm-global-prefix", "requires_tool": "node",
-                        "argv": ["{bin_dir}/npm", "install", "--global", "--prefix", "{prefix}", "{download}"],
-                        "env": {"npm_config_update_notifier": "false"}},
-            "prefix": "{prefix_root}/oh-my-codex/{version}", "links": {"omx": "bin/omx"},
+            "install": {"method": "npm-ci-lockfile", "requires_tool": "node", "tarball": tarball,
+                        "argv": ["{bin_dir}/npm", "ci", "--prefix", "{prefix}", "--ignore-scripts",
+                                 "--no-fund", "--no-audit"],
+                        "env": {"npm_config_update_notifier": "false"},
+                        "allowed_install_scripts": ["node_modules/oh-my-codex"],
+                        "project": project, "lockfile": lockfile},
+            "native_runtime": {
+                "product": "omx-runtime",
+                "manifest": {"url": f"{BASE}/omx/native-release-manifest.json",
+                             "sha256": sha(native_manifest)},
+                "artifacts": runtime,
+                "cache_path": "{cache_home}/oh-my-codex/native/{version}/{platform_key}/omx-runtime/omx-runtime",
+                "verify": [{"argv": ["{native}", "schema"], "stdout": "^runtime-schema=1$"}],
+            },
+            "prefix": "{prefix_root}/oh-my-codex/{version}", "links": {"omx": "node_modules/.bin/omx"},
             "verify": [{"argv": ["{bin_dir}/omx", "--version"], "stdout": "^oh-my-codex v0\\.21\\.6$"}],
         }
         font = make_tar({"JetBrainsMonoNerdFont-Regular.ttf": b"ttf"}, "xz")
@@ -324,8 +378,12 @@ class Fixture:
             "schema": 1, "prefix_root": "{data_home}/personal-dotfiles/tools",
             "bin_dir": "{data_home}/personal-dotfiles/bin",
             "home_links": ["node", "npm", "npx", "nvim", "fzf", "codex", "omx"],
-            "python_venvs": {"nvim": {"path": "{data_home}/personal-dotfiles/venvs/nvim",
-                                      "requirements": ["pynvim"], "only_binary": ["greenlet", "msgpack"]}},
+            "python_venvs": {"nvim": {"path": "{data_home}/personal-dotfiles/venvs/nvim", "requirements": [
+                {"name": "pynvim", "version": "0.6.0",
+                 "wheels": {"pynvim-0.6.0-py3-none-any.whl": "1" * 64}},
+                {"name": "greenlet", "version": "3.5.6", "marker": 'platform_python_implementation != "PyPy"',
+                 "wheels": {"greenlet-cp310-x86_64.whl": "2" * 64, "greenlet-cp312-x86_64.whl": "3" * 64}},
+            ]}},
             "tools": tools,
         }
         self.files[f"{BASE}/chrome.pub"] = CHROME_KEY
@@ -521,7 +579,7 @@ class ToolTests(unittest.TestCase):
         self.assertEqual(len(self.fx.fetch.calls), downloaded)
         self.assertTrue(all(not t["downloaded"] for t in second["details"]["tools"].values()))
         self.assertEqual(os.readlink(self.fx.bin_dir / "omx"),
-                         str(self.fx.tools_root / "oh-my-codex/0.21.6/bin/omx"))
+                         str(self.fx.tools_root / "oh-my-codex/0.21.6/node_modules/.bin/omx"))
 
     def test_checksum_mismatch_fails_closed(self):
         url = self.fx.tools["tools"]["node"]["artifacts"]["amd64"]["url"]
@@ -619,19 +677,6 @@ class ToolTests(unittest.TestCase):
         self.assertEqual(result["status"], "FAIL")
         self.assertIn("fc-cache", result["details"]["tools"]["nerd-font"]["reason"])
 
-    def test_nvim_venv_created_with_pip_inside_only(self):
-        result = self.fx.run(only=["neovim"])
-        self.assertEqual(result["status"], "PASS", result["reasons"])
-        python = result["details"]["python"]
-        venv = self.fx.target.data_home / "personal-dotfiles/venvs/nvim"
-        self.assertEqual(python["python3_host_prog"], str(venv / "bin/python"))
-        self.assertEqual(python["pynvim"], "0.6.0")
-        pip = next(a for a in self.runner.names() if "pip" in a)
-        self.assertEqual(pip[0], str(venv / "bin/python"))
-        self.assertNotIn("--break-system-packages", pip)
-        self.assertNotIn("--user", pip)
-        again = self.fx.run(only=["neovim"])
-        self.assertFalse(again["details"]["python"]["created"])
 
     def test_real_manifests_cover_both_architectures(self):
         _, tools = pk.load_manifests()
@@ -641,6 +686,185 @@ class ToolTests(unittest.TestCase):
         self.assertEqual(tools["tools"]["oh-my-codex"]["prefix"], "{prefix_root}/oh-my-codex/{version}")
         packages, _ = pk.load_manifests()
         self.assertFalse(packages["apt_policy"]["install_recommends"])
+
+
+class OmxTests(unittest.TestCase):
+    """oh-my-codex: lockfile-pinned npm ci, no lifecycle scripts, pinned runtime."""
+
+    def setUp(self):
+        self.fx = Fixture(self)
+        self.runner = self.fx.runner
+        self.spec = self.fx.tools["tools"]["oh-my-codex"]
+        self.prefix = self.fx.tools_root / "oh-my-codex" / "0.21.6"
+        self.runtime = (self.fx.target.cache_home / "oh-my-codex/native/0.21.6/linux-x64-musl"
+                        / "omx-runtime" / "omx-runtime")
+
+    def npm_calls(self):
+        return [a for a in self.runner.names() if a[0].endswith("/npm") and a[1:2] == ["ci"]]
+
+    def test_npm_ci_from_lockfile_without_scripts(self):
+        result = self.fx.run(only=["oh-my-codex"])
+        self.assertEqual(result["status"], "PASS", result["reasons"])
+        (argv,) = self.npm_calls()
+        self.assertIn("--ignore-scripts", argv)
+        self.assertNotIn("--global", argv)
+        self.assertEqual(self.runner.npm_env["npm_config_ignore_scripts"], "true")
+        self.assertNotIn("npm_config_global", self.runner.npm_env)
+        lock = json.loads((self.prefix / "package-lock.json").read_text())
+        self.assertEqual(lock, self.spec["install"]["lockfile"])
+        self.assertEqual(json.loads((self.prefix / "package.json").read_text()),
+                         self.spec["install"]["project"])
+        self.assertEqual((self.prefix / "vendor/oh-my-codex-0.21.6.tgz").read_bytes(), self.fx.omx_tgz)
+        self.assertEqual(os.readlink(self.fx.bin_dir / "omx"), str(self.prefix / "node_modules/.bin/omx"))
+
+    def test_runtime_is_published_like_the_postinstall_would(self):
+        result = self.fx.run(only=["oh-my-codex"])
+        self.assertEqual(result["status"], "PASS", result["reasons"])
+        self.assertEqual(self.runtime.read_bytes(), self.fx.runtime_bin)
+        self.assertTrue(os.access(self.runtime, os.X_OK))
+        sidecar = self.runtime.with_name("omx-runtime.sha256")
+        self.assertEqual(sidecar.read_text(), sha(self.fx.runtime_bin) + "\n")
+        self.assertEqual(len(sidecar.read_bytes()), 65)
+        native = result["details"]["tools"]["oh-my-codex"]["native_runtime"]
+        self.assertEqual(native["verify"], ["runtime-schema=1"])
+        self.assertIn(self.spec["native_runtime"]["artifacts"]["amd64"]["url"], self.fx.fetch.calls)
+        self.assertNotIn(self.spec["native_runtime"]["artifacts"]["arm64"]["url"], self.fx.fetch.calls)
+
+    def test_runtime_arm64_uses_its_own_artifact(self):
+        result = self.fx.run(arch="arm64", only=["oh-my-codex"])
+        self.assertEqual(result["details"]["tools"]["oh-my-codex"]["status"], "PASS", result["reasons"])
+        self.assertTrue((self.fx.target.cache_home / "oh-my-codex/native/0.21.6/linux-arm64-musl/omx-runtime"
+                         / "omx-runtime").is_file())
+
+    def test_argv_without_ignore_scripts_is_refused(self):
+        self.spec["install"]["argv"].remove("--ignore-scripts")
+        self.fx.write_manifests()
+        result = self.fx.run(only=["oh-my-codex"])
+        self.assertEqual(result["details"]["tools"]["oh-my-codex"]["status"], "FAIL")
+        self.assertIn("--ignore-scripts", result["details"]["tools"]["oh-my-codex"]["reason"])
+        self.assertEqual(self.npm_calls(), [])
+
+    def test_lockfile_must_pin_the_verified_tarball(self):
+        lock = self.spec["install"]["lockfile"]["packages"]["node_modules/oh-my-codex"]
+        lock["integrity"] = "sha512-" + "B" * 86 + "=="
+        self.fx.write_manifests()
+        result = self.fx.run(only=["oh-my-codex"])
+        self.assertEqual(result["details"]["tools"]["oh-my-codex"]["status"], "FAIL")
+        self.assertIn("pinned tarball", result["details"]["tools"]["oh-my-codex"]["reason"])
+        self.assertEqual(self.npm_calls(), [])
+        self.assertNotIn(f"{BASE}/omx.tgz", self.fx.fetch.calls)
+
+    def test_lockfile_entries_must_be_registry_tarballs_with_integrity(self):
+        for bad in ({"version": "4.3.6", "resolved": "https://registry.npmjs.org/zod/-/zod-4.3.6.tgz"},
+                    {"version": "4.3.6", "resolved": "git+https://example.invalid/zod.git",
+                     "integrity": "sha512-" + "A" * 86 + "=="},
+                    {"version": "4.3.6", "link": True, "resolved": "../zod"}):
+            with self.subTest(bad=bad):
+                fx = Fixture(self)
+                fx.tools["tools"]["oh-my-codex"]["install"]["lockfile"]["packages"]["node_modules/zod"] = bad
+                fx.write_manifests()
+                result = fx.run(only=["oh-my-codex"])
+                self.assertEqual(result["details"]["tools"]["oh-my-codex"]["status"], "FAIL")
+                self.assertFalse(any(a[0].endswith("/npm") and a[1:2] == ["ci"] for a in fx.runner.names()))
+
+    def test_unreviewed_install_script_in_the_closure_fails(self):
+        self.spec["install"]["lockfile"]["packages"]["node_modules/zod"]["hasInstallScript"] = True
+        self.fx.write_manifests()
+        result = self.fx.run(only=["oh-my-codex"])
+        self.assertEqual(result["details"]["tools"]["oh-my-codex"]["status"], "FAIL")
+        self.assertIn("install scripts", result["details"]["tools"]["oh-my-codex"]["reason"])
+        self.assertEqual(self.npm_calls(), [])
+
+    def test_lockfile_change_reinstalls_the_prefix(self):
+        self.assertEqual(self.fx.run(only=["oh-my-codex"])["status"], "PASS")
+        self.spec["install"]["lockfile"]["packages"]["node_modules/zod"]["version"] = "4.3.7"
+        self.fx.write_manifests()
+        result = self.fx.run(only=["oh-my-codex"])
+        self.assertEqual(result["status"], "PASS", result["reasons"])
+        self.assertEqual(len(self.npm_calls()), 2)
+
+    def test_runtime_archive_mismatch_fails_closed(self):
+        url = self.spec["native_runtime"]["artifacts"]["amd64"]["url"]
+        self.fx.fetch.files[url] += b"tampered"
+        result = self.fx.run(only=["oh-my-codex"])
+        omx = result["details"]["tools"]["oh-my-codex"]
+        self.assertEqual(omx["status"], "FAIL")
+        self.assertFalse(os.path.lexists(self.runtime))
+        self.assertFalse(os.path.lexists(self.fx.bin_dir / "omx"))
+        self.assertNotIn("tool-link-omx", [e["id"] for e in result["details"]["links"]])
+
+    def test_runtime_binary_mismatch_fails_closed(self):
+        self.spec["native_runtime"]["artifacts"]["amd64"]["binary_sha256"] = "0" * 64
+        self.fx.write_manifests()
+        result = self.fx.run(only=["oh-my-codex"])
+        self.assertEqual(result["details"]["tools"]["oh-my-codex"]["status"], "FAIL")
+        self.assertIn("sha256", result["details"]["tools"]["oh-my-codex"]["reason"])
+        self.assertFalse(os.path.lexists(self.runtime))
+
+    def test_runtime_manifest_must_list_the_pinned_archive(self):
+        data = json.dumps({"assets": [{"download_url": self.spec["native_runtime"]["artifacts"]["amd64"]["url"],
+                                       "sha256": "f" * 64}]}).encode()
+        self.fx.fetch.files[f"{BASE}/omx/native-release-manifest.json"] = data
+        self.spec["native_runtime"]["manifest"]["sha256"] = sha(data)
+        self.fx.write_manifests()
+        result = self.fx.run(only=["oh-my-codex"])
+        self.assertEqual(result["details"]["tools"]["oh-my-codex"]["status"], "FAIL")
+        self.assertNotIn(self.spec["native_runtime"]["artifacts"]["amd64"]["url"], self.fx.fetch.calls)
+
+    def test_stale_runtime_is_replaced(self):
+        self.runtime.parent.mkdir(parents=True)
+        self.runtime.write_bytes(b"old")
+        self.runtime.with_name("omx-runtime.sha256").write_text(sha(b"old") + "\n")
+        result = self.fx.run(only=["oh-my-codex"])
+        self.assertEqual(result["status"], "PASS", result["reasons"])
+        self.assertEqual(self.runtime.read_bytes(), self.fx.runtime_bin)
+
+    def test_dry_run_touches_nothing(self):
+        result = self.fx.run(only=["oh-my-codex"], dry_run=True)
+        self.assertEqual(result["status"], "SKIPPED", result["reasons"])
+        self.assertEqual(self.fx.fetch.calls, [])
+        self.assertFalse(os.path.lexists(self.runtime))
+        self.assertEqual(result["details"]["tools"]["oh-my-codex"]["native_runtime"]["plan"],
+                         "download+verify+publish")
+
+    def test_real_manifest_pins_the_whole_closure(self):
+        _, tools = pk.load_manifests()
+        spec = tools["tools"]["oh-my-codex"]
+        install = spec["install"]
+        self.assertEqual(install["method"], "npm-ci-lockfile")
+        self.assertEqual(install["argv"][1], "ci")
+        self.assertIn("--ignore-scripts", install["argv"])
+        pk.check_npm_lock(spec, spec["artifacts"]["any"])
+        packages = install["lockfile"]["packages"]
+        for native in ("@napi-rs/lzma-linux-x64-gnu", "@napi-rs/lzma-linux-arm64-gnu"):
+            self.assertIn(f"node_modules/{native}", packages)
+        self.assertEqual([k for k, v in packages.items() if v.get("hasInstallScript")],
+                         install["allowed_install_scripts"])
+        runtime = spec["native_runtime"]
+        for arch, key in (("amd64", "linux-x64-musl"), ("arm64", "linux-arm64-musl")):
+            art = runtime["artifacts"][arch]
+            self.assertEqual(art["platform_key"], key)
+            self.assertTrue(art["url"].startswith(
+                "https://github.com/Yeachan-Heo/oh-my-codex/releases/download/v0.21.6/"))
+            for field in ("sha256", "binary_sha256"):
+                self.assertRegex(art[field], "^[0-9a-f]{64}$")
+
+
+
+
+class StockUbuntuTests(unittest.TestCase):
+    def test_git_credential_helper_ships_with_ubuntu_git(self):
+        # Ubuntu's git package installs only git-credential-{cache,store};
+        # a helper that exists only on one machine breaks every other one.
+        text = (REPO_ROOT / "git" / "gitconfig").read_text(encoding="utf-8")
+        helpers, section = [], None
+        for raw in text.splitlines():
+            line = raw.strip()
+            if line.startswith("["):
+                section = line.strip("[]").split()[0].lower()
+            elif section == "credential" and line.startswith("helper") and "=" in line:
+                helpers.append(line.split("=", 1)[1].strip())
+        self.assertEqual(helpers, ["cache --timeout 60"])
 
 
 class ExtractTests(unittest.TestCase):
@@ -677,6 +901,66 @@ class ExtractTests(unittest.TestCase):
         dest = self.extract({"lib/real": b"x", "bin/l": ("sym", "../lib/real")})
         self.assertEqual((dest / "bin/l").read_bytes(), b"x")
 
+    def test_rejects_symlink_escaping_through_an_earlier_symlink(self):
+        # d1/up -> '..' is the root itself; d1/up/esc -> '..' then lives in
+        # the root and points one level above it, although both look inside
+        # when checked lexically against the member names.
+        for entries in ([("d1/", None), ("d1/up", ("sym", "..")), ("d1/up/esc", ("sym", ".."))],
+                        [("d1/", None), ("d1/up", ("sym", "..")), ("d1/up/esc2", ("sym", "../.."))]):
+            with self.subTest(entries=entries):
+                shutil.rmtree(self.tmp / "out", ignore_errors=True)
+                with self.assertRaises(dl.VerificationError):
+                    self.extract_raw(entries)
 
-if __name__ == "__main__":
+    def test_rejects_symlink_that_a_later_member_redirects(self):
+        # a/l -> 'x/../..' resolves to the root while a/x does not exist; once
+        # a later member makes a/x a link to '.', a/l points above the root.
+        shutil.rmtree(self.tmp / "out", ignore_errors=True)
+        with self.assertRaises(dl.VerificationError):
+            self.extract_raw([("a/", None), ("a/l", ("sym", "x/../..")), ("a/x", ("sym", "."))])
+
+    def test_strip_components_uses_the_extracted_layout(self):
+        archive = self.tmp / "s.tar.gz"
+        archive.write_bytes(make_tar([("top/d1/up", ("sym", "..")), ("top/d1/up/esc", ("sym", ".."))]))
+        with self.assertRaises(dl.VerificationError):
+            pk.safe_extract(archive, self.tmp / "stripped", kind="tar.gz", strip=1)
+
+    def extract_raw(self, entries):
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+            for name, value in entries:
+                info = tarfile.TarInfo(name.rstrip("/"))
+                if value is None:
+                    info.type = tarfile.DIRTYPE
+                    info.mode = 0o755
+                    tar.addfile(info)
+                else:
+                    info.type = tarfile.SYMTYPE
+                    info.linkname = value[1]
+                    tar.addfile(info)
+        archive = self.tmp / "raw.tar.gz"
+        archive.write_bytes(buf.getvalue())
+        pk.safe_extract(archive, self.tmp / "out", kind="tar.gz", strip=0)
+
+class NoVenvTests(unittest.TestCase):
+    """By user decision the installer never creates a Python virtualenv."""
+
+    def test_real_manifest_declares_no_venv(self):
+        _, tools = pk.load_manifests()
+        self.assertNotIn("python_venvs", tools)
+
+    def test_neovim_install_runs_no_venv_or_pip(self):
+        fx = Fixture(self)
+        fx.run(only=["neovim"])
+        self.assertFalse(any(a[1:3] == ["-m", "venv"] or a[1:3] == ["-m", "pip"]
+                             for a in fx.runner.names()))
+
+    def test_python_packages_come_from_apt(self):
+        packages, _ = pk.load_manifests()
+        names = {p["name"] for g in packages["groups"] for p in g["packages"]}
+        self.assertLessEqual({"python3", "python3-pip", "python-is-python3",
+                              "python3-pynvim"}, names)
+
+
+if __name__ == '__main__':
     unittest.main()

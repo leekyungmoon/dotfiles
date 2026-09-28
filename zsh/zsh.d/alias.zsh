@@ -363,6 +363,12 @@ function conda-activate.d() {
 # virtualenv
 alias wo='workon'
 
+# `python` means python3. The installer provides it system-wide through apt's
+# python-is-python3; this covers machines without that package.
+if (( ! $+commands[python] )) && (( $+commands[python3] )); then
+    alias python='python3'
+fi
+
 # Make sure the correct python from $PATH is used for the binary, even if
 # some the package is not installed in the current python environment.
 # (Do not execute a wrong bin from different python such as the global one)

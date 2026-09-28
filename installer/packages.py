@@ -1,4 +1,4 @@
-"""Packages phase: apt profile, pinned tool artifacts and the nvim venv.
+"""Packages phase: apt profile and pinned tool artifacts.
 
 apt work is a *system* phase: it goes through sudo, is not recorded by the
 dotfiles transaction and is not rolled back by ``restore``. Before any package
@@ -14,10 +14,19 @@ Links that must also work outside zsh (``~/.local/bin``) are *returned* in
 ``details["links"]`` for the transaction to own; this module never writes
 into ``~/.local/bin`` itself, except for the Claude Code launcher, which the
 verified vendor binary creates.
+
+npm packages are installed with ``npm ci --ignore-scripts`` from a lockfile
+embedded in the manifest, so the whole dependency closure is pinned and no
+lifecycle script runs; what a reviewed postinstall would have fetched is
+fetched here from pinned, verified inputs instead.
+
+No Python virtualenv is created: python3, pip, python-is-python3 and pynvim
+come from apt (user decision), so there is nothing to pin with pip here.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -97,6 +106,7 @@ class _Ctx:
             "home": str(target.home),
             "data_home": str(target.data_home),
             "codex_home": os.environ.get("CODEX_HOME") or str(target.home / ".codex"),
+            "cache_home": str(target.cache_home),
         }
         self.prefix_root = Path(expand(tools_manifest["prefix_root"], self.base))
         self.bin_dir = Path(expand(tools_manifest["bin_dir"], self.base))
@@ -484,6 +494,7 @@ def safe_extract(archive: Path, dest: Path, *, kind: str, strip: int) -> None:
         raise PackagesError(f"unsupported archive format {kind!r}")
     dest.mkdir(parents=True)
     root = dest.resolve()
+    symlinks: list[tuple[str, Path]] = []
     with tarfile.open(archive, modes[kind]) as tar:
         for member in tar:
             raw = member.name
@@ -510,11 +521,14 @@ def safe_extract(archive: Path, dest: Path, *, kind: str, strip: int) -> None:
                 os.chmod(out, (member.mode & 0o755) | 0o600)
             elif member.issym():
                 link = member.linkname
-                rel = os.path.normpath(os.path.join(os.path.dirname("/".join(parts)), link))
-                if os.path.isabs(link) or rel == ".." or rel.startswith("../"):
+                # Resolve against the real on-disk parent, so links that
+                # earlier members created along the path are followed.
+                if not link or os.path.isabs(link) or not _resolves_inside(
+                        os.path.join(os.path.realpath(out.parent), link), root):
                     raise VerificationError(f"archive symlink {raw!r} -> {link!r} escapes")
                 out.parent.mkdir(parents=True, exist_ok=True)
                 os.symlink(link, out)
+                symlinks.append((raw, out))
             elif member.islnk():
                 lparts = [p for p in member.linkname.split("/") if p not in ("", ".")]
                 if member.linkname.startswith("/") or ".." in lparts or len(lparts) <= strip:
@@ -527,6 +541,17 @@ def safe_extract(archive: Path, dest: Path, *, kind: str, strip: int) -> None:
                 shutil.copy2(source_path, out)
             else:
                 raise VerificationError(f"unsupported archive member type {raw!r}")
+    # A later member can change how an earlier link resolves (for example a
+    # link created under a path the earlier link walks through with '..').
+    # Check every link again against the finished tree.
+    for raw, out in symlinks:
+        if not _resolves_inside(str(out), root):
+            raise VerificationError(f"archive symlink {raw!r} resolves outside the prefix")
+
+
+def _resolves_inside(path: str, root: Path) -> bool:
+    resolved = Path(os.path.realpath(path))
+    return resolved == root or root in resolved.parents
 
 
 def _inside(path: Path, root: Path) -> bool:
@@ -542,11 +567,11 @@ def _read_marker(prefix: Path) -> dict | None:
     return data if isinstance(data, dict) else None
 
 
-def _marker_valid(prefix: Path, tool_id: str, version: str, sha256: str) -> bool:
+def _marker_valid(prefix: Path, tool_id: str, version: str, sha256: str, **extra: str) -> bool:
     marker = _read_marker(prefix) if prefix.is_dir() and not prefix.is_symlink() else None
     return bool(marker) and marker.get("schema") == MARKER_SCHEMA and \
         marker.get("tool") == tool_id and marker.get("version") == version and \
-        marker.get("sha256") == sha256
+        marker.get("sha256") == sha256 and all(marker.get(k) == v for k, v in extra.items())
 
 
 def _write_marker(prefix: Path, tool_id: str, version: str, artifact: dict, extra: dict) -> None:
@@ -703,43 +728,184 @@ def install_extract(ctx: _Ctx, tool_id: str, spec: dict) -> dict:
     return result
 
 
+NPM_REGISTRY = "https://registry.npmjs.org/"
+
+
+def _json_bytes(data) -> bytes:
+    return (json.dumps(data, indent=2) + "\n").encode("utf-8")
+
+
+def _lock_digest(install: dict) -> str:
+    canonical = json.dumps({"project": install.get("project"), "lockfile": install.get("lockfile")},
+                           sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def check_npm_lock(spec: dict, artifact: dict) -> None:
+    """Fail closed unless the embedded lockfile pins the whole closure.
+
+    The top-level package must resolve to the verified local tarball with the
+    pinned sha512; every other entry must be a registry tarball with sha512
+    integrity. Only packages listed in ``allowed_install_scripts`` may declare
+    lifecycle scripts; they never run (npm ci --ignore-scripts), and the
+    installer performs their effect itself (see ``native_runtime``).
+    """
+
+    install = spec.get("install", {})
+    package, version = spec.get("package"), spec.get("version")
+    project, lock, tarball = install.get("project"), install.get("lockfile"), install.get("tarball")
+    if not isinstance(project, dict) or not isinstance(lock, dict) or not isinstance(tarball, str):
+        raise VerificationError(f"{package}: install.project, install.lockfile and install.tarball are required")
+    parts = tarball.split("/")
+    if tarball.startswith("/") or ".." in parts or "" in parts:
+        raise VerificationError(f"{package}: tarball path {tarball!r} escapes the prefix")
+    if lock.get("lockfileVersion") not in (2, 3):
+        raise VerificationError(f"{package}: unsupported lockfileVersion {lock.get('lockfileVersion')!r}")
+    wanted = {package: f"file:{tarball}"}
+    packages = lock.get("packages")
+    if project.get("dependencies") != wanted or not isinstance(packages, dict) or \
+            (packages.get("") or {}).get("dependencies") != wanted:
+        raise VerificationError(f"{package}: lockfile root does not depend on exactly file:{tarball}")
+    top = packages.get(f"node_modules/{package}") or {}
+    if top.get("resolved") != f"file:{tarball}" or top.get("version") != version or \
+            not artifact.get("sha512") or top.get("integrity") != artifact["sha512"]:
+        raise VerificationError(f"{package}: lockfile entry does not match the pinned tarball")
+    allowed = set(install.get("allowed_install_scripts", []))
+    for path, entry in packages.items():
+        if not path:
+            continue
+        if not isinstance(entry, dict) or entry.get("link") or not path.startswith("node_modules/"):
+            raise VerificationError(f"{package}: lockfile entry {path!r} is not an installed tarball")
+        if path != f"node_modules/{package}":
+            resolved = str(entry.get("resolved", ""))
+            if not resolved.startswith(NPM_REGISTRY) or not str(entry.get("integrity", "")).startswith("sha512-"):
+                raise VerificationError(f"{package}: lockfile entry {path!r} is not pinned to a registry "
+                                        "tarball with sha512 integrity")
+        if entry.get("hasInstallScript") and path not in allowed:
+            raise VerificationError(f"{package}: {path} declares install scripts; review it and list it "
+                                    "in allowed_install_scripts with what the installer does instead")
+
+
+def _native_ok(binary: Path, sidecar: Path, digest: str) -> bool:
+    try:
+        return binary.is_file() and not binary.is_symlink() and \
+            sidecar.read_text(encoding="ascii") == f"{digest}\n" and \
+            downloads.file_digest(binary) == digest
+    except (OSError, UnicodeDecodeError):
+        return False
+
+
+def install_native_runtime(ctx: _Ctx, tool_id: str, spec: dict, mapping: dict[str, str]) -> dict:
+    """Do what the package's postinstall would, from pinned inputs only.
+
+    oh-my-codex's postinstall downloads omx-runtime and checks it against an
+    unsigned manifest from the same release. Instead, the archive and the
+    binary inside it are pinned here, and the binary is published in the
+    layout OMX's own hydration uses: the binary plus a ``.sha256`` sidecar
+    holding its digest and a newline.
+    """
+
+    native = spec["native_runtime"]
+    art = native["artifacts"].get(ctx.platform.architecture)
+    if art is None:
+        raise PackagesError(f"{tool_id}: no {native['product']} artifact for {ctx.platform.architecture!r}")
+    binary = Path(expand(native["cache_path"], dict(mapping, platform_key=art["platform_key"])))
+    sidecar = binary.with_name(binary.name + ".sha256")
+    digest = art["binary_sha256"].lower()
+    result = {"product": native["product"], "path": str(binary), "url": art["url"]}
+    present = _native_ok(binary, sidecar, digest)
+    result["downloaded"] = not present and not ctx.dry_run
+    if ctx.dry_run:
+        result["plan"] = "present (sha256 verified)" if present else "download+verify+publish"
+        return result
+    if not present:
+        with ctx.workdir() as work:
+            work = Path(work)
+            source = native.get("manifest")
+            if source:
+                data = ctx.download(source["url"], work / "native-release-manifest.json")
+                downloads.verify_sha256(data, source["sha256"])
+                assets = json.loads(data.read_text(encoding="utf-8")).get("assets", [])
+                entry = next((a for a in assets if a.get("download_url") == art["url"]), None)
+                if entry is None or str(entry.get("sha256", "")).lower() != art["sha256"].lower():
+                    raise VerificationError(f"{tool_id}: release manifest does not list the pinned "
+                                            f"{Path(art['url']).name}")
+            archive = ctx.download(art["url"], work / Path(art["url"]).name)
+            downloads.verify_sha256(archive, art["sha256"], size=art.get("size"))
+            stage = work / "extract"
+            safe_extract(archive, stage, kind=art["archive"], strip=0)
+            member = stage.joinpath(*art["member"].split("/"))
+            if member.is_symlink() or not member.is_file() or not _inside(member, stage.resolve()):
+                raise VerificationError(f"{tool_id}: {art['member']} missing from {Path(art['url']).name}")
+            downloads.verify_sha256(member, digest)
+            binary.parent.mkdir(parents=True, exist_ok=True)
+            os.chmod(binary.parent, 0o700)
+            if binary.is_symlink() or (os.path.lexists(binary) and not binary.is_file()):
+                raise PackagesError(f"{tool_id}: {binary} exists and is not a regular file")
+            _atomic_write(binary, member.read_bytes(), 0o755)
+            _atomic_write(sidecar, f"{digest}\n".encode("ascii"), 0o600)
+        if not _native_ok(binary, sidecar, digest):
+            raise VerificationError(f"{tool_id}: {binary} does not match the pinned sha256")
+    result["verify"] = _verify_commands(ctx, native, dict(mapping, native=str(binary)), substitute={},
+                                        env=ctx.env(path=SYSTEM_PATH))
+    return result
+
+
 def install_npm(ctx: _Ctx, tool_id: str, spec: dict, tools: dict) -> dict:
+    """npm ci --ignore-scripts into the versioned prefix from the embedded lock."""
+
     artifact = _select_artifact(spec, ctx.platform.architecture)
     mapping = _mapping(ctx, spec, artifact)
+    install = spec["install"]
     prefix = Path(mapping["prefix"])
     links = {name: prefix / rel for name, rel in spec.get("links", {}).items()}
     result = {"version": spec["version"], "prefix": str(prefix), "url": artifact["url"]}
-    fresh = not _marker_valid(prefix, tool_id, spec["version"], artifact["sha256"])
+    check_npm_lock(spec, artifact)
+    lock_sha256 = _lock_digest(install)
+    fresh = not _marker_valid(prefix, tool_id, spec["version"], artifact["sha256"],
+                              lock_sha256=lock_sha256)
     result["downloaded"] = fresh and not ctx.dry_run
     if ctx.dry_run:
-        result.update(status=SKIPPED, plan="download+verify+npm install" if fresh else "present (verified marker)")
+        result.update(status=SKIPPED, plan="download+verify+npm ci --ignore-scripts" if fresh
+                      else "present (verified marker)")
+        if spec.get("native_runtime"):
+            result["native_runtime"] = install_native_runtime(ctx, tool_id, spec, mapping)
         return result
     npm_link = ctx.bin_dir / "npm"
     if not os.path.exists(npm_link):
         raise PackagesError(f"{tool_id}: requires the pinned node/npm in {ctx.bin_dir}")
     npm_env = ctx.env(path=f"{ctx.bin_dir}:{SYSTEM_PATH}")
-    for key, value in spec.get("install", {}).get("env", {}).items():
+    for key, value in install.get("env", {}).items():
         npm_env[key] = value
     npm_env["npm_config_cache"] = str(ctx.target.cache_home / "personal-dotfiles" / "npm")
+    npm_env["npm_config_ignore_scripts"] = "true"
+    npm_env.pop("npm_config_global", None)
     if fresh:
+        argv_template = install["argv"]
+        if "--ignore-scripts" not in argv_template or "ci" not in argv_template:
+            raise PackagesError(f"{tool_id}: install.argv must be 'npm ci --ignore-scripts ...'")
         with ctx.workdir() as work:
             work = Path(work)
             tarball = ctx.download(artifact["url"], work / Path(artifact["url"]).name)
             downloads.verify_sha256(tarball, artifact["sha256"])
-            if artifact.get("sha512"):
-                downloads.verify_sri(tarball, artifact["sha512"])
+            downloads.verify_sri(tarball, artifact["sha512"])
             userconfig = work / "npmrc"
             userconfig.write_text("", encoding="utf-8")
             npm_env["npm_config_userconfig"] = str(userconfig)
             if os.path.lexists(prefix):
                 _remove_tree(prefix)
             prefix.mkdir(parents=True)
-            argv = [expand(a, dict(mapping, download=str(tarball))) for a in spec["install"]["argv"]]
-            ctx.log(f"packages: npm install {tool_id} {spec['version']}")
-            done = _run(ctx, argv, timeout=NPM_TIMEOUT, env=npm_env, cwd=work)
+            _atomic_write(prefix / "package.json", _json_bytes(install["project"]), 0o644)
+            _atomic_write(prefix / "package-lock.json", _json_bytes(install["lockfile"]), 0o644)
+            vendored = prefix.joinpath(*install["tarball"].split("/"))
+            vendored.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(tarball, vendored)
+            argv = [expand(a, dict(mapping, download=str(tarball))) for a in argv_template]
+            ctx.log(f"packages: npm ci {tool_id} {spec['version']} (lockfile, --ignore-scripts)")
+            done = _run(ctx, argv, timeout=NPM_TIMEOUT, env=npm_env, cwd=prefix)
             if done.returncode != 0:
                 _remove_tree(prefix)
-                raise PackagesError(f"{tool_id}: npm install failed: {_err_tail(done)}")
+                raise PackagesError(f"{tool_id}: npm ci failed: {_err_tail(done)}")
     substitute = {str(ctx.bin_dir / name): path for name, path in links.items()}
     try:
         result["verify"] = _verify_commands(ctx, spec, mapping, substitute=substitute,
@@ -749,7 +915,9 @@ def install_npm(ctx: _Ctx, tool_id: str, spec: dict, tools: dict) -> dict:
             _remove_tree(prefix)
         raise
     if fresh:
-        _write_marker(prefix, tool_id, spec["version"], artifact, {})
+        _write_marker(prefix, tool_id, spec["version"], artifact, {"lock_sha256": lock_sha256})
+    if spec.get("native_runtime"):
+        result["native_runtime"] = install_native_runtime(ctx, tool_id, spec, mapping)
     for name, path in links.items():
         switch_link(ctx.bin_dir / name, path)
     result["links"] = sorted(links)
@@ -831,7 +999,7 @@ def install_tool(ctx: _Ctx, tool_id: str, spec: dict, tools: dict) -> dict:
     method = spec.get("install", {}).get("method")
     if method == "extract":
         return install_extract(ctx, tool_id, spec)
-    if method == "npm-global-prefix":
+    if method == "npm-ci-lockfile":
         return install_npm(ctx, tool_id, spec, tools)
     if method == "vendor-self-install":
         return install_claude(ctx, tool_id, spec)
@@ -840,55 +1008,14 @@ def install_tool(ctx: _Ctx, tool_id: str, spec: dict, tools: dict) -> dict:
 
 # --- python venv for neovim --------------------------------------------------
 
-_PYNVIM_PROBE = "import importlib.metadata as m, pynvim; print(m.version('pynvim'))"
+_PIN_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
 
-def venv_step(ctx: _Ctx, config: dict) -> dict:
-    mapping = dict(ctx.base)
-    venv = Path(expand(config["path"], mapping))
-    python = venv / "bin" / "python"
-    result: dict = {"venv": str(venv), "python3_host_prog": str(python)}
-    env = ctx.env(path=f"{venv / 'bin'}:{SYSTEM_PATH}", PIP_CONFIG_FILE=os.devnull,
-                  PIP_REQUIRE_VIRTUALENV="1", PIP_DISABLE_PIP_VERSION_CHECK="1")
 
-    def probe() -> str | None:
-        if not python.exists():
-            return None
-        try:
-            done = _run(ctx, [python, "-c", _PYNVIM_PROBE], timeout=60, read_only=True, env=env)
-        except PackagesError:
-            return None
-        return _out(done).strip() if done.returncode == 0 else None
 
-    version = probe()
-    if version:
-        result.update(status=PASS, pynvim=version, created=False)
-        return result
-    if ctx.dry_run:
-        result.update(status=SKIPPED, plan=f"python3 -m venv {venv}; pip install "
-                      + " ".join(config["requirements"]))
-        return result
-    system_python = ctx.runner.which("python3") or "/usr/bin/python3"
-    venv.parent.mkdir(parents=True, exist_ok=True)
-    argv = [system_python, "-m", "venv"]
-    if os.path.lexists(venv):
-        argv.append("--clear")
-    done = _run(ctx, [*argv, venv], timeout=300, env=env)
-    if done.returncode != 0:
-        raise PackagesError(f"python venv {venv} failed: {_err_tail(done)} "
-                            "(is python3-venv installed?)")
-    pip = [python, "-m", "pip", "install", "--no-input"]
-    if config.get("only_binary"):
-        pip += ["--only-binary", ",".join(config["only_binary"])]
-    ctx.log("packages: pip install " + " ".join(config["requirements"]) + " into the nvim venv")
-    done = _run(ctx, [*pip, *config["requirements"]], timeout=PIP_TIMEOUT, env=env)
-    if done.returncode != 0:
-        raise PackagesError(f"pip install into {venv} failed: {_err_tail(done)}")
-    version = probe()
-    if not version:
-        raise PackagesError(f"pynvim is not importable from {python}")
-    result.update(status=PASS, pynvim=version, created=True)
-    return result
+
+
 
 
 # --- phase -------------------------------------------------------------------
@@ -1010,16 +1137,6 @@ def run_packages_phase(
                       "kind": "symlink", "link_text": str(source)})
     details["links"] = links
 
-    # 4. python venv for neovim
-    venv_cfg = tools_manifest.get("python_venvs", {}).get("nvim")
-    if venv_cfg and "neovim" in sel_tools:
-        try:
-            details["python"] = venv_step(ctx, venv_cfg)
-        except (PackagesError, OSError) as exc:
-            details["python"] = {"status": FAIL, "reason": str(exc)}
-            reasons.append(f"nvim venv: {exc}")
-        statuses.append(details["python"]["status"])
-
     if FAIL in statuses:
         status = FAIL
     elif dry_run:
@@ -1050,9 +1167,6 @@ def _print_plan(log, details: dict) -> None:
     for tool_id, result in details.get("tools", {}).items():
         log(f"packages (dry-run): {tool_id} {result.get('version', '')}: "
             f"{result.get('plan') or result.get('reason') or result.get('status')}")
-    python = details.get("python")
-    if python:
-        log(f"packages (dry-run): nvim venv: {python.get('plan') or python.get('status')}")
 
 
 def _save_state(target, status: str, details: dict) -> None:

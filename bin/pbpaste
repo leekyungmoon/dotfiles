@@ -5,6 +5,7 @@
 # practice, so a terminal that can receive a copy cannot be assumed to answer a
 # read.  When no local backend is usable we fail fast with a clear message
 # instead of silently returning a stale tmux buffer as "the clipboard".
+# An empty but live clipboard prints nothing and exits 0.
 #
 #   pbpaste                 read the OS clipboard (Wayland, then X11, then macOS)
 #   pbpaste --tmux-buffer   read the tmux paste buffer, explicitly requested
@@ -26,7 +27,7 @@ while (( $# )); do
     --tmux-buffer) mode=tmux-buffer ;;
     --backend) print_backend=1 ;;
     --help|-h)
-      sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'
+      sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'
       exit 0
       ;;
     --) shift; break ;;
@@ -51,17 +52,41 @@ have() { command -v "$1" >/dev/null 2>&1; }
 
 # A backend counts as usable only when it answers a bounded metadata probe.
 # Presence of the binary is not evidence of a live graphical session.
+# An empty clipboard is an answer: wl-paste reports "Nothing is copied" and
+# xclip "target ... not available", both with exit status 1, whereas a missing
+# compositor or X server reports "Failed to connect" / "Can't open display".
+WAYLAND_EMPTY='Nothing is copied'
+X11_EMPTY='not available'
+
 probe_wayland() {
   [[ -n ${WAYLAND_DISPLAY:-} ]] || return 1
   have wl-paste || return 1
-  run_bounded "${PBPASTE_PROBE_TIMEOUT}" wl-paste --list-types >/dev/null 2>&1
+  local err
+  err=$(run_bounded "${PBPASTE_PROBE_TIMEOUT}" wl-paste --list-types 2>&1 >/dev/null) \
+    && return 0
+  [[ ${err} == *"${WAYLAND_EMPTY}"* ]]
 }
 
 probe_x11() {
   [[ -n ${DISPLAY:-} ]] || return 1
   have xclip || return 1
-  run_bounded "${PBPASTE_PROBE_TIMEOUT}" \
-    xclip -selection clipboard -out -target TARGETS >/dev/null 2>&1
+  local err
+  err=$(run_bounded "${PBPASTE_PROBE_TIMEOUT}" \
+    xclip -selection clipboard -out -target TARGETS 2>&1 >/dev/null) && return 0
+  [[ ${err} == *"${X11_EMPTY}"* ]]
+}
+
+# Run a read with the payload going straight to stdout and only the tool's
+# own diagnostics captured. An empty clipboard becomes empty output, status 0.
+read_clipboard() {
+  local empty=$1; shift
+  local err status
+  { err=$(run_bounded "${PBPASTE_READ_TIMEOUT}" "$@" 2>&1 1>&3 3>&-); status=$?; } 3>&1
+  if (( status != 0 )) && [[ ${err} == *"${empty}"* ]]; then
+    return 0
+  fi
+  [[ -n ${err} ]] && printf '%s\n' "${err}" >&2
+  return "${status}"
 }
 
 probe_macos() {
@@ -113,10 +138,10 @@ case ${backend} in
   wayland)
     # --no-newline keeps the clipboard bytes exact; wl-paste otherwise appends
     # a newline of its own.
-    run_bounded "${PBPASTE_READ_TIMEOUT}" wl-paste --no-newline
+    read_clipboard "${WAYLAND_EMPTY}" wl-paste --no-newline
     ;;
   x11)
-    run_bounded "${PBPASTE_READ_TIMEOUT}" xclip -selection clipboard -out
+    read_clipboard "${X11_EMPTY}" xclip -selection clipboard -out
     ;;
   macos)
     exec /usr/bin/pbpaste
