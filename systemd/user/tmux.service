@@ -1,0 +1,27 @@
+# Start a detached tmux server at desktop login; tmux-continuum then restores
+# the last tmux-resurrect snapshot.  Installed as a static file by the
+# personal-dotfiles installer (continuum's @continuum-boot never rewrites it).
+[Unit]
+Description=tmux server with automatic tmux-resurrect restore (detached)
+Documentation=man:tmux(1) https://github.com/tmux-plugins/tmux-continuum
+After=graphical-session-pre.target
+
+[Service]
+Type=forking
+# The graphical environment (DISPLAY, WAYLAND_DISPLAY, ...) comes from the
+# user manager, which the desktop session imports it into before
+# graphical-session.target; tmux's update-environment refreshes it on attach.
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+UnsetEnvironment=TMUX TMUX_PANE
+# A running server with sessions belongs to the user: do not bootstrap again.
+ExecCondition=/bin/sh -c '! tmux has-session 2>/dev/null'
+ExecStart=/usr/bin/env tmux new-session -d -s __continuum_startup
+# Save, then stop; the kill runs even if the save fails.
+ExecStop=-%h/.dotfiles/tmux/resurrect-save
+ExecStop=-/usr/bin/env tmux kill-server
+KillMode=control-group
+TimeoutStartSec=90s
+TimeoutStopSec=30s
+
+[Install]
+WantedBy=graphical-session.target

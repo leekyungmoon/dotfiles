@@ -1,0 +1,14 @@
+[Unit]
+Description=Save live tmux state for crash recovery (tmux-resurrect)
+Documentation=https://github.com/tmux-plugins/tmux-resurrect
+
+[Service]
+Type=oneshot
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+UnsetEnvironment=TMUX TMUX_PANE
+# Skip (not fail) when no tmux server with sessions is running.
+ExecCondition=/usr/bin/env tmux has-session
+ExecStart=%h/.dotfiles/tmux/resurrect-save
+Nice=10
+IOSchedulingClass=idle
+TimeoutStartSec=30s

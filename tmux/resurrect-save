@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+# Run the upstream tmux-resurrect save, serialized across the prefix + C-s
+# binding, tmux-resurrect-autosave.timer and tmux.service's stop hook.
+# A save counts only when the post-save AI hook reports success; otherwise the
+# previous "last" snapshot is kept.
+set -euo pipefail
+umask 077
+# Keep the caller's PATH first (same tmux as the server); add usual fallbacks.
+export PATH="${PATH:+$PATH:}$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin"
+
+tmux has-session
+
+# TPM root, as TPM resolves it: TMUX_PLUGIN_MANAGER_PATH with a leading ~ or
+# $HOME expanded; fallback ${XDG_DATA_HOME:-$HOME/.local/share}/tmux/plugins.
+plugin_root=$(tmux show-environment -g TMUX_PLUGIN_MANAGER_PATH 2>/dev/null |
+    sed -n 's/^TMUX_PLUGIN_MANAGER_PATH=//p') || plugin_root=
+if [[ -z $plugin_root ]]; then
+    data_home=${XDG_DATA_HOME:-}
+    [[ $data_home == /* ]] || data_home=$HOME/.local/share
+    plugin_root=$data_home/tmux/plugins
+fi
+case $plugin_root in
+    "~"*) plugin_root=$HOME${plugin_root#"~"} ;;
+    '$HOME'*) plugin_root=$HOME${plugin_root#'$HOME'} ;;
+esac
+save_script=${plugin_root%/}/tmux-resurrect/scripts/save.sh
+if [[ ! -x $save_script ]]; then
+    printf 'tmux-resurrect is not installed: %s\n' "$save_script" >&2
+    exit 1
+fi
+
+# Snapshot directory, resolved exactly like tmux-resurrect's helpers.sh.
+state_dir=$(tmux show-option -gqv @resurrect-dir)
+if [[ -z $state_dir ]]; then
+    if [[ -d $HOME/.tmux/resurrect ]]; then
+        state_dir=$HOME/.tmux/resurrect
+    else
+        state_dir=${XDG_DATA_HOME:-$HOME/.local/share}/tmux/resurrect
+    fi
+fi
+state_dir=${state_dir//'$HOME'/"$HOME"}
+if [[ $state_dir == *'$HOSTNAME'* ]]; then
+    state_dir=${state_dir//'$HOSTNAME'/"$(hostname)"}
+fi
+state_dir=${state_dir//'~'/"$HOME"}
+[[ $state_dir == /* ]]
+mkdir -p -- "$state_dir"
+chmod 700 -- "$state_dir"
+
+exec 9>"$state_dir/operation.lock"
+flock -n 9 || exit 0
+
+previous=$(readlink -- "$state_dir/last" || true)
+# Upstream filenames have one-second precision; never overwrite a prior save.
+while [[ -e "$state_dir/tmux_resurrect_$(date +%Y%m%dT%H%M%S).txt" ]]; do
+    sleep 0.2
+done
+TMUX_RESURRECT_HOOK_OK=$(mktemp "$state_dir/.hook-ok.XXXXXXXX")
+export TMUX_RESURRECT_HOOK_OK
+trap 'rm -f -- "$TMUX_RESURRECT_HOOK_OK"' EXIT
+
+save_status=0
+"$save_script" quiet || save_status=$?
+
+# Upstream does not propagate hook errors; require a fresh successful hook.
+if [[ $save_status -ne 0 || ! -s $TMUX_RESURRECT_HOOK_OK ]]; then
+    if [[ -n $previous ]]; then
+        ln -sfn -- "$previous" "$state_dir/last"
+    else
+        rm -f -- "$state_dir/last"
+    fi
+    printf '%s\n' 'tmux-resurrect save or AI metadata hook failed; previous snapshot preserved.' >&2
+    exit 1
+fi
+current=$(readlink -- "$state_dir/last")
+test -s "$state_dir/$current"
+tmux set-option -g @continuum-save-last-timestamp "$(date +%s)"
+touch -- "$state_dir/last-successful-save"

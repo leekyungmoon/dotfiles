@@ -1,0 +1,30 @@
+{
+  "schema": 1,
+  "plugins": [
+    {
+      "name": "tpm",
+      "url": "https://github.com/tmux-plugins/tpm",
+      "commit": "e261deb1b47614eed3400089ce7197dc68acc4eb"
+    },
+    {
+      "name": "tmux-resurrect",
+      "url": "https://github.com/tmux-plugins/tmux-resurrect",
+      "commit": "cff343cf9e81983d3da0c8562b01616f12e8d548"
+    },
+    {
+      "name": "tmux-continuum",
+      "url": "https://github.com/tmux-plugins/tmux-continuum",
+      "commit": "0698e8f4b17d6454c71bf5212895ec055c578da0"
+    },
+    {
+      "name": "tmux-scroll-copy-mode",
+      "url": "https://github.com/nhdaly/tmux-scroll-copy-mode",
+      "commit": "aa59077c635ab21b251bd8cb4dc24c415e64a58e"
+    },
+    {
+      "name": "tmux-menus",
+      "url": "https://github.com/jaclu/tmux-menus",
+      "commit": "1c3372d489a10907d2dff7731e0a10246b7a6a81"
+    }
+  ]
+}
