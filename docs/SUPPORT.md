@@ -23,6 +23,27 @@ Status values:
 | 22.04 | arm64 | pending verification | pending verification | pending verification | pending verification | pending verification | — |
 
 
+## Pre-release checks (2026-09-28)
+
+What was checked before publishing, none of it on a fresh target machine:
+
+| Check | 22.04 amd64 | 22.04 arm64 | 24.04 amd64 | 24.04 arm64 |
+| ----- | ----------- | ----------- | ----------- | ----------- |
+| apt profile resolves with `--no-install-recommends`, no forbidden package, no removal (`apt-get -s` against the release's archive) | pass | pass | pass | pass |
+| Pinned tool artifacts: checksum/signature entry exists, URL answers | pass | pass | pass | pass |
+| Pinned tools downloaded, verified and run (`--version`) | not run | not run | pass (node, nvim, fzf, codex) | not run |
+| GNOME keys validated against the release's compiled schemas | pass | pass (same `all` packages) | pass | pass (same `all` packages) |
+| tmux config and fzf pickers on the release's tmux (3.2a / 3.4 binaries, isolated server) | pass | not run | pass | not run |
+| Installer, update, restore and one-liner flows in disposable homes (fake apt/sudo/systemctl), GNOME apply/restore on a private D-Bus, tmux save/kill/restore on isolated servers | — | — | pass (on a 24.04 amd64 host) | — |
+| Unit tests on the release's Python | pass (3.10) | not run | pass (3.12) | not run |
+
+Not verified yet anywhere: a real one-liner run on a fresh machine (real
+sudo apt, Chrome repo, chsh, systemd user units at login), live GNOME
+pickup of the settings, input-remapper with a physical keyboard, and any
+execution on arm64. Those rows in the results table stay "pending
+verification" until someone runs them.
+
+
 ## Known release differences
 
 These come from the package manifests (`manifests/packages.json`,
