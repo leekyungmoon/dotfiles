@@ -23,3 +23,5 @@ email | zsh/zshenv | Jongwook Choi | upstream author credit carried over from wo
 ssh-remote-host | tests/unit/test_audit_public.py | git.internal.test | synthetic fixture on the reserved .test TLD, kept in history by an early audit test
 home-path | tests/test-tmux-smart-paste.sh | fixture/.Xauthority | synthetic XAUTHORITY values of the mocked tmux environment
 home-path | tests/integration/test_tmux_service_start.py | GNOME_SETUP_DISPLAY=":1", HOME= | synthetic HOME of a fake user-manager environment
+home-path | tools/public-audit.allowlist | synthetic XAUTHORITY values of the mocked tmux environment | an earlier version of the rule above spelled the synthetic placeholder path itself
+home-path | tools/public-audit.allowlist | synthetic HOME of a fake user-manager environment | an earlier version of the rule above spelled the synthetic placeholder path itself
