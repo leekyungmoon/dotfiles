@@ -21,3 +21,5 @@ email | manifests/tools.json | Claude Code Release Signing | UID of Anthropic's 
 email | zsh/zshenv | Sorin Ionescu | upstream author credit (prezto) carried over from wookayin/dotfiles
 email | zsh/zshenv | Jongwook Choi | upstream author credit carried over from wookayin/dotfiles
 ssh-remote-host | tests/unit/test_audit_public.py | git.internal.test | synthetic fixture on the reserved .test TLD, kept in history by an early audit test
+home-path | tests/test-tmux-smart-paste.sh | /home/fixture/ | synthetic XAUTHORITY values of the mocked tmux environment
+home-path | tests/integration/test_tmux_service_start.py | /home/elsewhere | synthetic HOME of a fake user-manager environment
