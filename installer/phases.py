@@ -322,6 +322,50 @@ def start_autosave_timer(target, runner, env) -> tuple[str, list[str], str]:
     return PASS, [], "started"
 
 
+TMUX_RELOADED = "reloaded the running tmux server's config (sessions kept)"
+
+
+def reload_running_tmux(target, runner, env: dict[str, str] | None = None
+                        ) -> tuple[list[str], str]:
+    """Make an already running tmux server use the new ~/.tmux.conf.
+
+    A tmux server keeps the configuration it was started with, so a server
+    that was running before the install (for example one started with an
+    earlier, upstream config) would keep its old key bindings until it is
+    restarted. Only the user's default server is considered, and only when it
+    loaded this home's ~/.tmux.conf; sessions and panes are left as they are.
+    A failure is reported, never fatal. Returns ``(reasons, outcome)``.
+    """
+
+    tmux = runner.which("tmux")
+    if tmux is None:
+        return [], "no-tmux"
+    tenv = dict(os.environ if env is None else env)
+    for key in ("TMUX", "TMUX_PANE"):  # the user's default server, not a caller's
+        tenv.pop(key, None)
+    conf = target.home / ".tmux.conf"
+    probe = runner.run([tmux, "display-message", "-p", "#{config_files}"],
+                       timeout=10, check=False, env=tenv, read_only=True)
+    if probe.returncode != 0:
+        return [], "no-running-server"
+    loaded = [part.strip() for part in
+              (probe.stdout or b"").decode("utf-8", "replace").strip().split(",")
+              if part.strip()]
+    # tmux records the resolved path of each file it loaded. A config inside
+    # this home (an old ~/.tmux.conf, an upstream checkout's tmux.conf, ...) is
+    # what a restart would replace with ~/.tmux.conf anyway; a server that runs
+    # another user's or another home's config is left alone.
+    home = str(target.home).rstrip("/") + "/"
+    if not any(path == str(conf) or path.startswith(home) for path in loaded):
+        return [], "running-server-uses-another-config"
+    done = runner.run([tmux, "source-file", str(conf)], timeout=60, check=False,
+                      env=tenv)
+    if done.returncode != 0:
+        return [("could not reload the running tmux server's config: "
+                 + _tail(done.stderr or done.stdout))], "reload-failed"
+    return [TMUX_RELOADED], "reloaded"
+
+
 def post_install_phase(target, runner, *, repo_root: Path, run_id: str,
                        systemd_units_applied: bool,
                        env: dict[str, str] | None = None,
@@ -338,6 +382,13 @@ def post_install_phase(target, runner, *, repo_root: Path, run_id: str,
     statuses.append(PASS if status == SKIPPED else status)
     reasons += why
     details["tmux_plugins"] = plugin_details
+
+    # After the plugins are in place, so the reloaded config finds them.
+    try:
+        why, details["tmux_reload"] = reload_running_tmux(target, runner, env)
+    except Exception as exc:  # never let a running server break the install
+        why, details["tmux_reload"] = [f"tmux reload: {exc}"], "reload-failed"
+    reasons += why
 
     if not systemd_units_applied:
         details["systemd"] = "units-skipped"
@@ -834,6 +885,10 @@ def completion_lines(results: list[PhaseResult]) -> list[str]:
         follow.append("zsh is not your login shell yet: "
                       + "; ".join(shell.reasons))
     post = by_phase.get("post-install")
+    if post is not None and post.details.get("tmux_reload") == "reloaded":
+        follow.append("tmux was already running, so its config was reloaded. Shells "
+                      "already open in it keep their old settings: run `exec zsh` "
+                      "there, or open a new window.")
     if post is not None and "systemd-user-manager-unavailable" in post.reasons:
         follow.append("User services (tmux) start at the next graphical login.")
     gui = by_phase.get("gui")

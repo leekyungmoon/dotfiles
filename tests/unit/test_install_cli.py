@@ -1053,6 +1053,15 @@ class UiTests(unittest.TestCase):
         neither = "\n".join(phases.completion_lines([PhaseResult(
             "packages", "PASS", [], {"tools_selected": ["node", "neovim"]})]))
         self.assertNotIn("Sign in to the AI CLIs", neither)
+        # A tmux server that was running before the install was reloaded:
+        # its existing shells still have the old settings.
+        reloaded = "\n".join(phases.completion_lines([PhaseResult(
+            "post-install", "PASS", [phases.TMUX_RELOADED], {"tmux_reload": "reloaded"})]))
+        self.assertIn("exec zsh", reloaded)
+        self.assertIn("tmux was already running", reloaded)
+        quiet = "\n".join(phases.completion_lines([PhaseResult(
+            "post-install", "PASS", [], {"tmux_reload": "no-running-server"})]))
+        self.assertNotIn("tmux was already running", quiet)
         bad = "\n".join(phases.completion_lines([PhaseResult("smoke", "FAIL", ["zsh"])]))
         self.assertIn("You have   1 warnings or errors", bad)
         self.assertNotIn("codex login", bad)

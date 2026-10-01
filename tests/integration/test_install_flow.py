@@ -417,11 +417,20 @@ class InstallFlowTests(unittest.TestCase):
         # zsh plugin prefill ran (fake zsh), nvim is absent here.
         self.assertTrue(any(c[1:2] == ["-c"] and "antidote" in c[-1]
                             for c in runner.ran("zsh")))
-        # Smoke checks used an isolated -L socket and killed exactly it.
+        # The running-server reload probed the user's default server (no -L/-S),
+        # read-only; the fake answers with no config inside this home, so
+        # nothing was sourced into it.
         tmux = runner.ran("tmux")
-        sockets = {c[c.index("-L") + 1] for c in tmux}
+        probes = [c for c in tmux if c[1:2] == ["display-message"]]
+        self.assertEqual(probes, [[f"{FAKE}/tmux", "display-message", "-p", "#{config_files}"]])
+        self.assertEqual(by_phase["post-install"]["details"]["tmux_reload"],
+                         "running-server-uses-another-config")
+        self.assertFalse(any("source-file" in c and "-L" not in c for c in tmux))
+        # Smoke checks used an isolated -L socket and killed exactly it.
+        smoke = [c for c in tmux if "-L" in c]
+        sockets = {c[c.index("-L") + 1] for c in smoke}
         self.assertEqual(len(sockets), 1)
-        self.assertEqual(tmux[-1][-1], "kill-server")
+        self.assertEqual(smoke[-1][-1], "kill-server")
         # The repo submodules were never touched by the plugin step.
         self.assertTrue((self.checkout / "tmux/plugins/tpm/tpm").exists())
         # ~/.gitconfig is a small copied stub that includes the tracked file.
