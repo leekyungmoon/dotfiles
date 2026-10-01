@@ -489,6 +489,15 @@ class RuntimeWriterAuditTests(unittest.TestCase):
         rc = (REPO_ROOT / "zsh/zshrc").read_text(encoding="utf-8")
         self.assertTrue(rc.rstrip().splitlines()[-1].startswith("# vim:"))
         self.assertIn("|| _pd_reload_startup\n", rc)
+        # The new process takes the hand-over first thing in zshenv, before
+        # the startup can run any program.
+        env = (REPO_ROOT / "zsh/zshenv").read_text(encoding="utf-8")
+        early = "_pd_reload_early=1 source ${${(%):-%x}:A:h}/zsh.d/dotfiles-reload.zsh"
+        self.assertIn(early, env)
+        code = [l.strip() for l in env.splitlines()
+                if l.strip() and not l.lstrip().startswith("#")]
+        self.assertEqual(code[0], "if [[ -n ${_PD_RELOAD_PID:-} ]]; then")
+        self.assertEqual(code[3], early)
 
     def test_writer_markers(self):
         for writer in self.manifest["writers"]:

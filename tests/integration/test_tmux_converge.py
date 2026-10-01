@@ -55,6 +55,8 @@ ZSH = shutil.which("zsh", path="/usr/bin:/bin")
 UPSTREAM_REV = "097d88d8"  # wookayin/dotfiles' tmux.conf before this repository
 ZSH_SETTINGS = REPO_ROOT / "zsh" / "zsh.d" / "zsh_custom_settings.zsh"
 RELOAD_MODULE = REPO_ROOT / "zsh" / "zsh.d" / "dotfiles-reload.zsh"
+# zsh/zshrc's last line: the reload module puts a reloaded shell's session back.
+STARTUP_CALL = "(( ! ${+functions[_pd_reload_startup]} )) || _pd_reload_startup\n"
 BASH = shutil.which("bash", path="/usr/bin:/bin")
 
 FAKE_SYSTEMCTL = """#!/bin/sh
@@ -221,12 +223,13 @@ class ConvergeRunningTmuxTests(unittest.TestCase):
         self.hook_rc.write_text(f"source {RELOAD_MODULE}\n" if HOOK_SOURCE == "module"
                                 else HOOK_STUB)
         # A zsh of an earlier install of this repository: hooked, without td.
+        # Both end as zsh/zshrc does, with the reload module's startup call.
         self.hooked_old_zshrc = (f"source {self.hook_rc}\n"
-                                 "PS1='hooked%# '\n" + SHELL_LOG_LINE)
+                                 "PS1='hooked%# '\n" + SHELL_LOG_LINE + STARTUP_CALL)
         # The new setup: the repository's settings (td) and the reload hook.
         self.new_zshrc = (f"source {ZSH_SETTINGS} >/dev/null 2>&1\n"
                           f"source {self.hook_rc}\n"
-                          "PS1='new%# '\n" + SHELL_LOG_LINE)
+                          "PS1='new%# '\n" + SHELL_LOG_LINE + STARTUP_CALL)
         # An upstream ZDOTDIR, for unhooked shells started after the install.
         self.old_zdotdir = self.root / "z"
         self.old_zdotdir.mkdir()

@@ -272,18 +272,31 @@ else
   export SETUP_VALUE=new-default
   [[ -d $ZDOTDIR/added ]] && path=($ZDOTDIR/added $path)
 fi
+[[ -r $ZDOTDIR/pre-module.zsh ]] && source $ZDOTDIR/pre-module.zsh
 source $RELOAD_TEST_REPO/zsh/zsh.d/dotfiles-reload.zsh
 _t_precmd() { print -r -- "prompt $$ ${_pd_reload_loaded:-none}" >> $ZDOTDIR/prompts.log }
 precmd_functions+=(_t_precmd)
+[[ -r $ZDOTDIR/post-module.zsh ]] && source $ZDOTDIR/post-module.zsh
 # last, as zsh/zshrc does
 [[ -e $ZDOTDIR/no-startup-call ]] || _pd_reload_startup
+[[ -r $ZDOTDIR/after-startup.zsh ]] && source $ZDOTDIR/after-startup.zsh
+'''
+
+# zsh/zshenv's first lines, for the fixture's own .zshenv
+FIXTURE_ZSHENV_EARLY = r'''
+if [[ -n ${_PD_RELOAD_PID:-} ]]; then
+  if [[ $_PD_RELOAD_PID == $$ && -o interactive ]]; then
+    _pd_reload_early=1 source $RELOAD_TEST_REPO/zsh/zsh.d/dotfiles-reload.zsh
+  fi
+  unset _PD_RELOAD_PID _PD_RELOAD_FD _PD_RELOAD_HOOKFD
+fi
 '''
 
 
 class Fixture:
     def __init__(self, name, login=False, gen="g1", state_setup=None, extra_path=None,
                  strace_log=None, unset_state=False, tools=False, runtime=False,
-                 startup_call=True):
+                 startup_call=True, early=True, files=None):
         self.root = os.path.join(work, "fx-" + name)
         self.home = os.path.join(self.root, "home")
         self.zdot = os.path.join(self.root, "zdot")
@@ -299,6 +312,9 @@ class Fixture:
             self.env["XDG_RUNTIME_DIR"] = self.runtime
         if not startup_call:
             open(os.path.join(self.zdot, "no-startup-call"), "w").close()
+        for fname, body in (files or {}).items():  # hook points of FIXTURE_ZSHRC
+            with open(os.path.join(self.zdot, fname), "w") as handle:
+                handle.write(body)
         if unset_state:
             del self.env["XDG_STATE_HOME"]
             self.state = os.path.join(self.home, ".local", "state")
@@ -308,6 +324,8 @@ class Fixture:
             self.env["PATH"] = extra_path + ":" + self.env["PATH"]
         with open(os.path.join(self.zdot, ".zshenv"), "w") as handle:
             handle.write("unsetopt GLOBAL_RCS\n")
+            if early:  # as zsh/zshenv does
+                handle.write(FIXTURE_ZSHENV_EARLY)
         with open(os.path.join(self.zdot, ".zshrc"), "w") as handle:
             handle.write(FIXTURE_ZSHRC)
         with open(os.path.join(self.zdot, ".zprofile"), "w") as handle:
@@ -788,11 +806,18 @@ def _():
     fx.update("g2")
     since = len(sh.buf)
     sh.send("td; print -r -- LATE:${PATH%%:*}:$SETUP_OVERRIDE:$_pd_reload_loaded\r")
+    sh.wait(lambda: sh.loaded() == "g2", "late: new prompt")
+    sh.pump(0.8)
+    out = strip(sh.text(since))
+    check("late: the kept line comes back to the prompt, not run",
+          "TD-NEW-" not in out and len(sh.starts()) == 2, tail(out))
+    since = len(sh.buf)
+    sh.send("\r")
     sh.wait_text(r"LATE:.*:g2", since)
     sh.pump(0.3)
     out = strip(sh.text(since))
-    check("late: td once in the new shell, the session on top",
-          out.count("TD-NEW-") == 1 and "LATE:/opt/venv/bin:mine:g2" in out, out[-300:])
+    check("late: Enter runs it once in the new shell, the session on top",
+          out.count("TD-NEW-") == 1 and "LATE:/opt/venv/bin:mine:g2" in out, tail(out))
     left = [n for n in os.listdir(os.path.join(fx.state, "personal-dotfiles"))
             if n.startswith((".hist", ".handover"))]
     check("late: no hand-over file left", left == [], left)
@@ -817,6 +842,293 @@ def _():
     names = sorted(os.listdir(os.path.join(fx.state, "personal-dotfiles")))
     check("sweep: a dead shell's files go, the rest stays",
           names == sorted([f".hist.{live}", "keep.txt", "generation", "shell-hook"]), names)
+    fx.close()
+
+
+def _left(fx):
+    return [n for n in os.listdir(os.path.join(fx.state, "personal-dotfiles"))
+            if n.startswith((".hist", ".handover"))]
+
+
+@case("fixture: ^C during the new shell's startup leaves a clean, reloadable shell")
+def _():
+    slow = "[[ -e $ZDOTDIR/old-setup || -e $ZDOTDIR/no-sleep ]] || sleep 3\n"
+    fx = Fixture("ctrlc", files={"pre-module.zsh": slow})
+    sh = fx.sh
+    sh.run("export SESSION_VAR=kept PATH=/opt/venv/bin:$PATH")
+    fx.update("g2")
+    since = len(sh.buf)
+    sh.send("print -r -- KEPT-${:-RAN}-$_pd_reload_loaded\r")
+    sh.wait(lambda: len(sh.starts()) == 2, "ctrlc: new shell started", 15)
+    sh.pump(0.8)
+    sh.send("\x03")   # interrupts the rest of the startup
+    sh.pump(2.0)
+    out = strip(sh.text(since))
+    check("ctrlc: the kept line is shown, not run", "KEPT-RAN-" not in out, tail(out))
+    sh.send("\x15")   # kill-whole-line: drop it
+    sh.pump(0.3)
+    since = len(sh.buf)
+    sh.send("print -r -- STATE:${SESSION_VAR:-none}:${PATH%%:*}:${HISTFILE:t}:"
+            "${+functions[_pd_reload_precmd]}:${_PD_RELOAD_FD:-nofd}:${_PD_RELOAD_PID:-nopid}\r")
+    sh.wait_text(r"STATE:\S+", since, 10)
+    sh.pump(0.3)
+    found = re.findall(r"STATE:\S+", strip(sh.text(since)))
+    check("ctrlc: the session came back, the module is loaded, nothing exported",
+          "STATE:kept:/opt/venv/bin:.zsh_history:1:nofd:nopid" in found, found)
+    since = len(sh.buf)
+    sh.send("sh -c 'env | grep -c _PD_RELOAD; ls -l /proc/$$/fd | grep -c -e handover"
+            " -e shell-hook'\r")
+    sh.pump(1.5)
+    counts = re.findall(r"^(\d+)\s*$", strip(sh.text(since)), re.M)
+    check("ctrlc: a child gets no hand-over and no hook mark", counts == ["0", "0"], counts)
+    check("ctrlc: nothing left behind", _left(fx) == [], _left(fx))
+    open(os.path.join(fx.zdot, "no-sleep"), "w").close()
+    since = len(sh.buf)
+    sh.send("exec zsh\r")
+    sh.wait(lambda: len(sh.starts()) == 3, "ctrlc: exec zsh", 15)
+    sh.pump(1.5)
+    check("ctrlc: a later 'exec zsh' replays nothing",
+          "KEPT-RAN-" not in strip(sh.text(since)), tail(strip(sh.text(since))))
+    fx.close()
+
+
+@case("fixture: programs the new shell's startup starts get no hand-over")
+def _():
+    daemon = ("[[ -e $ZDOTDIR/old-setup ]] || { sleep 300 &! "
+              "print -r -- $! >| $ZDOTDIR/daemon.pid }\n")
+    fx = Fixture("daemon", files={"pre-module.zsh": daemon})
+    sh = fx.sh
+    sh.run("export MY_SECRET=hunter2")
+    fx.update("g2")
+    since = len(sh.buf)
+    sh.send("print -r -- TYPED-${:-SECRET}-$_pd_reload_loaded\r")
+    sh.wait_text(r"TYPED-SECRET-g2", since)
+    pidfile = os.path.join(fx.zdot, "daemon.pid")
+    sh.wait(lambda: os.path.exists(pidfile), "daemon started")
+    with open(pidfile) as handle:
+        dpid = int(handle.read().strip())
+    try:
+        with open(f"/proc/{dpid}/environ", "rb") as handle:
+            environ = handle.read()
+        links = [t for _, t in _fd_links(dpid)]
+        check("daemon: no _PD_RELOAD_* in its environment", b"_PD_RELOAD" not in environ,
+              [e for e in environ.split(b"\0") if b"PD_RELOAD" in e])
+        check("daemon: no hand-over or hook descriptor",
+              not any(".handover." in t or "shell-hook" in t for t in links), links)
+    finally:
+        try:
+            os.kill(dpid, signal.SIGKILL)
+        except OSError:
+            pass
+    fx.close()
+
+
+@case("fixture: a second update during the new shell's startup keeps the line and stack")
+def _():
+    bump = ("[[ -e $ZDOTDIR/old-setup || -e $ZDOTDIR/bumped ]] || { : >| $ZDOTDIR/bumped; "
+            "print -r -- g3 >| $XDG_STATE_HOME/personal-dotfiles/generation }\n")
+    fx = Fixture("double", files={"pre-module.zsh": bump})
+    sh = fx.sh
+    sh.send("print -r -- PUSHED-${:-LINE}-$_pd_reload_loaded")
+    sh.pump(0.3)
+    sh.send("\x1bq")   # push-line
+    sh.pump(0.3)
+    fx.update("g2")
+    since = len(sh.buf)
+    sh.send("print -r -- KEPT-${:-LINE}-$_pd_reload_loaded\r")
+    sh.wait_text(r"KEPT-LINE-g3", since)
+    sh.wait(lambda: sh.loaded() == "g3", "double: g3 prompt")
+    sh.pump(0.5)
+    sh.send("\r")
+    sh.wait_text(r"PUSHED-LINE-g3", since)
+    sh.pump(0.3)
+    out = re.findall(r"\b(?:KEPT|PUSHED)-LINE-g\d\b", strip(sh.text(since)))
+    check("double: the kept line, then the pushed one, once each, after both reloads",
+          out == ["KEPT-LINE-g3", "PUSHED-LINE-g3"] and len(sh.starts()) == 3,
+          (out, sh.starts()))
+    fx.close()
+
+
+@case("fixture: _pd_reload_disable or a reset precmd_functions in the startup")
+def _():
+    for kind, where, body in (
+            ("disable", "post-module.zsh", "[[ -e $ZDOTDIR/old-setup ]] || _pd_reload_disable\n"),
+            ("reset", "post-module.zsh",
+             "[[ -e $ZDOTDIR/old-setup ]] || precmd_functions=(_t_precmd)\n"),
+            ("reset-late", "after-startup.zsh",
+             "[[ -e $ZDOTDIR/old-setup ]] || precmd_functions=(_t_precmd)\n")):
+        fx = Fixture("off-" + kind, files={where: body})
+        sh = fx.sh
+        sh.run("print -r -- EARLIER-${:-CMD}")
+        fx.update("g2")
+        since = len(sh.buf)
+        sh.send("print -r -- KEPT-$_pd_reload_loaded:${HISTFILE:t}\r")
+        sh.wait_text(r"KEPT-g2:\S+", since)
+        sh.wait(lambda: sh.loaded() == "g2", f"{kind}: new prompt")
+        sh.run("print -r -- AFTER-${:-RELOAD}")
+        out = strip(sh.text(since))
+        check(f"{kind}: the handed-over line ran, with the real HISTFILE",
+              "KEPT-g2:.zsh_history" in out, tail(out))
+        check(f"{kind}: history goes to HISTFILE again",
+              "print -r -- AFTER-${:-RELOAD}" in history(fx.zdot), history(fx.zdot)[-3:])
+        check(f"{kind}: nothing left behind", _left(fx) == [], _left(fx))
+        fx.update("g3")
+        sh.run("")
+        sh.run("")
+        if kind == "disable":
+            check("disable: no further reload", len(sh.starts()) == 2, sh.starts())
+        else:
+            sh.wait(lambda: sh.loaded() == "g3", "reset: still reloads")
+            check("reset: the hooks came back, it still reloads", len(sh.starts()) == 3,
+                  sh.starts())
+        fx.close()
+
+
+@case("fixture: a variable the new setup made read-only stops nothing else")
+def _():
+    ro = "[[ -e $ZDOTDIR/old-setup ]] || typeset -r SETUP_OVERRIDE\n"
+    fx = Fixture("readonly", files={"post-module.zsh": ro})
+    a = fx.sh
+    b = fx.another()
+    a.run("export SETUP_OVERRIDE=mine ALSO_MINE=yes; pushd -q /tmp; pushd -q /; "
+          "print -r -- OWN-${:-A}")
+    b.run("print -r -- OTHER-${:-B}")
+    fx.update("g2")
+    since = len(a.buf)
+    a.send("print -r -- RO:$SETUP_OVERRIDE:${ALSO_MINE:-none}:${(j:|:)${(@q)dirstack}}:"
+           "$OLDPWD:$_pd_reload_loaded; fc -ln 1 >| $ZDOTDIR/ro-hist\r")
+    a.wait_text(r"RO:.*:g2", since)
+    a.pump(0.5)
+    out = strip(a.text(since))
+    check("readonly: the read-only one kept, the rest restored",
+          re.search(r"RO:from-setup:yes:/tmp\|.+:/tmp:g2", out) is not None,
+          re.findall(r"RO:\S+", out))
+    with open(os.path.join(fx.zdot, "ro-hist")) as handle:
+        listed = handle.read()
+    check("readonly: still this shell's history",
+          "OTHER-${:-B}" not in listed and "OWN-${:-A}" in listed, listed[-300:])
+    check("readonly: nothing left behind", _left(fx) == [], _left(fx))
+    fx.close()
+
+
+@case("fixture: a session that keeps no history never writes it to disk")
+def _():
+    if not shutil.which("strace"):
+        skips.append("private history: strace not installed")
+        return
+    log = os.path.join(work, "strace-private.log")
+    fx = Fixture("private-disk", strace_log=log)
+    sh = fx.sh
+    sh.run("unset HISTFILE")
+    sh.run("print -r -- PRIVATE-${:-CMD}")
+    fx.update("g2")
+    since = len(sh.buf)
+    sh.send("print -r -- AFTER-$_pd_reload_loaded:${+HISTFILE}\r")
+    sh.wait_text(r"AFTER-g2:0", since)
+    sh.pump(0.5)
+    with open(log) as handle:
+        created = [l for l in handle if "/.hist." in l and "openat(" in l]
+    check("private: no history file created on disk", created == [], created[:3])
+    fx.close()
+    # With a private XDG_RUNTIME_DIR the list goes through memory and stays.
+    fx = Fixture("private-runtime", runtime=True)
+    sh = fx.sh
+    sh.run("unset HISTFILE")
+    sh.run("print -r -- PRIVATE-${:-CMD}")
+    fx.update("g2")
+    since = len(sh.buf)
+    sh.send("fc -ln -1\r")
+    sh.wait(lambda: sh.loaded() == "g2", "private-runtime: new prompt")
+    sh.pump(0.5)
+    out = strip(sh.text(since))
+    check("private: with XDG_RUNTIME_DIR the list is kept",
+          "print -r -- PRIVATE-${:-CMD}" in out and not os.listdir(
+              os.path.join(fx.runtime, "personal-dotfiles")), tail(out))
+    fx.close()
+
+
+@case("fixture: what a plugin exports at the first prompt is the setup's, not the session's")
+def _():
+    lazy = ("if [[ -e $ZDOTDIR/old-setup ]]; then\n"
+            "  _t_lazy() { [[ -n ${LAZY_VAR-} ]] || export LAZY_VAR=old-lazy }\n"
+            "  precmd_functions+=(_t_lazy)\n"
+            "else\n"
+            "  export LAZY_VAR=new-eager\n"
+            "fi\n")
+    fx = Fixture("lazy", files={"post-module.zsh": lazy})
+    sh = fx.sh
+    sh.run("print -r -- LAZY-BEFORE-$LAZY_VAR")
+    fx.update("g2")
+    since = len(sh.buf)
+    sh.send("print -r -- LAZY-AFTER-$LAZY_VAR-$_pd_reload_loaded\r")
+    sh.wait_text(r"LAZY-AFTER-\S+-g2", since)
+    out = strip(sh.text(since))
+    check("lazy: the new setup's value", "LAZY-AFTER-new-eager-g2" in out, tail(out))
+    fx.close()
+
+
+@case("fixture: a venv stays in front of the new setup's entries, also after deactivate")
+def _():
+    fx = Fixture("venv-added", tools=True)
+    sh = fx.sh
+    tools, added = os.path.join(fx.zdot, "tools"), os.path.join(fx.zdot, "added")
+    activate = os.path.join(fx.root, "activate")
+    with open(activate, "w") as handle:
+        handle.write(
+            'deactivate () {\n'
+            '    if [ -n "${_OLD_VIRTUAL_PATH:-}" ] ; then\n'
+            '        PATH="${_OLD_VIRTUAL_PATH:-}"; export PATH; unset _OLD_VIRTUAL_PATH\n'
+            '    fi\n'
+            '    unset VIRTUAL_ENV\n'
+            '    if [ ! "${1:-}" = "nondestructive" ] ; then unset -f deactivate; fi\n'
+            '}\n'
+            'deactivate nondestructive\n'
+            'VIRTUAL_ENV=/opt/fakevenv; export VIRTUAL_ENV\n'
+            '_OLD_VIRTUAL_PATH="$PATH"\n'
+            'PATH="$VIRTUAL_ENV/bin:$PATH"; export PATH\n')
+    sh.run(f"source {activate}")
+    fx.update("g2")
+    since = len(sh.buf)
+    sh.send("print -r -- ACTIVE:${(j:,:)${${(s.:.)PATH}[1,3]}}:$_pd_reload_loaded; deactivate; "
+            "print -r -- GONE:${(j:,:)${${(s.:.)PATH}[1,2]}}\r")
+    sh.wait_text(r"GONE:\S+", since)
+    sh.pump(0.3)
+    out = strip(sh.text(since))
+    check("venv-added: the venv first, the new entry in front of the setup's",
+          f"ACTIVE:/opt/fakevenv/bin,{added},{tools}:g2" in out, tail(out))
+    check("venv-added: deactivate keeps the new setup's entry",
+          f"GONE:{added},{tools}" in out, tail(out))
+    fx.close()
+
+
+@case("fixture: a history hand-over zsh could not read falls back to HISTFILE")
+def _():
+    gone = ("[[ -e $ZDOTDIR/old-setup ]] || "
+            "rm -f -- $XDG_STATE_HOME/personal-dotfiles/.hist.$$\n")
+    fx = Fixture("hist-fallback", files={"after-startup.zsh": gone})
+    sh = fx.sh
+    sh.run("print -r -- EARLIER-${:-CMD}")
+    fx.update("g2")
+    since = len(sh.buf)
+    sh.send("fc -ln 1 | grep -c 'EARLIER-[$]'\r")   # not this line itself
+    sh.wait(lambda: sh.loaded() == "g2", "hist-fallback: new prompt")
+    sh.pump(0.5)
+    counts = re.findall(r"^(\d+)\s*$", strip(sh.text(since)), re.M)
+    check("hist-fallback: HISTFILE's lines are there", counts[-1:] == ["1"],
+          tail(strip(sh.text(since))))
+    fx.close()
+
+
+@case("fixture: without the early load in zshenv the module takes the hand-over itself")
+def _():
+    fx = Fixture("not-early", early=False)
+    sh = fx.sh
+    sh.run("export SESSION_VAR=kept")
+    fx.update("g2")
+    since = len(sh.buf)
+    sh.send("print -r -- NOTEARLY:$SESSION_VAR:$_pd_reload_loaded\r")
+    sh.wait_text(r"NOTEARLY:kept:g2", since)
+    check("not-early: one reload", len(sh.starts()) == 2, sh.starts())
     fx.close()
 
 
@@ -1111,10 +1423,12 @@ fi
 typeset -gi _t_sourced=$(( ${_t_sourced:-0} + 1 ))
 if (( _t_sourced == 1 )); then
   print -r -- "start $$ ${options[login]}" >>| $HOME/starts.log
+  [[ -r $HOME/local-first.zsh ]] && source $HOME/local-first.zsh
 else
   # after the reload module's precmd hook: the shell is ready for input
   _t_precmd() { print -r -- "prompt $$ ${_pd_reload_loaded:-none}" >>| $HOME/prompts.log }
   add-zsh-hook precmd _t_precmd
+  [[ -r $HOME/local-last.zsh ]] && source $HOME/local-last.zsh
 fi
 '''
 
@@ -1141,7 +1455,7 @@ def plugin_sources(target):
 class Real:
     sources = None
 
-    def __init__(self, name, gen="g1", tools_bin=False):
+    def __init__(self, name, gen="g1", tools_bin=False, files=None):
         self.root = os.path.join(work, "real-" + name)
         self.home = os.path.join(self.root, "home")
         zdir = os.path.join(self.home, ".zsh")
@@ -1164,6 +1478,9 @@ class Real:
                             symlinks=True)
         with open(os.path.join(self.home, ".zshrc.local"), "w") as handle:
             handle.write(REAL_LOCAL)
+        for fname, body in (files or {}).items():  # local-first.zsh, local-last.zsh
+            with open(os.path.join(self.home, fname), "w") as handle:
+                handle.write(body)
         open(os.path.join(self.home, "old-setup"), "w").close()
         write_gen(self.state, gen)
         self.sh = Shell(self.env, ["zsh", "-l"], self.root)
@@ -1518,6 +1835,85 @@ def _():
     check("real histfile: still unset, nothing written",
           "HF-0" in out and not any("SECRET" in l for l in history(r.home)),
           (out[-200:], history(r.home)[-3:]))
+    r.close()
+
+
+@real("real: ^C during the new shell's startup leaves a clean, reloadable shell")
+def _():
+    slow = "[[ -e $HOME/old-setup || -e $HOME/no-sleep ]] || sleep 3\n"
+    r = Real("ctrlc", files={"local-first.zsh": slow})
+    sh = r.sh
+    sh.run("export SESSION_VAR=kept PATH=/opt/venv/bin:$PATH")
+    r.update("g2")
+    since = len(sh.buf)
+    sh.send("print -r -- KEPT-${:-RAN}-$_pd_reload_loaded\r")
+    sh.wait(lambda: len(sh.starts()) == 2, "real ctrlc: new shell started", 30)
+    sh.pump(1.0)
+    sh.send("\x03")
+    sh.pump(3.0)
+    out = strip(sh.text(since))
+    check("real ctrlc: the kept line is shown, not run", "KEPT-RAN-" not in out, tail(out))
+    sh.send("\x15")
+    sh.pump(0.5)
+    since = len(sh.buf)
+    sh.send("print -r -- STATE:${SESSION_VAR:-none}:${PATH%%:*}:${HISTFILE:t}:"
+            "${+functions[_pd_reload_precmd]}:${_PD_RELOAD_FD:-nofd}\r")
+    sh.wait_text(r"STATE:\S+", since, 15)
+    sh.pump(0.5)
+    found = re.findall(r"STATE:\S+", strip(sh.text(since)))
+    check("real ctrlc: the session came back, the module is loaded",
+          "STATE:kept:/opt/venv/bin:.zsh_history:1:nofd" in found, found)
+    left = [n for n in os.listdir(os.path.join(r.state, "personal-dotfiles"))
+            if n.startswith((".hist", ".handover"))]
+    check("real ctrlc: nothing left behind", left == [], left)
+    r.close()
+
+
+@real("real: a second update during the new shell's startup keeps the line and stack")
+def _():
+    bump = ("[[ -e $HOME/old-setup || -e $HOME/bumped ]] || { : >| $HOME/bumped; "
+            "print -r -- g3 >| $XDG_STATE_HOME/personal-dotfiles/generation }\n")
+    r = Real("double", files={"local-first.zsh": bump})
+    sh = r.sh
+    sh.send("print -r -- PUSHED-${:-LINE}-$_pd_reload_loaded")
+    sh.pump(0.5)
+    sh.send("\x1bq")   # push-line (bound in this config)
+    sh.pump(1.0)
+    sh.send("\x1b")
+    sh.pump(0.3)
+    sh.send("i")
+    sh.pump(0.3)
+    r.update("g2")
+    since = len(sh.buf)
+    sh.send("print -r -- KEPT-${:-LINE}-$_pd_reload_loaded\r")
+    sh.wait_text(r"KEPT-LINE-g3", since, 60)
+    sh.wait(lambda: sh.loaded() == "g3", "real double: g3 prompt")
+    sh.pump(0.8)
+    sh.send("\r")
+    sh.wait_text(r"PUSHED-LINE-g3", since)
+    sh.pump(0.3)
+    out = re.findall(r"\b(?:KEPT|PUSHED)-LINE-g\d\b", strip(sh.text(since)))
+    check("real double: the kept line, then the pushed one, once each",
+          out == ["KEPT-LINE-g3", "PUSHED-LINE-g3"] and len(sh.starts()) == 3,
+          (out, sh.starts()))
+    r.close()
+
+
+@real("real: _pd_reload_disable in .zshrc.local still completes a reload")
+def _():
+    off = "[[ -e $HOME/old-setup ]] || _pd_reload_disable\n"
+    r = Real("disable", files={"local-last.zsh": off})
+    sh = r.sh
+    r.update("g2")
+    since = len(sh.buf)
+    sh.send("print -r -- KEPT-$_pd_reload_loaded:${HISTFILE:t}\r")
+    sh.wait_text(r"KEPT-g2:\S+", since, 60)
+    sh.wait(lambda: sh.loaded() == "g2", "real disable: new prompt")
+    sh.run("print -r -- AFTER-${:-DISABLE}")
+    out = strip(sh.text(since))
+    check("real disable: ran with the real HISTFILE", "KEPT-g2:.zsh_history" in out, tail(out))
+    check("real disable: history goes to HISTFILE",
+          "print -r -- AFTER-${:-DISABLE}" in history(r.home), history(r.home)[-3:])
     r.close()
 
 

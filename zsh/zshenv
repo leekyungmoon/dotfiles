@@ -19,6 +19,18 @@
 #   Jongwook Choi <wookayin@gmail.com>
 #
 
+# A zsh that a reloading interactive zsh exec'd into (same pid) loads
+# zsh.d/dotfiles-reload.zsh first: it takes over the old shell's session
+# before this startup runs any program, and an interrupted startup still
+# leaves a shell that reloads itself.
+if [[ -n ${_PD_RELOAD_PID:-} ]]; then
+  if [[ $_PD_RELOAD_PID == $$ && -o interactive \
+        && -r ${${(%):-%x}:A:h}/zsh.d/dotfiles-reload.zsh ]]; then
+    _pd_reload_early=1 source ${${(%):-%x}:A:h}/zsh.d/dotfiles-reload.zsh
+  fi
+  unset _PD_RELOAD_PID _PD_RELOAD_FD _PD_RELOAD_HOOKFD
+fi
+
 #
 # Browser
 #

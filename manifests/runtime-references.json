@@ -16,7 +16,7 @@
     "staging": "${XDG_DATA_HOME:-$HOME/.local/share}/personal-dotfiles/staging (scratch clones only)",
     "generation": "${XDG_STATE_HOME:-$HOME/.local/state}/personal-dotfiles/generation (one line '<generation>', derived by install.py from the checkout's content and written atomically at the end of the post actions of every successful install, repair or update; read with zsh builtins, never written, by zsh/zsh.d/dotfiles-reload.zsh at every primary prompt and at Enter on it)",
     "shell_hook": "${XDG_STATE_HOME:-$HOME/.local/state}/personal-dotfiles/shell-hook (empty, static, 0600, in the 0700 personal-dotfiles directory; created when missing and then held open read-only and close-on-exec by every interactive zsh that loaded zsh/zsh.d/dotfiles-reload.zsh, never written; a symlinked or foreign-owned directory or file, or a directory writable by others, is refused). A process holding a /proc/<pid>/fd link to it is a hooked shell that reloads itself: bin/dotfiles and installer/phases.py never exec over or respawn it",
-    "reload_handover": "$XDG_RUNTIME_DIR/personal-dotfiles (0700) when XDG_RUNTIME_DIR is a directory owned by the user that nobody else can use (in memory, not on disk), else ${XDG_STATE_HOME:-$HOME/.local/state}/personal-dotfiles: .handover.<pid> (the records a reloading zsh hands to the zsh it execs, 0600, O_EXCL, unlinked as soon as it is reopened for reading) and .hist.<pid> (that shell's history list, 0600, removed by the new shell once zsh has read it). Both exist only while one shell reloads itself; leftovers of a shell that died meanwhile are removed at the next zsh startup"
+    "reload_handover": "$XDG_RUNTIME_DIR/personal-dotfiles (0700) when XDG_RUNTIME_DIR is a directory owned by the user that nobody else can use (in memory, not on disk), else ${XDG_STATE_HOME:-$HOME/.local/state}/personal-dotfiles: .handover.<pid> (the records a reloading zsh hands to the zsh it execs, 0600, O_EXCL, unlinked as soon as it is reopened for reading) and .hist.<pid> (that shell's history list, 0600, removed by the new shell once zsh has read it; a session that keeps no history, HISTFILE unset or SAVEHIST=0, writes it only in the XDG_RUNTIME_DIR place). Both exist only while one shell reloads itself; leftovers of a shell that died meanwhile are removed at the next zsh startup"
   },
   "scan": {
     "roots": [
@@ -1204,11 +1204,11 @@
     },
     {
       "id": "zsh-reload-history-flush",
-      "entrypoint": "zsh/zsh.d/dotfiles-reload.zsh (precmd hook, interactive shells)",
+      "entrypoint": "zsh/zsh.d/dotfiles-reload.zsh (precmd hook, interactive shells; zsh/zshenv loads it first in a shell that reloads itself)",
       "before": "none (new)",
       "after": "appends this shell's not-yet-written lines to $HISTFILE (fc -AI), then writes the hand-over for the new zsh (same pid) it execs after the generation changed: .handover.<pid> and .hist.<pid> (fc -W) in the reload hand-over place (see path_contract.reload_handover); the new shell removes .hist.<pid> once zsh has read it, and every zsh removes such files of dead shells at startup; reads, never writes, ${XDG_STATE_HOME:-~/.local/state}/personal-dotfiles/generation",
       "status": "outside-checkout",
-      "evidence": "tests/test-zsh-dotfiles-reload.zsh: the first command after an update enters the history once; the shell keeps its own history list ('r' re-runs its own command), its buffer stack, its PATH order and its session changes (exported variables, an unset HISTFILE or SAVEHIST=0, the umask, a venv's deactivate, the directory stack); no hand-over file is left behind, leftovers of dead shells are swept, a private XDG_RUNTIME_DIR takes the hand-over and an open one does not; with the fixture and with the real zshrc and plugin stack",
+      "evidence": "tests/test-zsh-dotfiles-reload.zsh: the first command after an update enters the history once; the shell keeps its own history list ('r' re-runs its own command), its buffer stack, its PATH order and its session changes (exported variables, an unset HISTFILE or SAVEHIST=0, the umask, a venv's deactivate, the directory stack); ^C during the new shell's startup, a second update meanwhile, _pd_reload_disable or an emptied precmd_functions in the startup and a read-only variable lose nothing; programs the startup starts get no hand-over; no hand-over file is left behind, leftovers of dead shells are swept, a private XDG_RUNTIME_DIR takes the hand-over and an open one does not; with the fixture and with the real zshrc and plugin stack",
       "checks": [
         {
           "file": "zsh/zsh.d/dotfiles-reload.zsh",
@@ -1226,6 +1226,15 @@
           "forbid": [
             "\\.dotfiles/",
             "\\$\\{?ZDOTDIR"
+          ]
+        },
+        {
+          "file": "zsh/zshenv",
+          "require": [
+            "_pd_reload_early=1 source \\$\\{\\$\\{\\(%\\):-%x\\}:A:h\\}/zsh\\.d/dotfiles-reload\\.zsh"
+          ],
+          "forbid": [
+            "\\.dotfiles/dotfiles-reload"
           ]
         }
       ]
