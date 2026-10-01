@@ -13,7 +13,10 @@
     "xdg_rule": "an XDG_* value that is unset or not absolute falls back to the default",
     "tools_bin": "${XDG_DATA_HOME:-$HOME/.local/share}/personal-dotfiles/bin (first on $PATH via zsh/zshenv)",
     "nvim_python_host": "python3 on PATH (/usr/bin/python3 with apt python3-pynvim), unless $PYTHON3_HOST_PROG is set; no virtualenv is created",
-    "staging": "${XDG_DATA_HOME:-$HOME/.local/share}/personal-dotfiles/staging (scratch clones only)"
+    "staging": "${XDG_DATA_HOME:-$HOME/.local/share}/personal-dotfiles/staging (scratch clones only)",
+    "generation": "${XDG_STATE_HOME:-$HOME/.local/state}/personal-dotfiles/generation (one line '<generation>', derived by install.py from the checkout's content and written atomically at the end of the post actions of every successful install, repair or update; read with zsh builtins, never written, by zsh/zsh.d/dotfiles-reload.zsh at every primary prompt and at Enter on it)",
+    "shell_hook": "${XDG_STATE_HOME:-$HOME/.local/state}/personal-dotfiles/shell-hook (empty, static, 0600, in the 0700 personal-dotfiles directory; created when missing and then held open read-only and close-on-exec by every interactive zsh that loaded zsh/zsh.d/dotfiles-reload.zsh, never written; a symlinked or foreign-owned directory or file, or a directory writable by others, is refused). A process holding a /proc/<pid>/fd link to it is a hooked shell that reloads itself: bin/dotfiles and installer/phases.py never exec over or respawn it",
+    "reload_handover": "$XDG_RUNTIME_DIR/personal-dotfiles (0700) when XDG_RUNTIME_DIR is a directory owned by the user that nobody else can use (in memory, not on disk), else ${XDG_STATE_HOME:-$HOME/.local/state}/personal-dotfiles: .handover.<pid> (the records a reloading zsh hands to the zsh it execs, 0600, O_EXCL, unlinked as soon as it is reopened for reading) and .hist.<pid> (that shell's history list, 0600, removed by the new shell once zsh has read it). Both exist only while one shell reloads itself; leftovers of a shell that died meanwhile are removed at the next zsh startup"
   },
   "scan": {
     "roots": [
@@ -1177,6 +1180,59 @@
       "after": "unchanged (outside the checkout)",
       "status": "outside-checkout",
       "evidence": "isolated zsh -l -i: writes only under HOME and XDG cache"
+    },
+    {
+      "id": "zsh-reload-history-flush",
+      "entrypoint": "zsh/zsh.d/dotfiles-reload.zsh (precmd hook, interactive shells)",
+      "before": "none (new)",
+      "after": "appends this shell's not-yet-written lines to $HISTFILE (fc -AI), then writes the hand-over for the new zsh (same pid) it execs after the generation changed: .handover.<pid> and .hist.<pid> (fc -W) in the reload hand-over place (see path_contract.reload_handover); the new shell removes .hist.<pid> once zsh has read it, and every zsh removes such files of dead shells at startup; reads, never writes, ${XDG_STATE_HOME:-~/.local/state}/personal-dotfiles/generation",
+      "status": "outside-checkout",
+      "evidence": "tests/test-zsh-dotfiles-reload.zsh: the first command after an update enters the history once; the shell keeps its own history list ('r' re-runs its own command), its buffer stack, its PATH order and its session changes (exported variables, an unset HISTFILE or SAVEHIST=0, the umask, a venv's deactivate, the directory stack); no hand-over file is left behind, leftovers of dead shells are swept, a private XDG_RUNTIME_DIR takes the hand-over and an open one does not; with the fixture and with the real zshrc and plugin stack",
+      "checks": [
+        {
+          "file": "zsh/zsh.d/dotfiles-reload.zsh",
+          "require": [
+            "fc -AI",
+            "/personal-dotfiles/generation",
+            "XDG_STATE_HOME",
+            "state=\\$HOME/\\.local/state",
+            "_pd_reload_file=\\$_pd_reload_dir/generation",
+            "fc -W",
+            "\\.handover\\.\\$\\$",
+            "\\.hist\\.\\$\\$",
+            "XDG_RUNTIME_DIR/personal-dotfiles"
+          ],
+          "forbid": [
+            "\\.dotfiles/",
+            "\\$\\{?ZDOTDIR"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "zsh-shell-hook",
+      "entrypoint": "zsh/zsh.d/dotfiles-reload.zsh (startup of every interactive zsh)",
+      "before": "none (new)",
+      "after": "creates ${XDG_STATE_HOME:-~/.local/state}/personal-dotfiles (0700; missing parents 0700) and the empty file shell-hook in it (0600, O_EXCL) when missing, then holds shell-hook open read-only and close-on-exec (see path_contract.shell_hook); at startup no other write than removing the reload hand-over files of dead shells (see writers.zsh-reload-history-flush), nothing per prompt, nothing under the checkout",
+      "status": "outside-checkout",
+      "evidence": "tests/test-zsh-dotfiles-reload.zsh: created 0700/0700/0600, refused symlinked, group-writable and unwritable directories and a symlinked or FIFO hook file, close-on-exec flags, no fork and no write in the state directory over prompts (strace)",
+      "checks": [
+        {
+          "file": "zsh/zsh.d/dotfiles-reload.zsh",
+          "require": [
+            "_pd_reload_hook_file=\\$_pd_reload_dir/shell-hook",
+            "zf_mkdir -m 700",
+            "sysopen -w -o creat,excl,nofollow,cloexec -m 600",
+            "sysopen -r -o cloexec,nofollow,nonblock"
+          ],
+          "forbid": [
+            "\\.dotfiles/",
+            "\\$\\{?ZDOTDIR",
+            "_DOTFILES_RUNTIME_ROOT",
+            "/run/user"
+          ]
+        }
+      ]
     },
     {
       "id": "p10k-caches",

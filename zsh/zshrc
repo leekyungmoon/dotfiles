@@ -287,6 +287,10 @@ if [ -f "$HOME/.zshrc.local" ]; then
     source "$HOME/.zshrc.local"
 fi
 
+# Last: a shell that reloaded itself after a dotfiles update gets its session
+# back on top of the setup loaded above (see zsh.d/dotfiles-reload.zsh).
+(( ! ${+functions[_pd_reload_startup]} )) || _pd_reload_startup
+
 # Profiling
 if [ -n "$ZSH_PROFILE_LOG" ]; then
   zprof >! "$ZSH_PROFILE_LOG"
