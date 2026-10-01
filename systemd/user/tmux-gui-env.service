@@ -1,0 +1,18 @@
+# Refresh the graphical environment of a tmux server that outlived the last
+# login: Xwayland gets a new cookie and auth file at every login, so panes of
+# an older server would otherwise lose X11 (e.g. image paste in Codex).
+[Unit]
+Description=Refresh tmux desktop display variables after graphical login
+Documentation=https://github.com/leekyungmoon/dotfiles/blob/HEAD/docs/tmux-auto-restore.ko.md
+# Runs after tmux.service so a freshly started server is covered too.
+After=graphical-session.target tmux.service
+
+[Service]
+Type=oneshot
+Environment=PATH=%h/.local/share/personal-dotfiles/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+UnsetEnvironment=TMUX TMUX_PANE TMUX_SERVICE_TMUX TMUX_SERVICE_ENV_POLLS
+ExecStart=%h/.dotfiles/tmux/tmux-service-start --sync
+TimeoutStartSec=60s
+
+[Install]
+WantedBy=graphical-session.target

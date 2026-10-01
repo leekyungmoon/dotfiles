@@ -85,7 +85,7 @@ if global_environment=$(timeout --kill-after="${kill_grace}" \
     [[ ${environment_entry} == *=* ]] || continue
     environment_name=${environment_entry%%=*}
     case ${environment_name} in
-      DISPLAY|WAYLAND_DISPLAY|XDG_RUNTIME_DIR|XDG_SESSION_TYPE|\
+      DISPLAY|WAYLAND_DISPLAY|XAUTHORITY|XDG_RUNTIME_DIR|XDG_SESSION_TYPE|\
         DBUS_SESSION_BUS_ADDRESS)
         ;;
       *)

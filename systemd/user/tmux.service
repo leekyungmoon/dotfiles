@@ -19,10 +19,15 @@ Type=forking
 # PATH puts the installer's tools directory (fd shim, fzf-preview.sh) first,
 # as zsh/zshenv does, for run-shell and popup commands of this server.
 Environment=PATH=%h/.local/share/personal-dotfiles/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
-UnsetEnvironment=TMUX TMUX_PANE
+# Fallback only: tmux-service-start takes DISPLAY, WAYLAND_DISPLAY and the
+# Xwayland cookie from the user manager once GNOME has exported them.
+Environment=DISPLAY=:0
+UnsetEnvironment=TMUX TMUX_PANE TMUX_SERVICE_TMUX TMUX_SERVICE_ENV_POLLS
 # A running server with sessions belongs to the user: do not bootstrap again.
 ExecCondition=/bin/sh -c '! tmux has-session 2>/dev/null'
-ExecStart=/usr/bin/env tmux new-session -d -s __continuum_startup
+# Waits (bounded) for the graphical environment, keeps the Xwayland cookie in
+# ~/.Xauthority, then execs `tmux new-session -d -s __continuum_startup`.
+ExecStart=%h/.dotfiles/tmux/tmux-service-start
 # Save, then stop; the kill runs even if the save fails or is skipped.
 ExecStop=-%h/.dotfiles/tmux/resurrect-save
 ExecStop=-/usr/bin/env tmux kill-server

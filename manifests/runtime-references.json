@@ -1049,6 +1049,22 @@
       "classification": "runtime-link",
       "purpose": "user-facing hint: how to install a skipped AI CLI later from the ~/.dotfiles checkout",
       "count": 1
+    },
+    {
+      "file": "systemd/user/tmux.service",
+      "line": "ExecStart=%h/.dotfiles/tmux/tmux-service-start",
+      "kind": "link",
+      "classification": "runtime-link",
+      "purpose": "tmux.service starts the server through the checkout's wrapper, which waits for the desktop environment and the Xwayland cookie",
+      "count": 1
+    },
+    {
+      "file": "systemd/user/tmux-gui-env.service",
+      "line": "ExecStart=%h/.dotfiles/tmux/tmux-service-start --sync",
+      "kind": "link",
+      "classification": "runtime-link",
+      "purpose": "at every login, refreshes the graphical environment of a tmux server that outlived the last login",
+      "count": 1
     }
   ],
   "writers": [

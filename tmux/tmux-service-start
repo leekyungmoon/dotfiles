@@ -1,0 +1,261 @@
+#!/bin/sh
+# Desktop display variables for tmux panes.
+#
+#   tmux-service-start         tmux.service ExecStart: start the detached
+#                              bootstrap server with the session's variables.
+#   tmux-service-start --sync  tmux-gui-env.service, every graphical login:
+#                              refresh the X cookie and, when a server
+#                              survived logout, its environment.
+#
+# At graphical-session start the user manager may not have WAYLAND_DISPLAY or
+# XAUTHORITY yet; GNOME exports them slightly later.  The tmux server copies its
+# own environment into the global environment that every restored pane, and
+# every AI TUI that reads the clipboard for an image paste, inherits.  Starting
+# with DISPLAY alone leaves Xwayland unauthorized and Wayland unknown, so wait
+# (bounded) for the session variables instead.
+#
+# Xwayland's auth file is renamed on every login, while tmux (and the processes
+# in its panes) may outlive a logout.  Panes are therefore given a stable file,
+# ~/.local/state/tmux/Xauthority, rebuilt on each login with only the current
+# cookie bound to this display.  The same display-bound entries are merged into
+# ~/.Xauthority for processes started without XAUTHORITY.  mutter's own entries
+# carry no display number (they match every display), so they are never copied
+# verbatim.  Both files hold the live cookie: keep them out of backups.
+
+set -u
+set -f
+
+mode=start
+if [ "${1:-}" = --sync ]; then
+  mode=sync
+fi
+
+# The unit's PATH puts ~/.local/bin first, so a user-local tmux wins over /usr/bin.
+tmux_bin=${TMUX_SERVICE_TMUX:-$(command -v tmux)}
+if [ -z "$tmux_bin" ]; then
+  echo "tmux-service-start: tmux not found on PATH" >&2
+  exit 1
+fi
+max_polls=${TMUX_SERVICE_ENV_POLLS:-40}  # 0.5 s each; well inside the timeouts
+case $max_polls in
+  '' | *[!0-9]* | ????*) max_polls=40 ;;
+esac
+
+names='DISPLAY WAYLAND_DISPLAY XAUTHORITY XDG_SESSION_TYPE XDG_CURRENT_DESKTOP DBUS_SESSION_BUS_ADDRESS'
+
+env_dump=
+pick() {
+  value=$(printf '%s\n' "$env_dump" | sed -n "s/^$1=//p" | head -n 1)
+  case $value in
+    \$\'*) value= ;;  # systemd-escaped value: never export it verbatim
+  esac
+  printf '%s' "$value"
+}
+
+listed() {
+  printf '%s\n' "$env_dump" | grep -q "^$1="
+}
+
+session_env_ready() {
+  [ -n "$env_dump" ] || return 1  # systemctl failed: retry within the bound
+  [ "$(pick XDG_SESSION_TYPE)" = wayland ] || return 0
+  [ -n "$(pick WAYLAND_DISPLAY)" ] || return 1
+  # With Xwayland also wait for a readable cookie; pure Wayland has no DISPLAY.
+  [ -z "$(pick DISPLAY)" ] || [ -r "$(pick XAUTHORITY)" ]
+}
+
+polls=0
+ready=no
+while :; do
+  env_dump=$(systemctl --user show-environment 2>/dev/null) || env_dump=
+  if session_env_ready; then
+    ready=yes
+    break
+  fi
+  polls=$((polls + 1))
+  [ "$polls" -ge "$max_polls" ] && break
+  sleep 0.5
+done
+if [ "$ready" = no ]; then
+  echo "tmux-service-start: desktop session variables not ready after $polls polls; continuing" >&2
+fi
+
+for name in $names; do
+  value=$(pick "$name")
+  if [ -n "$value" ]; then
+    export "$name=$value"
+  fi
+done
+
+# Display number of a local DISPLAY (":0" or ":0.0"); empty for remote ones.
+display_number=
+case ${DISPLAY:-} in
+  :[0-9]*)
+    display_number=${DISPLAY#:}
+    display_number=${display_number%%.*}
+    case $display_number in
+      *[!0-9]*) display_number= ;;
+    esac
+    ;;
+esac
+
+# The cookie only ever travels through pipes and unexported shell variables;
+# keep it out of an xtrace log too.
+case $- in
+  *x*) trace=on; set +x ;;
+  *) trace=off ;;
+esac
+
+# Entries of the current auth file, rebound to this display number.
+entries=
+source_auth=${XAUTHORITY:-}
+if [ -n "$display_number" ] && [ -n "$source_auth" ] && [ -r "$source_auth" ]; then
+  entries=$(xauth -f "$source_auth" nlist 2>/dev/null | awk -v num="$display_number" '
+    function hex(s,   i, out) {
+      out = ""
+      for (i = 1; i <= length(s); i++) out = out sprintf("%02x", 48 + substr(s, i, 1))
+      return out
+    }
+    NF == 8 && $4 == "0000" {
+      printf "%s %s %s %04x %s %s %s %s %s\n", $1, $2, $3, length(num), hex(num), $5, $6, $7, $8
+      next
+    }
+    NF == 9 && $5 == hex(num) { print }
+  ') || entries=
+fi
+
+# The stable per-user file lives in a private directory that this script
+# validates once: a real directory owned by the user with no group/other access.
+stable=
+stable_ok=no
+built=no
+if [ -n "${HOME:-}" ] && [ -n "$display_number" ]; then
+  stable_dir=$HOME/.local/state/tmux
+  stable=$stable_dir/Xauthority
+  if (umask 077 && mkdir -p "$stable_dir") 2>/dev/null &&
+    [ -d "$stable_dir" ] && [ ! -L "$stable_dir" ] && [ -O "$stable_dir" ] &&
+    chmod 700 "$stable_dir" 2>/dev/null &&
+    [ -z "$(find "$stable_dir" -maxdepth 0 -perm /077 2>/dev/null)" ]; then
+    stable_ok=yes
+  fi
+fi
+
+# Rebuild the stable file atomically with exactly these entries.
+if [ "$stable_ok" = yes ] && [ -n "$entries" ] && [ "$source_auth" != "$stable" ]; then
+  tmp=$( (umask 077 && mktemp "$stable_dir/.Xauthority.XXXXXX") 2>/dev/null) || tmp=
+  if [ -n "$tmp" ]; then
+    trap 'rm -f "$tmp" "$tmp-n" "$tmp-c" "$tmp-l"' EXIT
+    trap 'rm -f "$tmp" "$tmp-n" "$tmp-c" "$tmp-l"; exit 1' HUP INT TERM
+    printf '%s\n' "$entries" | xauth -q -f "$tmp" nmerge - >/dev/null 2>&1
+    written=$(xauth -f "$tmp" nlist 2>/dev/null) || written=
+    # xauth writes FamilyWild entries last, so compare order-independently.
+    # mv -T (GNU) refuses a directory at the stable path instead of moving
+    # the cookie into it; elsewhere it fails closed (built=no).
+    if [ -n "$written" ] &&
+      [ "$(printf '%s\n' "$written" | sort)" = "$(printf '%s\n' "$entries" | sort)" ] &&
+      mv -fT "$tmp" "$stable" 2>/dev/null; then
+      built=yes
+    else
+      rm -f "$tmp" "$tmp-n" "$tmp-c" "$tmp-l"
+    fi
+    trap - EXIT HUP INT TERM
+    written=
+    tmp=
+  fi
+fi
+
+# Compatibility copy for processes that were started without XAUTHORITY.
+# Break a lock only when it is stale (older than a minute).
+if [ "$built" = yes ]; then
+  lock_flag=
+  if [ -n "$(find "$HOME/.Xauthority-c" -maxdepth 0 -mmin +1 2>/dev/null)" ]; then
+    lock_flag=-b
+  fi
+  printf '%s\n' "$entries" |
+    (umask 077 && xauth $lock_flag -q -f "$HOME/.Xauthority" nmerge -) \
+      >/dev/null 2>&1 || :
+fi
+entries=
+
+if [ "$trace" = on ]; then
+  set -x
+fi
+
+# Which XAUTHORITY panes get:
+#   rebuilt stable file          -> the stable path;
+#   readable source, not rebuilt -> keep that working per-login path;
+#   source set but unreadable    -> the stable path (the next --sync refreshes
+#                                   it in place), never the dead per-login path;
+#   no source at all             -> leave XAUTHORITY unset so X clients use
+#                                   their default ~/.Xauthority (e.g. Xorg).
+if [ "$built" = yes ]; then
+  export XAUTHORITY="$stable"
+elif [ -n "$source_auth" ] && [ -r "$source_auth" ]; then
+  if [ -n "$display_number" ] && [ "$source_auth" != "$stable" ]; then
+    if [ "$mode" = sync ]; then
+      echo "tmux-service-start: X cookie not rebuilt; tmux XAUTHORITY left unchanged" >&2
+    else
+      echo "tmux-service-start: X cookie not rebuilt; keeping $source_auth" >&2
+    fi
+  fi
+elif [ -n "$source_auth" ] && [ "$stable_ok" = yes ]; then
+  if [ "$mode" = sync ]; then
+    echo "tmux-service-start: $source_auth is not readable; tmux XAUTHORITY left unchanged" >&2
+  else
+    echo "tmux-service-start: $source_auth is not readable; using $stable" >&2
+  fi
+  export XAUTHORITY="$stable"
+elif [ -n "$source_auth" ]; then
+  unset XAUTHORITY
+fi
+
+if [ "$mode" = start ]; then
+  if ! "$tmux_bin" has-session 2>/dev/null; then
+    exec "$tmux_bin" new-session -d -s __continuum_startup
+  fi
+fi
+
+if "$tmux_bin" has-session 2>/dev/null && [ -n "$env_dump" ]; then
+  for name in $names; do
+    if [ "$name" = XAUTHORITY ]; then
+      # Publish only a freshly built stable file; never replace a working
+      # global value with a volatile per-login path.
+      if [ "$built" = yes ]; then
+        "$tmux_bin" set-environment -g XAUTHORITY "$stable"
+      fi
+      continue
+    fi
+    value=$(pick "$name")
+    if [ -n "$value" ]; then
+      "$tmux_bin" set-environment -g "$name" "$value"
+    elif ! listed "$name"; then
+      # Gone from this login (e.g. WAYLAND_DISPLAY on an Xorg login).
+      "$tmux_bin" set-environment -gu "$name" 2>/dev/null || :
+    fi
+  done
+
+  # Session-level copies (made by update-environment on attach, or "-NAME"
+  # removal markers from sessions restored before the variables existed)
+  # shadow the global values for new panes.  Address sessions by ID so no
+  # session name is parsed as a target.
+  "$tmux_bin" list-sessions -F '#{session_id}' 2>/dev/null |
+    while IFS= read -r session_id; do
+      case $session_id in
+        \$[0-9]*) ;;
+        *) continue ;;
+      esac
+      for name in XAUTHORITY WAYLAND_DISPLAY DISPLAY; do
+        "$tmux_bin" set-environment -t "$session_id" -u "$name" \
+          2>/dev/null || :
+      done
+    done
+fi
+
+if [ "$mode" = start ]; then
+  # A server appeared while waiting (a user started tmux).  It is now synced,
+  # but it is not this unit's process: fail the start so systemd does not run
+  # ExecStop (resurrect-save + kill-server) against the user's server.
+  echo "tmux-service-start: a tmux server is already running; refreshed it instead of starting one" >&2
+  exit 75
+fi
+exit 0

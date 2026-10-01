@@ -218,10 +218,12 @@
       "condition": "systemd-user"
     },
     {
-      "id": "systemd-tmux-service-login-dropin",
-      "dest": "{config}/systemd/user/tmux.service.d/login.conf",
-      "kind": "remove",
-      "description": "obsolete drop-in from an older local setup that would override the shipped tmux.service"
+      "id": "systemd-tmux-gui-env-service",
+      "dest": "{config}/systemd/user/tmux-gui-env.service",
+      "kind": "copy",
+      "source": "systemd/user/tmux-gui-env.service",
+      "mode": "0644",
+      "condition": "systemd-user"
     },
     {
       "id": "systemd-tmux-resurrect-autosave-service",
@@ -251,6 +253,13 @@
       "dest": "{config}/systemd/user/timers.target.wants/tmux-resurrect-autosave.timer",
       "kind": "link",
       "link_to": "{config}/systemd/user/tmux-resurrect-autosave.timer",
+      "condition": "systemd-user"
+    },
+    {
+      "id": "systemd-enable-tmux-gui-env-service",
+      "dest": "{config}/systemd/user/graphical-session.target.wants/tmux-gui-env.service",
+      "kind": "link",
+      "link_to": "{config}/systemd/user/tmux-gui-env.service",
       "condition": "systemd-user"
     }
   ]

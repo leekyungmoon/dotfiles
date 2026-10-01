@@ -464,9 +464,9 @@ class InstallFlowTests(unittest.TestCase):
         plain = colored.replace("\033[0;33m", "").replace("\033[0;32m", "") \
             .replace("\033[0;34m", "").replace("\033[0m", "")
         self.assertIn(f"backed up to {zshrc_backup}, replaced", plain)
-        self.assertIn(f"backed up to {baseline / 'systemd-tmux-service-login-dropin' / 'object'}"
-                      ", removed", plain)
-        self.assertFalse(os.path.lexists(dropin))
+        # An existing tmux.service.d drop-in is the user's: left exactly as it was.
+        self.assertEqual(dropin.read_text(), "[Service]\nExecStart=\n")
+        self.assertNotIn("login.conf", plain)
         self.assertTrue(runs.is_dir())
 
         rc, out, _ = self.main("restore", "--baseline")

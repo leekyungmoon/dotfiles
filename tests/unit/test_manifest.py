@@ -398,5 +398,18 @@ class RejectionTests(ManifestTestCase):
             mf.resolve(manifest, self.target, self.tmp / "no-repo")
 
 
+class NeverManagedTests(unittest.TestCase):
+    """Files holding live X cookies are never shipped, managed or backed up."""
+
+    def test_x_cookie_files_are_not_managed(self):
+        manifest = mf.load_manifest(REPO_ROOT / "manifests" / "managed-paths.json")
+        forbidden = ("{home}/.Xauthority", "{state}/tmux", "{home}/.local/state/tmux")
+        for entry in manifest.entries:
+            with self.subTest(entry=entry.id):
+                for path in forbidden:
+                    self.assertFalse(entry.dest == path or entry.dest.startswith(path + "/"),
+                                     entry.dest)
+
+
 if __name__ == "__main__":
     unittest.main()

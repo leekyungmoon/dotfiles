@@ -63,6 +63,8 @@ case " $* " in
     ;;
 esac
 printf 'xclip:%s\n' "$*" >>"${MOCK_BACKEND_LOG}"
+# Xwayland authorizes the X11 bridge through this variable.
+printf 'xclip:XAUTHORITY=%s\n' "${XAUTHORITY-<unset>}" >>"${MOCK_ENV_LOG}"
 case ${mode} in
   fail)
     exit 1
@@ -108,6 +110,8 @@ case ${1:-} in
       [[ -n ${MOCK_TMUX_GLOBAL_WAYLAND_DISPLAY:-} ]] &&
         printf 'WAYLAND_DISPLAY=%s\n' \
           "${MOCK_TMUX_GLOBAL_WAYLAND_DISPLAY}"
+      [[ -n ${MOCK_TMUX_GLOBAL_XAUTHORITY:-} ]] &&
+        printf 'XAUTHORITY=%s\n' "${MOCK_TMUX_GLOBAL_XAUTHORITY}"
       [[ -n ${MOCK_TMUX_GLOBAL_XDG_RUNTIME_DIR:-} ]] &&
         printf 'XDG_RUNTIME_DIR=%s\n' \
           "${MOCK_TMUX_GLOBAL_XDG_RUNTIME_DIR}"
@@ -126,6 +130,9 @@ case ${1:-} in
       WAYLAND_DISPLAY)
         environment_value=${MOCK_TMUX_GLOBAL_WAYLAND_DISPLAY:-}
         ;;
+      XAUTHORITY)
+        environment_value=${MOCK_TMUX_GLOBAL_XAUTHORITY:-}
+        ;;
       XDG_RUNTIME_DIR)
         environment_value=${MOCK_TMUX_GLOBAL_XDG_RUNTIME_DIR:-}
         ;;
@@ -143,6 +150,9 @@ case ${1:-} in
     printf '%s=%s\n' "${environment_name}" "${environment_value}"
     ;;
   display-message)
+    # The helper's first tmux call: what the caller (pane binding) had.
+    printf 'display-message:XAUTHORITY=%s\n' "${XAUTHORITY-<unset>}" \
+      >>"${MOCK_ENV_LOG}"
     printf '/dev/pts/77|||TSP|||%s\n' \
       "${MOCK_PANE_CURRENT_COMMAND:-zsh}"
     ;;
@@ -187,8 +197,16 @@ run_case() {
   : >"${MOCK_LOG}"
   : >"${MOCK_BACKEND_LOG}"
   : >"${MOCK_PAYLOAD_FILE}"
+  : >"${MOCK_ENV_LOG}"
   rm -f -- "${MOCK_WL_PID_FILE}" "${MOCK_XCLIP_PID_FILE}"
-  command=("${script_path}" %77)
+  # The caller's XAUTHORITY is explicit: set, or truly absent (never the
+  # value of whatever shell runs this test).
+  if [[ -n ${MOCK_SESSION_XAUTHORITY} ]]; then
+    caller_xauthority=("XAUTHORITY=${MOCK_SESSION_XAUTHORITY}")
+  else
+    caller_xauthority=(-u XAUTHORITY)
+  fi
+  command=(/usr/bin/env "${caller_xauthority[@]}" "${script_path}" %77)
   if [[ -n ${MOCK_OUTER_TIMEOUT:-} ]]; then
     command=(timeout --kill-after=0.20s \
       "${MOCK_OUTER_TIMEOUT}" "${command[@]}")
@@ -202,6 +220,7 @@ run_case() {
     MOCK_LOG="${MOCK_LOG}" \
     MOCK_BACKEND_LOG="${MOCK_BACKEND_LOG}" \
     MOCK_PAYLOAD_FILE="${MOCK_PAYLOAD_FILE}" \
+    MOCK_ENV_LOG="${MOCK_ENV_LOG}" \
     MOCK_WL_TYPES_MODE="${MOCK_WL_TYPES_MODE}" \
     MOCK_WL_PAYLOAD_MODE="${MOCK_WL_PAYLOAD_MODE}" \
     MOCK_WL_DELAY="${MOCK_WL_DELAY}" \
@@ -219,6 +238,7 @@ run_case() {
     MOCK_TMUX_PASTE_MODE="${MOCK_TMUX_PASTE_MODE}" \
     MOCK_TMUX_GLOBAL_DISPLAY="${MOCK_TMUX_GLOBAL_DISPLAY}" \
     MOCK_TMUX_GLOBAL_WAYLAND_DISPLAY="${MOCK_TMUX_GLOBAL_WAYLAND_DISPLAY}" \
+    MOCK_TMUX_GLOBAL_XAUTHORITY="${MOCK_TMUX_GLOBAL_XAUTHORITY}" \
     MOCK_TMUX_GLOBAL_XDG_RUNTIME_DIR="${MOCK_TMUX_GLOBAL_XDG_RUNTIME_DIR}" \
     MOCK_TMUX_GLOBAL_XDG_SESSION_TYPE="${MOCK_TMUX_GLOBAL_XDG_SESSION_TYPE}" \
     MOCK_TMUX_GLOBAL_DBUS_SESSION_BUS_ADDRESS="${MOCK_TMUX_GLOBAL_DBUS_SESSION_BUS_ADDRESS}" \
@@ -231,8 +251,10 @@ reset_case() {
   MOCK_SESSION_XDG_RUNTIME_DIR=/run/user/1000
   MOCK_SESSION_XDG_SESSION_TYPE=wayland
   MOCK_SESSION_DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus
+  MOCK_SESSION_XAUTHORITY=''
   MOCK_TMUX_GLOBAL_DISPLAY=:0
   MOCK_TMUX_GLOBAL_WAYLAND_DISPLAY=wayland-global
+  MOCK_TMUX_GLOBAL_XAUTHORITY=''
   MOCK_TMUX_GLOBAL_XDG_RUNTIME_DIR=/run/user/1000
   MOCK_TMUX_GLOBAL_XDG_SESSION_TYPE=wayland
   MOCK_TMUX_GLOBAL_DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus
@@ -268,6 +290,7 @@ assert_buffer_cleaned() {
 MOCK_LOG=${test_root}/calls.log
 MOCK_BACKEND_LOG=${test_root}/backend.log
 MOCK_PAYLOAD_FILE=${test_root}/payload
+MOCK_ENV_LOG=${test_root}/env.log
 MOCK_WL_PID_FILE=${test_root}/wl.pid
 MOCK_XCLIP_PID_FILE=${test_root}/xclip.pid
 
@@ -317,6 +340,64 @@ grep -Fxq 'send-keys:send-keys -t %77 C-v' "${MOCK_LOG}"
 grep -Fxq 'wl-paste:--list-types' "${MOCK_BACKEND_LOG}"
 grep -Fxq 'xclip:-selection clipboard -out -target TARGETS' \
   "${MOCK_BACKEND_LOG}"
+
+# Panes restored before the desktop exported XAUTHORITY lack it, while tmux's
+# global environment carries the stable ~/.Xauthority.  The X11 bridge must
+# run with the imported value, or Xwayland rejects the clipboard read.
+reset_case
+MOCK_TMUX_GLOBAL_XAUTHORITY=/home/fixture/.Xauthority
+MOCK_CLIPBOARD_TYPES=''
+MOCK_X11_CLIPBOARD_TYPES='TARGETS image/png'
+MOCK_TTY_COMMANDS=$'zsh 77 77\ncodex 77 77'
+run_case
+grep -Fxq 'send-keys:send-keys -t %77 C-v' "${MOCK_LOG}"
+grep -Fxq 'xclip:-selection clipboard -out -target TARGETS' \
+  "${MOCK_BACKEND_LOG}"
+grep -Fxq 'display-message:XAUTHORITY=<unset>' "${MOCK_ENV_LOG}"
+[[ $(grep -c '^xclip:' "${MOCK_ENV_LOG}") -eq 1 ]]
+grep -Fxq 'xclip:XAUTHORITY=/home/fixture/.Xauthority' "${MOCK_ENV_LOG}"
+
+# The X11 text payload read (second xclip call) uses the same import.
+reset_case
+MOCK_WAYLAND_DISPLAY=''
+MOCK_TMUX_GLOBAL_WAYLAND_DISPLAY=''
+MOCK_SESSION_XDG_SESSION_TYPE=x11
+MOCK_TMUX_GLOBAL_XDG_SESSION_TYPE=x11
+MOCK_TMUX_GLOBAL_XAUTHORITY=/home/fixture/.Xauthority
+MOCK_X11_CLIPBOARD_TYPES='TARGETS text/plain;charset=utf-8'
+MOCK_X11_CLIPBOARD_TEXT='x11 text via imported auth'
+MOCK_TTY_COMMANDS='zsh 77 77'
+run_case
+[[ $(<"${MOCK_PAYLOAD_FILE}") == 'x11 text via imported auth' ]]
+grep -Fxq 'display-message:XAUTHORITY=<unset>' "${MOCK_ENV_LOG}"
+[[ $(grep -c '^xclip:' "${MOCK_ENV_LOG}") -eq 2 ]]
+[[ $(grep -Fxc 'xclip:XAUTHORITY=/home/fixture/.Xauthority' \
+  "${MOCK_ENV_LOG}") -eq 2 ]]
+assert_buffer_cleaned
+
+# A caller that already has XAUTHORITY keeps its own value.
+reset_case
+MOCK_SESSION_XAUTHORITY=/home/fixture/.Xauthority-caller
+MOCK_TMUX_GLOBAL_XAUTHORITY=/home/fixture/.Xauthority
+MOCK_CLIPBOARD_TYPES=''
+MOCK_X11_CLIPBOARD_TYPES='TARGETS image/png'
+MOCK_TTY_COMMANDS=$'zsh 77 77\ncodex 77 77'
+run_case
+grep -Fxq 'send-keys:send-keys -t %77 C-v' "${MOCK_LOG}"
+grep -Fxq 'display-message:XAUTHORITY=/home/fixture/.Xauthority-caller' \
+  "${MOCK_ENV_LOG}"
+grep -Fxq 'xclip:XAUTHORITY=/home/fixture/.Xauthority-caller' "${MOCK_ENV_LOG}"
+if grep -Fxq 'xclip:XAUTHORITY=/home/fixture/.Xauthority' "${MOCK_ENV_LOG}"; then
+  exit 1
+fi
+
+# Control: with no global value nothing is invented.
+reset_case
+MOCK_CLIPBOARD_TYPES=''
+MOCK_X11_CLIPBOARD_TYPES='TARGETS image/png'
+MOCK_TTY_COMMANDS=$'zsh 77 77\ncodex 77 77'
+run_case
+grep -Fxq 'xclip:XAUTHORITY=<unset>' "${MOCK_ENV_LOG}"
 
 reset_case
 MOCK_XCLIP_TYPES_MODE=fail

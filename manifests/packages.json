@@ -144,6 +144,10 @@
       "note": "Installed even without a running desktop; settings are applied later by the GUI phase. None of these pull GNOME Shell, a session or a display manager.",
       "packages": [
         {
+          "name": "xauth",
+          "reason": "tmux/tmux-service-start merges the Xwayland cookie into ~/.Xauthority so a tmux server started at login (and panes that outlive a re-login) keep X11 access, e.g. image paste in Codex."
+        },
+        {
           "name": "libglib2.0-bin",
           "reason": "gsettings and gdbus, used by installer/gui.py to apply GNOME settings and probe the user D-Bus session."
         },

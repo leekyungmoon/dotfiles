@@ -357,7 +357,13 @@ class PortableFilesTests(unittest.TestCase):
             with self.subTest(name=name):
                 text = (REPO_ROOT / name).read_text(encoding="utf-8")
                 self.assertIsNone(SOURCE_USER_PATH.search(text))
-                self.assertNotIn("DISPLAY=:0", text)
+                # DISPLAY=:0 appears only as tmux.service's documented fallback
+                # for when the user manager never exports the desktop session.
+                lines = [l for l in text.splitlines() if "DISPLAY=:0" in l]
+                if name == "systemd/user/tmux.service":
+                    self.assertEqual(lines, ["Environment=DISPLAY=:0"])
+                else:
+                    self.assertEqual(lines, [])
                 # Generic reasons only; nothing about one machine's private setup.
                 self.assertNotRegex(text.lower(), r"sidebar|workspace restore app")
 
@@ -376,7 +382,7 @@ class PortableFilesTests(unittest.TestCase):
         # Logging out of the desktop does not stop the server.
         self.assertNotIn("PartOf", values)
         self.assertNotIn("BindsTo", values)
-        self.assertEqual(values["Environment"], [UNIT_PATH])
+        self.assertEqual(values["Environment"], [UNIT_PATH, "DISPLAY=:0"])
         tools = json.loads(
             (REPO_ROOT / "manifests/tools.json").read_text(encoding="utf-8")
         )
@@ -384,10 +390,12 @@ class PortableFilesTests(unittest.TestCase):
             tools["bin_dir"].replace("{data_home}", "%h/.local/share"),
             UNIT_PATH.split("=", 1)[1].split(":"),
         )
-        self.assertEqual(values["UnsetEnvironment"], ["TMUX TMUX_PANE"])
+        self.assertEqual(values["UnsetEnvironment"],
+                         ["TMUX TMUX_PANE TMUX_SERVICE_TMUX TMUX_SERVICE_ENV_POLLS"])
         self.assertIn("! tmux has-session", values["ExecCondition"][0])
-        self.assertTrue(values["ExecStart"][0].startswith("/usr/bin/env tmux "))
-        self.assertIn("__continuum_startup", values["ExecStart"][0])
+        # The wrapper waits for the desktop environment (and the Xwayland
+        # cookie), then execs `tmux new-session -d -s __continuum_startup`.
+        self.assertEqual(values["ExecStart"], ["%h/.dotfiles/tmux/tmux-service-start"])
         self.assertEqual(values["ExecStop"], [
             "-%h/.dotfiles/tmux/resurrect-save",
             "-/usr/bin/env tmux kill-server",

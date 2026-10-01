@@ -15,6 +15,9 @@ PC 재부팅이나 예기치 않은 종료 이후에도 터미널 작업환경�
   tmux에 접속한 화면이 없어도 1분마다 저장한다.
 - **systemd 사용자 서비스** (`tmux.service`): Ubuntu 데스크톱 로그인 시 tmux를
   백그라운드로 시작한다.
+- 로그인할 때 tmux가 데스크톱 화면·클립보드 정보를 받은 뒤 시작한다.
+  로그인마다 그 정보를 다시 맞추므로, 복구된 창의 Codex·Claude에서도
+  이미지 붙여넣기(`Ctrl+V`)가 동작한다(아래 "화면·클립보드 환경 변수").
 - 모든 저장은 `tmux/resurrect-save` 하나를 거친다. lock으로 중복 저장을 막고,
   저장 hook이 실패하면 이전 저장본을 그대로 둔다. 새로 시작한 tmux 서버가
   마지막 저장본을 아직 복구하지 않았으면 저장하지 않는다(아래 "복구 전 저장
@@ -30,19 +33,49 @@ PC 재부팅이나 예기치 않은 종료 이후에도 터미널 작업환경�
 | `tmux/resurrect.conf` | plugin 선언과 옵션, 복구 전후 hook, prefix + C-s 저장 키, `default-command` |
 | `tmux/resurrect-save` | upstream `save.sh`를 lock·hook 검증·복구 전 저장 보류와 함께 실행, 복구 전후 hook(`--pre-restore`, `--post-restore`) |
 | `tmux/resurrect-ai-session.py` | 저장본의 AI pane 명령을 확인된 resume 명령으로 교체 |
-| `systemd/user/tmux.service` | 로그인 시 tmux 백그라운드 시작, 종료 시 저장 후 서버 종료 |
+| `systemd/user/tmux.service` | 로그인 시 `tmux/tmux-service-start`로 tmux 백그라운드 시작, 종료 시 저장 후 서버 종료 |
+| `tmux/tmux-service-start` | 데스크톱 변수와 X 쿠키를 받은 뒤 tmux 시작(`--sync`: 로그인마다 갱신) |
+| `systemd/user/tmux-gui-env.service` | 로그인마다 살아 있는 tmux의 화면·클립보드 변수 갱신 |
 | `systemd/user/tmux-resurrect-autosave.{service,timer}` | 1분 주기 저장 |
 | `manifests/tmux-plugins.json` | TPM과 plugin의 고정 commit |
 
 표의 경로는 저장소 checkout인 `~/.dotfiles` 기준이다. unit 파일은
-`~/.config/systemd/user/`에 복사되며, 예전 로컬 설정이 남긴
-`~/.config/systemd/user/tmux.service.d/login.conf` drop-in은 배포된 unit을
-덮어쓰므로 설치기가 제거한다(백업 후 제거, [RECOVERY.md](RECOVERY.md) 참고).
+`~/.config/systemd/user/`에 복사된다. 이미 있는
+`~/.config/systemd/user/tmux.service.d/` drop-in은 건드리지 않는다.
 
 plugin은 `${XDG_DATA_HOME:-$HOME/.local/share}/tmux/plugins`
 (`TMUX_PLUGIN_MANAGER_PATH`)에, 저장본은
 `${XDG_DATA_HOME:-$HOME/.local/share}/tmux/resurrect`에 둔다. 설치기는 plugin을
 manifest의 commit 그대로 받는다.
+
+### 화면·클립보드 환경 변수
+
+- 문제: 로그인 직후 tmux가 `DISPLAY`만 가진 채 시작되면, GNOME이 조금 뒤에
+  내보내는 `WAYLAND_DISPLAY`·`XAUTHORITY`가 없어서 복구된 모든 pane이
+  Xwayland 인증 쿠키 없이 뜬다. GNOME에서 X11로 클립보드를 읽는 Codex의
+  이미지 붙여넣기가 `X11 server connection timed out`으로 실패한다. Xwayland
+  인증 파일은 로그인마다 이름이 바뀌는데 tmux는 로그아웃 뒤에도 살아 있을 수
+  있어, 예전 경로를 받은 pane도 같은 문제가 생긴다.
+- `tmux/tmux-service-start`(`tmux.service`의 ExecStart): 최대 20초 동안 세션
+  변수를 기다린 뒤 그 값으로 tmux를 시작한다. 현재 쿠키만 이 display 번호에
+  묶어 전용 파일 `~/.local/state/tmux/Xauthority`를 원자적으로 다시 만들고,
+  pane에는 이 고정 경로를 `XAUTHORITY`로 준다. `XAUTHORITY` 없이 시작된
+  프로세스를 위해 같은 항목을 `~/.Xauthority`에도 병합한다. 기다리는 동안
+  사용자가 tmux를 먼저 띄웠으면 그 서버만 갱신하고 75로 실패 종료한다.
+  그래야 systemd가 ExecStop(`kill-server`)으로 사용자 서버를 끄지 않는다.
+- `tmux-gui-env.service`: 로그인마다 `tmux-service-start --sync`를 실행해 쿠키
+  파일을 새로 만들고, 살아 있는 tmux의 전역 변수와 세션별
+  `XAUTHORITY`·`WAYLAND_DISPLAY`·`DISPLAY` 덮어쓰기를 고친다.
+- `tmux.conf`의 `update-environment`에는 `XAUTHORITY`가 없다(사라질 경로가
+  세션에 고정되지 않도록). `bin/tmux-smart-paste`는 tmux 전역 환경의
+  `XAUTHORITY`를 가져온다.
+- 보안: `~/.local/state/tmux/Xauthority`와 `~/.Xauthority`에는 현재 X 쿠키가
+  들어 있다(0600). 저장소에 넣지 않으며 설치기의 관리·백업 대상도 아니다.
+  pane에서 `ssh -X`/`-Y`를 쓰면 실제 쿠키가 전달된다는 점에 주의한다.
+- 확인: `systemctl --user show tmux-gui-env.service -p Result --no-pager`,
+  `tmux show-environment -g | grep -E 'WAYLAND_DISPLAY|XAUTHORITY'`.
+  실제 판정은 Codex pane에서 이미지 `Ctrl+V`.
+- 회귀시험: `tests/integration/test_tmux_service_start.py`.
 
 ### 설계상 선택
 
