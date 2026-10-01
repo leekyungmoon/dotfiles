@@ -15,6 +15,7 @@ import re
 import secrets
 import shutil
 import tempfile
+import time
 from pathlib import Path
 
 from installer import ui
@@ -322,55 +323,843 @@ def start_autosave_timer(target, runner, env) -> tuple[str, list[str], str]:
     return PASS, [], "started"
 
 
-TMUX_RELOADED = "reloaded the running tmux server's config (sessions kept)"
+# --- the running tmux server ---------------------------------------------------
+
+# Global user options that hold a server's runtime state rather than its
+# configuration; converging keeps them. tmux/resurrect-save only lets a save
+# replace "last" on a server marked restored, and continuum records when it
+# last saved. A fresh server sets these at run time, not from the config.
+RUNTIME_USER_OPTIONS = frozenset({"@tmux-restore-complete",
+                                  "@continuum-save-last-timestamp"})
+# tmux-continuum (manifests/tmux-plugins.json) auto-restores only when it is
+# loaded into a server younger than @continuum-restore-max-delay seconds
+# (default 10; continuum.tmux just_started_tmux_server). Converging sources
+# the new config only into an older server, with this margin.
+CONTINUUM_RESTORE_MAX_DELAY = 10
+CONTINUUM_MARGIN = 2.0
+TMUX_CONVERGE_TIMEOUT = 300.0
+
+# (show-options flags, set-option flags) per global option scope.
+_OPTION_SCOPES = (("-g", "-g"), ("-gw", "-gw"), ("-s", "-s"))
+_HOOK_SCOPES = ("-g", "-gw")
+_OPTION_NAME_RE = re.compile(r"^@?[A-Za-z0-9][A-Za-z0-9_.-]*$")
+_PLAIN_WORD_RE = re.compile(r"^[A-Za-z0-9_@%+=:,./-]+$")
+_PTS_RE = re.compile(r"^/dev/pts/[0-9]+$")
+_PANE_FORMAT = "\t".join(("#{pane_id}", "#{pane_pid}", "#{pane_dead}", "#{pane_in_mode}",
+                          "#{alternate_on}", "#{pane_height}", "#{pane_tty}",
+                          "#{pane_current_command}", "#{window_index}",
+                          "#{pane_index}", "#{session_name}"))  # the name last: any text
+_PANE_FIELDS = 11
+_sleep = time.sleep  # patched by tests
 
 
-def reload_running_tmux(target, runner, env: dict[str, str] | None = None
-                        ) -> tuple[list[str], str]:
-    """Make an already running tmux server use the new ~/.tmux.conf.
+@dataclasses.dataclass
+class TmuxDefaults:
+    """What a server started with ``-f /dev/null`` has: the tmux defaults."""
 
-    A tmux server keeps the configuration it was started with, so a server
-    that was running before the install (for example one started with an
-    earlier, upstream config) would keep its old key bindings until it is
-    restarted. Only the user's default server is considered, and only when it
-    loaded this home's ~/.tmux.conf; sessions and panes are left as they are.
-    A failure is reported, never fatal. Returns ``(reasons, outcome)``.
+    keys: list[str]                         # list-keys: re-sourceable bind-key lines
+    notes: list[tuple[str, str, str]]       # (table, key, note) of the default keys
+    options: dict[str, dict[str, tuple]]    # show-options flag -> name -> lines
+    hooks: dict[str, dict[str, tuple]]      # show-hooks flag -> name -> lines
+
+
+def _lines(completed) -> list[str]:
+    return [line for line in _text(completed.stdout).splitlines() if line.strip()]
+
+
+def _option_table(lines: list[str]) -> dict[str, tuple]:
+    """``show-options``/``show-hooks`` lines by option name (arrays grouped)."""
+
+    table: dict[str, list[str]] = {}
+    for line in lines:
+        name = line.split(" ", 1)[0].split("[", 1)[0]
+        table.setdefault(name, []).append(line)
+    return {name: tuple(values) for name, values in table.items()}
+
+
+def _key_tables(keys: list[str]) -> list[str]:
+    tables = set()
+    for line in keys:
+        words = line.split()
+        for i, word in enumerate(words[:4]):
+            if word == "-T" and i + 1 < len(words):
+                tables.add(words[i + 1])
+    return sorted(tables)
+
+
+def tmux_quote(text: str) -> str:
+    """One tmux config token holding ``text`` literally."""
+
+    if "'" not in text:
+        return f"'{text}'"
+    escaped = text.replace("\\", "\\\\").replace('"', '\\"').replace("$", "\\$")
+    return f'"{escaped}"'
+
+
+def capture_tmux_defaults(binary: str, runner, env: dict[str, str],
+                          cwd: Path | None = None) -> TmuxDefaults:
+    """Start a throwaway ``-f /dev/null`` server, read its defaults, kill it.
+
+    The server has its own short ``-L`` name inside a private TMUX_TMPDIR, so
+    nothing else can be addressed; exactly that server is killed afterwards.
     """
 
+    name = f"pdfd{os.getpid()}{secrets.token_hex(2)}"
+    socket_dir = _short_socket_dir(name, env)
+    if socket_dir is None:
+        raise RuntimeError("no temporary directory is short enough for a tmux socket "
+                           f"(limit {SOCKET_PATH_MAX} characters); set TMPDIR=/tmp")
+    penv = dict(env)
+    for key in ("TMUX", "TMUX_PANE"):
+        penv.pop(key, None)
+    penv["TMUX_TMPDIR"] = socket_dir
+    base = [binary, "-L", name]
+
+    def query(*args, required=True):
+        done = runner.run([*base, *args], timeout=30, check=False, env=penv,
+                          read_only=True)
+        if done.returncode != 0:
+            if not required:
+                return None
+            raise RuntimeError(f"tmux {' '.join(args)} failed: {_tail(done.stderr)}")
+        return _lines(done)
+
+    try:
+        # Two arguments: tmux runs sleep itself, no shell and no rc files.
+        started = runner.run([*base, "-f", "/dev/null", "new-session", "-d", "-s",
+                              "defaults", "sleep", "600"], timeout=30, check=False,
+                             env=penv, cwd=cwd, read_only=True)
+        if started.returncode != 0:
+            raise RuntimeError("could not start a tmux server to read its defaults: "
+                               + _tail(started.stderr))
+        keys = query("list-keys")
+        notes = []
+        for table in _key_tables(keys):
+            for line in query("list-keys", "-N", "-P", "", "-T", table) or []:
+                parts = line.split(None, 1)
+                if len(parts) == 2:
+                    notes.append((table, parts[0], parts[1].strip()))
+        options = {flag: _option_table(query("show-options", flag))
+                   for flag, _ in _OPTION_SCOPES}
+        hooks = {}
+        for flag in _HOOK_SCOPES:
+            listed = query("show-hooks", flag, required=False)
+            if listed is not None:
+                hooks[flag] = _option_table(listed)
+        return TmuxDefaults(keys, notes, options, hooks)
+    finally:
+        try:
+            runner.run([*base, "kill-server"], timeout=30, check=False, env=penv,
+                       read_only=True)
+        finally:
+            shutil.rmtree(socket_dir, ignore_errors=True)
+
+
+def _server_state(tmux, runner, tenv) -> tuple[list[str], dict, dict]:
+    def query(*args):
+        done = runner.run([tmux, *args], timeout=30, check=False, env=tenv,
+                          read_only=True)
+        return _lines(done) if done.returncode == 0 else None
+
+    keys = query("list-keys") or []
+    options = {flag: _option_table(query("show-options", flag) or [])
+               for flag, _ in _OPTION_SCOPES}
+    hooks = {flag: _option_table(query("show-hooks", flag) or []) for flag in _HOOK_SCOPES}
+    return keys, options, hooks
+
+
+def _reset_lines(defaults: TmuxDefaults, keys: list[str], options: dict,
+                 hooks: dict) -> list[str]:
+    """tmux commands that put a server's keys, options and hooks at the defaults.
+
+    An option is set straight to the fresh server's value, not unset: tmux
+    takes default-shell, editor, status-keys and mode-keys from the
+    environment when it starts, so ``-u`` would give the built-in values
+    instead. Array options are unset (their defaults do not depend on the
+    environment). Options that already have the fresh value are not touched.
+    """
+
+    lines = [f"unbind-key -a -T {tmux_quote(table)}" for table in _key_tables(keys)]
+    lines += defaults.keys
+    lines += [f"bind-key -N {tmux_quote(note)} -T {tmux_quote(table)} {tmux_quote(key)}"
+              for table, key, note in defaults.notes]
+    for show_flag, set_flag in _OPTION_SCOPES:
+        fresh = defaults.options.get(show_flag, {})
+        for name, value in sorted(options.get(show_flag, {}).items()):
+            if not _OPTION_NAME_RE.match(name) or value == fresh.get(name):
+                continue
+            if name.startswith("@"):
+                if name not in RUNTIME_USER_OPTIONS:
+                    lines.append(f"set-option {set_flag}u {name}")
+            elif name not in fresh:  # an option the defaults' tmux does not know
+                continue
+            elif any("[" in line.split(" ", 1)[0] for line in value + fresh[name]):
+                lines.append(f"set-option {set_flag}u {name}")
+            elif " " in fresh[name][0]:
+                # show-options escapes the value so that it parses back.
+                lines.append(f"set-option {set_flag} {fresh[name][0]}")
+            else:
+                lines.append(f"set-option {set_flag}u {name}")
+    for flag in _HOOK_SCOPES:
+        if flag not in defaults.hooks:
+            continue
+        fresh = defaults.hooks[flag]
+        for name, value in sorted(hooks.get(flag, {}).items()):
+            if _OPTION_NAME_RE.match(name) and value != fresh.get(name, (name,)):
+                lines.append(f"set-hook {flag}u {name}")
+    return lines
+
+
+def _source_lines(tmux, runner, tenv, workdir: Path, label: str,
+                  lines: list[str]) -> str | None:
+    """Source ``lines`` into the server; the error text, or None.
+
+    Any stderr output is an error, whatever the exit status: tmux 3.4 exits
+    0 when a command error comes before a later run-shell or if-shell of the
+    same file and only prints the error.
+    """
+
+    if not lines:
+        return None
+    path = workdir / f"{label}.conf"
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write("\n".join(lines) + "\n")
+    done = runner.run([tmux, "source-file", str(path)], timeout=TMUX_CONVERGE_TIMEOUT,
+                      check=False, env=tenv)
+    errors = _tail(done.stderr)
+    if done.returncode != 0:
+        return errors or _tail(done.stdout) or f"exit status {done.returncode}"
+    return errors or None
+
+
+def default_config_files(target) -> list[Path]:
+    """The files a tmux server started without -f loads, as tmux resolves them."""
+
+    out, seen = [], set()
+    for path in (Path("/etc/tmux.conf"), target.home / ".tmux.conf",
+                 target.config_home / "tmux" / "tmux.conf",
+                 target.home / ".config" / "tmux" / "tmux.conf"):
+        if path.is_file() and os.path.realpath(path) not in seen:
+            seen.add(os.path.realpath(path))
+            out.append(path)
+    return out
+
+
+def _config_lines(paths: list[Path]) -> list[str]:
+    """The config files' text, to follow the reset in the same file.
+
+    Not ``source-file``: tmux reads a sourced file asynchronously and runs its
+    event loop meanwhile, so a reset default the config overrides (for
+    example automatic-rename, which renames windows at once) would take
+    effect for a moment. In one file the whole reset and the config up to its
+    first run-shell or if-shell run in one go. A parse error anywhere in the
+    file means nothing of it runs. (#{config_files} is not changed by either.)
+    """
+
+    lines = []
+    for path in paths:
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            lines.append(f"source-file {tmux_quote(str(path))}")
+            continue
+        lines += [f"# {path}", *text.splitlines(), ""]
+    return lines
+
+
+def _proc_stat(pid: int) -> tuple[str, int, int, int] | None:
+    """``(comm, ppid, pgrp, tpgid)`` from /proc/<pid>/stat."""
+
+    fields = _proc_stat_fields(pid)
+    if fields is None:
+        return None
+    comm, rest = fields
+    try:
+        return comm, int(rest[1]), int(rest[2]), int(rest[5])
+    except (ValueError, IndexError):
+        return None
+
+
+def _proc_stat_fields(pid: int) -> tuple[str, list[str]] | None:
+    """``(comm, fields 3...)`` of /proc/<pid>/stat (``fields[0]`` is field 3)."""
+
+    try:
+        data = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8", errors="replace")
+        return data[data.index("(") + 1:data.rindex(")")], data[data.rindex(")") + 2:].split()
+    except (OSError, ValueError):
+        return None
+
+
+def _has_children(pid: int) -> bool:
+    for entry in os.listdir("/proc"):
+        if entry.isdigit() and entry != str(pid):
+            stat = _proc_stat(int(entry))
+            if stat is not None and stat[1] == pid:
+                return True
+    return False
+
+
+# --- the reload hook of zsh/zsh.d/dotfiles-reload.zsh ---------------------------
+#
+# Every interactive zsh started with this repository's config keeps one file
+# descriptor open, read-only and close-on-exec, on the static file
+# {state}/personal-dotfiles/shell-hook. Such a "hooked" shell reloads itself
+# (at Enter on its primary prompt, or before its next prompt) when the
+# generation changes, keeping its exported environment; nothing outside
+# ever restarts it. A process is hooked iff one of its /proc/<pid>/fd links
+# resolves to that file. There is no per-prompt state to go stale: the
+# descriptor lives exactly as long as the zsh process image (it closes on
+# 'exec bash' and on exit, and a reused pid never has it), and it does not
+# depend on /run/user/<uid> or a login session.
+
+SHELL_HOOK_FILE = "shell-hook"
+# The last two components of a hook file wherever its state directory is
+# (another XDG_STATE_HOME, a moved home, a bind mount): also hooked, so such
+# a shell is left alone rather than taken for one without the hook.
+_HOOK_SUFFIX = "/personal-dotfiles/" + SHELL_HOOK_FILE
+_DELETED = " (deleted)"
+RESPAWN_SHELL = "zsh"  # the only shell converge ever replaces (with a zsh)
+
+
+def shell_hook_path(target) -> Path:
+    """``{state}/personal-dotfiles/shell-hook`` of ``target``."""
+
+    return target.state_root / SHELL_HOOK_FILE
+
+
+def _hook_names(hook_path: Path) -> set[str]:
+    names = {str(hook_path), os.path.realpath(hook_path)}
+    return names | {name + _DELETED for name in names}
+
+
+def shell_hooked(pid: int, hook_path: Path) -> bool | None:
+    """Whether process ``pid`` holds a descriptor on the shell-hook file.
+
+    True: one of its /proc/<pid>/fd links is ``hook_path`` (also when that
+    file was removed or replaced since: " (deleted)", or the same inode under
+    another name) or any ``.../personal-dotfiles/shell-hook``. False: none
+    is. None: cannot tell (the process is gone or its fds cannot be read),
+    which callers treat as hooked: nothing is restarted on a guess.
+    """
+
+    names = _hook_names(hook_path)
+    try:
+        st = os.stat(hook_path)
+        identity = (st.st_dev, st.st_ino)
+    except OSError:
+        identity = None
+    base = f"/proc/{pid}/fd"
+    try:
+        fds = os.listdir(base)
+    except OSError:
+        return None
+    for fd in fds:
+        link_path = f"{base}/{fd}"
+        try:
+            link = os.readlink(link_path)
+        except FileNotFoundError:
+            continue  # closed since the listing
+        except OSError:
+            return None
+        if link in names:
+            return True
+        name = link[:-len(_DELETED)] if link.endswith(_DELETED) else link
+        if name.endswith(_HOOK_SUFFIX):
+            return True
+        if identity is not None and name.startswith("/") and \
+                os.path.basename(name) == SHELL_HOOK_FILE:
+            try:
+                fst = os.stat(link_path)  # the open file itself, not the name
+            except OSError:
+                continue
+            if (fst.st_dev, fst.st_ino) == identity:
+                return True
+    if not os.path.isdir(f"/proc/{pid}"):
+        return None  # exited while being looked at
+    return False
+
+
+# --- which pane shells are respawned ---------------------------------------------
+
+# Options that make a shell run commands instead of reading the terminal.
+_COMMAND_OPTIONS = ("c",)
+_LONG_COMMAND_OPTIONS = ("--command", "--init-command")
+
+
+def _cmdline(pid: int) -> list[str] | None:
+    try:
+        data = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        return None
+    if not data:
+        return None
+    return data.rstrip(b"\0").decode("utf-8", "replace").split("\0")
+
+
+def interactive_invocation(argv: list[str]) -> bool:
+    """Whether a shell's argv is an interactive invocation.
+
+    Every argument after argv[0] must be an option word (``-l``, ``-il``,
+    ``+x``, ``--login``): no ``-c``, no non-option operand such as a script
+    file (``bash script.sh``) and no option argument (``--rcfile FILE``,
+    ``-o OPT``), which is refused as an operand too. argv[0] starting with
+    '-' is how login and tmux start a login shell; that alone is not enough
+    (``-zsh -c ...`` and ``-bash -c ...``, as su - and sudo -i run a
+    command, are still refused). bin/dotfiles applies the same rule to its
+    parent shell (tests/unit/test_install_cli.py keeps the two in parity).
+    """
+
+    if not argv or not argv[0]:
+        return False
+    for word in argv[1:]:
+        if word in ("-", "--", "+", "++") or not word[:1] in ("-", "+"):
+            return False
+        if word.startswith("--"):
+            name = word.split("=", 1)[0]
+            if "=" in word or name in _LONG_COMMAND_OPTIONS or name == "--rcfile":
+                return False
+            continue
+        letters = word[1:]
+        if not letters.isalpha() or any(c in letters for c in _COMMAND_OPTIONS):
+            return False
+        if "o" in letters:  # -o takes the next word
+            return False
+    return True
+
+
+def _std_fds_on(pid: int, tty: str) -> bool:
+    try:
+        return all(os.readlink(f"/proc/{pid}/fd/{fd}") == tty for fd in (0, 1, 2))
+    except OSError:
+        return False
+
+
+def _exe_name(pid: int) -> str | None:
+    try:
+        exe = os.readlink(f"/proc/{pid}/exe")
+    except OSError:
+        return None
+    if exe.endswith(_DELETED):  # the binary was upgraded since the shell started
+        exe = exe[:-len(_DELETED)]
+    return os.path.basename(exe)
+
+
+def shell_restart_check(pid: int, tty: str, *, hook_path: Path) -> tuple[str | None, str]:
+    """``(cwd, "restart")`` when the shell of a pane may be respawned, else
+    ``(None, why)``. The caller adds the conditions only it knows: the
+    generation changed, and the pane is live, not in a mode and not on the
+    alternate screen.
+
+    All of these must hold:
+    - ``pid`` is a zsh: /proc comm and the exe's basename are both zsh, so
+      a bash, sh, dash or fish pane is never replaced by a zsh ("not-zsh");
+    - it is its own process group and its terminal's foreground group, with
+      no child process at all: no foreground command, no background or
+      suspended job ("busy");
+    - its argv is an interactive invocation (:func:`interactive_invocation`):
+      no ``-c``, no script operand ("script");
+    - its stdin, stdout and stderr are the pane's terminal ("redirected");
+    - it is not hooked (:func:`shell_hooked`): a shell of this repository
+      reloads itself, keeping its exported environment, so it is never
+      respawned ("hooked"; "hook-unknown" when its fds cannot be read);
+    - its working directory still exists ("no-directory").
+
+    What is left is a zsh from before this repository's hook (such as an
+    upstream wookayin/dotfiles one) that looks idle at its prompt.
+    Residual risk, accepted and inherent: from outside, such an unhooked
+    zsh cannot be told apart from one at its prompt while it sits inside a
+    builtin that reads the terminal (``read``, ``vared``, ``select``, a
+    ``source``d script waiting at ``read``), at a continuation (PS2) or
+    heredoc prompt, at a spelling-correction query, or with a typed but
+    unsubmitted command line; and variables it exported after it started
+    (an activated venv, a sourced ROS overlay) are not visible in
+    /proc/<pid>/environ. Respawning such a shell loses that. Every shell
+    started with this repository's config is hooked, so this applies only
+    to shells that predate it, and only when the generation changes.
+    """
+
+    stat = _proc_stat(pid)
+    if stat is None:
+        return None, "gone"
+    comm, _, pgrp, tpgid = stat
+    if comm != RESPAWN_SHELL or _exe_name(pid) != RESPAWN_SHELL:
+        return None, "not-zsh"
+    if pgrp != pid or tpgid != pid or _has_children(pid):
+        return None, "busy"
+    argv = _cmdline(pid)
+    if argv is None or not interactive_invocation(argv):
+        return None, "script"
+    if not _std_fds_on(pid, tty):
+        return None, "redirected"
+    hooked = shell_hooked(pid, hook_path)
+    if hooked is None:
+        return None, "hook-unknown"
+    if hooked:
+        return None, "hooked"
+    try:
+        cwd = os.readlink(f"/proc/{pid}/cwd")
+    except OSError:
+        return None, "gone"
+    if not os.path.isdir(cwd):  # a removed cwd reads "... (deleted)"
+        return None, "no-directory"
+    return cwd, "restart"
+
+def _respawn_argv(command: str, shell: str, path: str) -> list[str] | None:
+    """How a new pane of this server would start, as respawn-pane arguments."""
+
+    command = command.strip()
+    if command:
+        words = command.split()
+        if len(words) > 1 and all(_PLAIN_WORD_RE.match(w) for w in words):
+            # Plain words: tmux executes them directly, so the pane's pid is
+            # the shell itself (as with a default-shell that execs).
+            return words if shutil.which(words[0], path=path) else None
+        return [command]
+    if shell.startswith("/") and os.access(shell, os.X_OK):
+        return [shell, "-l"]  # what tmux starts without default-command: a login shell
+    return None
+
+
+def _scroll_into_history(tmux, runner, tenv, pane_id: str, tty: str, height: int) -> None:
+    """Keep what an idle pane shows: scroll it into the history first.
+
+    respawn-pane keeps a pane's history but clears its screen. Newlines
+    written to the pane's terminal scroll every shown line into the history;
+    then the screen is blank.
+    """
+
+    if not _PTS_RE.match(tty) or height <= 0:
+        return
+    try:
+        fd = os.open(tty, os.O_WRONLY | os.O_NOCTTY | os.O_NONBLOCK)
+    except OSError:
+        return
+    try:
+        os.write(fd, b"\r\n" * height)
+    except OSError:
+        return
+    finally:
+        os.close(fd)
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline:
+        shown = runner.run([tmux, "capture-pane", "-p", "-t", pane_id], timeout=10,
+                           check=False, env=tenv, read_only=True)
+        if shown.returncode != 0 or not _text(shown.stdout).strip():
+            return
+        _sleep(0.05)
+
+
+def _pane_state(tmux, runner, tenv, pane_id: str) -> list[str] | None:
+    """The pane's _PANE_FORMAT fields now, or None."""
+
+    shown = runner.run([tmux, "display-message", "-p", "-t", pane_id, _PANE_FORMAT],
+                       timeout=10, check=False, env=tenv, read_only=True)
+    if shown.returncode != 0:
+        return None
+    fields = _text(shown.stdout).rstrip("\n").split("\t", _PANE_FIELDS - 1)
+    return fields if len(fields) == _PANE_FIELDS else None
+
+
+def _pane_check(fields: list[str], hook_path: Path) -> tuple[str | None, str]:
+    """:func:`shell_restart_check` plus what tmux knows of the pane."""
+
+    (_, pid, dead, in_mode, alternate, _, tty, current, *_rest) = fields
+    if dead == "1" or in_mode == "1" or alternate == "1" or not pid.isdigit():
+        return None, "busy"
+    cwd, why = shell_restart_check(int(pid), tty, hook_path=hook_path)
+    if cwd is not None and os.path.basename(current).lstrip("-") != RESPAWN_SHELL:
+        return None, "busy"  # tmux sees another foreground program
+    return cwd, why
+
+
+def respawn_idle_panes(tmux, runner, tenv, *, hook_path: Path
+                       ) -> tuple[list[dict], dict[str, int], list[str]]:
+    """Respawn every pane shell :func:`_pane_check` allows (the caller has
+    established that the generation changed).
+
+    Returns ``(restarted, kept, problems)``: the respawned panes as
+    ``{"pane": "session:window.pane", "pane_id", "directory"}``, and the
+    number of panes left as they are, by reason. A pane that runs anything
+    else (a command, a job, a script, codex, an editor, ssh, the installer
+    itself, a bash), a hooked zsh, a pane in a mode, on the alternate screen
+    or dead is left exactly as it is. ``list-panes -a`` names a pane once
+    per session that shows it (grouped sessions, linked windows); each pane
+    counts once.
+
+    Everything is checked again, from tmux and /proc, right before the
+    pane's screen is scrolled into its history, and once more right before
+    respawn-pane; a pane that fails either check is left alone (after the
+    first one, it is not even scrolled). What remains is the moment between
+    the last check and respawn-pane -k itself.
+    """
+
+    listed = runner.run([tmux, "list-panes", "-a", "-F", _PANE_FORMAT], timeout=30,
+                        check=False, env=tenv, read_only=True)
+    if listed.returncode != 0:
+        return [], {}, ["could not list the tmux panes: " + _tail(listed.stderr)]
+    env_path = runner.run([tmux, "show-environment", "-g", "PATH"], timeout=10,
+                          check=False, env=tenv, read_only=True)
+    path = _text(env_path.stdout).strip()
+    path = path[len("PATH="):] if path.startswith("PATH=") else tenv.get("PATH", "")
+    restarted: list[dict] = []
+    kept: dict[str, int] = {}
+    problems: list[str] = []
+    seen: set[str] = set()
+
+    def keep(why: str) -> None:
+        kept[why] = kept.get(why, 0) + 1
+
+    def recheck(pane_id: str, pid: str, cwd: str) -> str | None:
+        """None when the pane is still exactly as when it was chosen."""
+        now = _pane_state(tmux, runner, tenv, pane_id)
+        if now is None:
+            return "gone"
+        if now[1] != pid:
+            return "moved"
+        again, why = _pane_check(now, hook_path)
+        if again is None:
+            return why
+        return None if again == cwd else "moved"
+
+    for line in _lines(listed):
+        fields = line.split("\t", _PANE_FIELDS - 1)
+        if len(fields) != _PANE_FIELDS:
+            continue
+        (pane_id, pid, _dead, _mode, _alt, height, tty, _current,
+         window, index, session) = fields
+        if pane_id in seen:
+            continue
+        seen.add(pane_id)
+        cwd, why = _pane_check(fields, hook_path)
+        if cwd is None:
+            keep(why)
+            continue
+        start = runner.run([tmux, "display-message", "-p", "-t", pane_id,
+                            "#{default-command}\t#{default-shell}"], timeout=10,
+                           check=False, env=tenv, read_only=True)
+        command, _, shell = _text(start.stdout).rstrip("\n").partition("\t")
+        argv = _respawn_argv(command, shell, path) if start.returncode == 0 else None
+        if argv is None:
+            keep("no-command")
+            problems.append(f"no command to restart tmux pane {pane_id} with "
+                            f"(default-command {command!r}, default-shell {shell!r})")
+            continue
+        # Look again right before touching the pane at all: the shell may
+        # have started something since the listing.
+        why = recheck(pane_id, pid, cwd)
+        if why is not None:
+            keep(why)
+            continue
+        _scroll_into_history(tmux, runner, tenv, pane_id, tty,
+                             int(height) if height.isdigit() else 0)
+        # And once more right before the respawn.
+        why = recheck(pane_id, pid, cwd)
+        if why is not None:
+            keep(why)
+            continue
+        done = runner.run([tmux, "respawn-pane", "-k", "-t", pane_id, "-c",
+                           cwd.replace("#", "##"), *argv], timeout=30, check=False,
+                          env=tenv)
+        if done.returncode != 0:
+            keep("respawn-failed")
+            problems.append(f"could not restart tmux pane {pane_id}: {_tail(done.stderr)}")
+            continue
+        restarted.append({"pane": f"{session}:{window}.{index}", "pane_id": pane_id,
+                          "directory": cwd})
+    return restarted, kept, problems
+
+def _server_binary(tmux, runner, version: str, pid: str) -> tuple[str, str | None]:
+    """A tmux binary of the running server's version, for reading its defaults."""
+
+    def version_of(binary):
+        try:
+            done = runner.run([binary, "-V"], timeout=10, check=False, read_only=True)
+        except Exception:
+            return None
+        return _text(done.stdout).strip() if done.returncode == 0 else None
+
+    wanted = f"tmux {version}"
+    if version_of(tmux) == wanted:
+        return tmux, None
+    try:
+        exe = os.readlink(f"/proc/{int(pid)}/exe")
+    except (OSError, ValueError):
+        exe = None
+    if exe and os.access(exe, os.X_OK) and version_of(exe) == wanted:
+        return exe, None
+    return tmux, (f"the running server is {wanted} but {tmux} is "
+                  f"{version_of(tmux) or 'unknown'}; its defaults were read from {tmux}")
+
+
+def _wait_out_continuum_restore(tmux, runner, tenv, start_time: str) -> float:
+    """Wait until continuum would no longer auto-restore into this server."""
+
+    delay = CONTINUUM_RESTORE_MAX_DELAY
+    done = runner.run([tmux, "show-options", "-gqv", "@continuum-restore-max-delay"],
+                      timeout=10, check=False, env=tenv, read_only=True)
+    value = _text(done.stdout).strip()
+    if done.returncode == 0 and value.isdigit():
+        delay = max(delay, int(value))
+    try:
+        remaining = int(start_time) + delay + CONTINUUM_MARGIN - time.time()
+    except ValueError:
+        return 0.0
+    if remaining > 0:
+        _sleep(remaining)
+        return remaining
+    return 0.0
+
+
+def converge_summary(details: dict) -> str | None:
+    """The one neutral line printed for a converged server."""
+
+    if details.get("outcome") != "converged":
+        return None
+    if details.get("respawn") == "generation-unchanged":
+        return "tmux: applied the new config"
+    count = details.get("respawned_panes", 0)
+    return (f"tmux: applied the new config; restarted {count} idle "
+            f"shell{'' if count == 1 else 's'}")
+
+
+def generation_changed(generation: str | None, previous: str | None) -> bool:
+    """Whether a run changed the generation: one was written and it differs
+    from the one recorded before (None: there was none, as on a first
+    install over another setup)."""
+
+    return generation is not None and generation != previous
+
+
+def converge_running_tmux(target, runner, env: dict[str, str] | None = None, *,
+                          generation: str | None = None,
+                          previous_generation: str | None = None,
+                          hook_path: Path | None = None) -> tuple[list[str], dict]:
+    """Make the running tmux server what a fresh one with the new config is.
+
+    Only the user's default server (TMUX and TMUX_PANE removed, so never a
+    caller's) is considered, and only when it loaded a config inside this
+    home. Its key bindings, global options and global hooks are first put
+    back at the tmux defaults, read from a throwaway ``-f /dev/null`` server,
+    keeping only the runtime state in RUNTIME_USER_OPTIONS; then the files a
+    fresh server loads (~/.tmux.conf) are sourced, so TPM loads the new
+    plugins. This is idempotent and runs on every converge.
+
+    Last, and only when the config loaded without any error and the
+    generation changed (``generation``, the one just written, differs from
+    ``previous_generation``, the one recorded before it), the pane shells
+    :func:`respawn_idle_panes` allows are respawned in the same directory
+    with the server's default command, so they run the new shell setup:
+    idle, interactive zsh shells without the reload hook (``hook_path``,
+    default :func:`shell_hook_path`). A hooked zsh reloads itself and a bash,
+    sh or fish pane is never replaced. Every other pane, its sessions and
+    windows are left untouched. A failure is reported, never fatal.
+
+    Returns ``(reasons, details)``: ``reasons`` lists only problems;
+    ``details["outcome"]`` is one of converged, no-running-server,
+    running-server-uses-another-config, failed; ``details["respawn"]`` is
+    done or generation-unchanged; ``details["restarted"]`` names each
+    respawned pane (session:window.pane) and its directory,
+    ``details["kept"]`` counts the panes left as they are, by reason.
+    """
+
+    details: dict = {"outcome": "no-running-server", "respawned_panes": 0,
+                     "busy_panes": 0}
     tmux = runner.which("tmux")
     if tmux is None:
-        return [], "no-tmux"
+        return [], details
     tenv = dict(os.environ if env is None else env)
     for key in ("TMUX", "TMUX_PANE"):  # the user's default server, not a caller's
         tenv.pop(key, None)
-    conf = target.home / ".tmux.conf"
-    probe = runner.run([tmux, "display-message", "-p", "#{config_files}"],
+    probe = runner.run([tmux, "display-message", "-p",
+                        "#{pid}\t#{start_time}\t#{version}\t#{config_files}"],
                        timeout=10, check=False, env=tenv, read_only=True)
     if probe.returncode != 0:
-        return [], "no-running-server"
-    loaded = [part.strip() for part in
-              (probe.stdout or b"").decode("utf-8", "replace").strip().split(",")
-              if part.strip()]
+        return [], details
+    fields = _text(probe.stdout).strip("\n").split("\t", 3)
+    if len(fields) != 4:
+        fields = ["", "", "", ""]
+    pid, start_time, version, config_files = fields
+    loaded = [part.strip() for part in config_files.split(",") if part.strip()]
     # tmux records the resolved path of each file it loaded. A config inside
-    # this home (an old ~/.tmux.conf, an upstream checkout's tmux.conf, ...) is
-    # what a restart would replace with ~/.tmux.conf anyway; a server that runs
-    # another user's or another home's config is left alone.
+    # this home (an old ~/.tmux.conf, an upstream checkout's tmux.conf, ...)
+    # is what a restart would replace with ~/.tmux.conf anyway; a server
+    # running another user's or another home's config is left alone.
     home = str(target.home).rstrip("/") + "/"
-    if not any(path == str(conf) or path.startswith(home) for path in loaded):
-        return [], "running-server-uses-another-config"
-    done = runner.run([tmux, "source-file", str(conf)], timeout=60, check=False,
-                      env=tenv)
-    if done.returncode != 0:
-        return [("could not reload the running tmux server's config: "
-                 + _tail(done.stderr or done.stdout))], "reload-failed"
-    return [TMUX_RELOADED], "reloaded"
+    conf = str(target.home / ".tmux.conf")
+    if not any(path == conf or path.startswith(home) for path in loaded):
+        details["outcome"] = "running-server-uses-another-config"
+        return [], details
+
+    problems: list[str] = []
+    waited = _wait_out_continuum_restore(tmux, runner, tenv, start_time)
+    if waited:
+        details["waited_for_continuum_seconds"] = round(waited, 1)
+    binary, note = _server_binary(tmux, runner, version, pid)
+    if note:
+        details["defaults_from"] = note
+    defaults = capture_tmux_defaults(binary, runner, child_env(target, tenv),
+                                     cwd=target.home)
+    keys, options, hooks = _server_state(tmux, runner, tenv)
+    lines = _reset_lines(defaults, keys, options, hooks)
+    lines += _config_lines(default_config_files(target))
+    workdir = Path(tempfile.mkdtemp(prefix="pdfc-"))
+    try:
+        config_error = _source_lines(tmux, runner, tenv, workdir, "converge", lines)
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+    if config_error:
+        # No shell is restarted into a config that did not load cleanly.
+        problems.append(f"loading the new config: {config_error}")
+    elif not generation_changed(generation, previous_generation):
+        # Nothing changed (or no generation was written): no shell has
+        # anything new to load, so none is touched.
+        details["respawn"] = "generation-unchanged"
+        details["restarted"] = []
+        details["kept"] = {}
+    else:
+        # Only with the new config in place: its default-command starts them.
+        restarted, kept, why = respawn_idle_panes(
+            tmux, runner, tenv,
+            hook_path=shell_hook_path(target) if hook_path is None else Path(hook_path))
+        details["respawn"] = "done"
+        details["respawned_panes"] = len(restarted)
+        details["busy_panes"] = sum(kept.values())
+        details["restarted"] = restarted
+        details["kept"] = dict(sorted(kept.items()))
+        problems += why
+    if problems:
+        details["outcome"] = "failed"
+        return (["could not fully apply the new config to the running tmux server: "
+                 + "; ".join(problems)], details)
+    details["outcome"] = "converged"
+    return [], details
 
 
 def post_install_phase(target, runner, *, repo_root: Path, run_id: str,
                        systemd_units_applied: bool,
                        env: dict[str, str] | None = None,
                        skip_zplug: bool = False,
-                       skip_vimplug: bool = False) -> PhaseResult:
+                       skip_vimplug: bool = False,
+                       tmux_env: dict[str, str] | None = None,
+                       record_generation=None,
+                       hook_path: Path | None = None) -> PhaseResult:
+    """The post actions, in this order:
+
+    1. the pinned tmux plugins, the systemd user units and the zsh/nvim
+       plugin step;
+    2. ``record_generation()`` (install.py: compute the checkout's
+       generation, write it, return ``(previous, generation)``), so every
+       shell started from here on loads the final generation and every
+       hooked shell sees the change;
+    3. the running tmux server is converged: config reset and source, then,
+       only when the generation changed, the idle unhooked zsh panes are
+       respawned.
+
+    ``tmux_env`` addresses the user's tmux server (it keeps TMUX_TMPDIR,
+    which ``env`` from :func:`child_env` drops); it defaults to ``env``.
+    """
+
     statuses: list[str] = []
     reasons: list[str] = []
     details: dict = {}
@@ -382,13 +1171,6 @@ def post_install_phase(target, runner, *, repo_root: Path, run_id: str,
     statuses.append(PASS if status == SKIPPED else status)
     reasons += why
     details["tmux_plugins"] = plugin_details
-
-    # After the plugins are in place, so the reloaded config finds them.
-    try:
-        why, details["tmux_reload"] = reload_running_tmux(target, runner, env)
-    except Exception as exc:  # never let a running server break the install
-        why, details["tmux_reload"] = [f"tmux reload: {exc}"], "reload-failed"
-    reasons += why
 
     if not systemd_units_applied:
         details["systemd"] = "units-skipped"
@@ -415,6 +1197,31 @@ def post_install_phase(target, runner, *, repo_root: Path, run_id: str,
     statuses += plugin_statuses
     reasons += plugin_reasons
     details.update(plugin_details)
+
+    generation = previous = None
+    if record_generation is not None:
+        try:
+            previous, generation = record_generation()
+        except Exception as exc:  # the files are installed; shells keep theirs
+            reasons.append(f"could not write the generation file: {exc}")
+        else:
+            details["generation"] = generation
+            details["generation_changed"] = generation_changed(generation, previous)
+
+    # Last: the converged server loads the plugins above, and the shells it
+    # restarts start on the generation just written.
+    try:
+        why, details["tmux_converge"] = converge_running_tmux(
+            target, runner, env if tmux_env is None else tmux_env,
+            generation=generation, previous_generation=previous, hook_path=hook_path)
+    except Exception as exc:  # never let a running server break the install
+        why = [f"could not apply the new config to the running tmux server: {exc}"]
+        details["tmux_converge"] = {"outcome": "failed", "respawned_panes": 0,
+                                    "busy_panes": 0}
+    reasons += why
+    summary = converge_summary(details["tmux_converge"])
+    if summary:
+        ui.log(summary)
 
     return PhaseResult("post-install", worst(statuses or [PASS]), reasons, details)
 
@@ -885,10 +1692,6 @@ def completion_lines(results: list[PhaseResult]) -> list[str]:
         follow.append("zsh is not your login shell yet: "
                       + "; ".join(shell.reasons))
     post = by_phase.get("post-install")
-    if post is not None and post.details.get("tmux_reload") == "reloaded":
-        follow.append("tmux was already running, so its config was reloaded. Shells "
-                      "already open in it keep their old settings: run `exec zsh` "
-                      "there, or open a new window.")
     if post is not None and "systemd-user-manager-unavailable" in post.reasons:
         follow.append("User services (tmux) start at the next graphical login.")
     gui = by_phase.get("gui")
@@ -909,8 +1712,9 @@ def completion_lines(results: list[PhaseResult]) -> list[str]:
         for command in identity.details.get("commands", []):
             follow.append(command)
     lines += ["- " + ui.YELLOW(item) for item in follow]
+    # No "restart your shell" line: open shells pick up the new setup by
+    # themselves (idle tmux panes are restarted, zsh reloads at its prompt).
     lines += [
-        "- Please restart shell (e.g. " + ui.CYAN("`exec zsh`") + ") if necessary.",
         "- To install some packages locally (e.g. neovim, fzf), try "
         + ui.CYAN("`dotfiles install <package>`"),
         "- If you want to update dotfiles (or have any errors), try "

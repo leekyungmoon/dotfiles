@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
@@ -469,6 +470,572 @@ class LoginShellGateTests(TempHome):
         self.assertIn("smoke-failed", status["login-shell"]["reasons"][0])
 
 
+class GenerationTests(TempHome):
+    """{state}/personal-dotfiles/generation: "<generation>\\n", 0600, atomic,
+    from the checkout's content, written at the end of the post actions."""
+
+    def pipeline(self, tx_status="PASS", ctx=None):
+        ctx = ctx or self.ctx()
+        ctx.current_shell = "/usr/bin/zsh"
+        passed = lambda name: PhaseResult(name, "PASS")  # noqa: E731
+        seen = {}
+        marker = self.target.state_root / "generation"
+
+        def post(*args, **kwargs):
+            seen["at_post_install"] = marker.read_text() if marker.exists() else None
+            seen["tmux_env"] = kwargs.get("tmux_env")
+            seen["generation"] = kwargs["record_generation"]()
+            seen["after_record"] = marker.read_text()
+            return passed("post-install")
+
+        with mock.patch.object(install, "preflight_phase", return_value=passed("preflight")), \
+                mock.patch.object(install, "packages_phase",
+                                  return_value=PhaseResult("packages", "SKIPPED")), \
+                mock.patch.object(install, "extra_desired_entries", return_value=([], [])), \
+                mock.patch.object(install, "transaction_phase",
+                                  return_value=(PhaseResult("transaction", tx_status,
+                                                            ["x"] if tx_status == "FAIL"
+                                                            else []), False)), \
+                mock.patch.object(phases, "post_install_phase", side_effect=post), \
+                mock.patch.object(phases, "smoke_phase", return_value=passed("smoke")), \
+                mock.patch.object(phases, "git_identity_phase",
+                                  return_value=passed("git-identity")), \
+                mock.patch.object(phases, "auth_phase",
+                                  return_value=PhaseResult("auth", "SKIPPED")), \
+                mock.patch.object(install, "gui_phase",
+                                  return_value=PhaseResult("gui", "SKIPPED")), \
+                redirect_stdout(io.StringIO()):
+            rc = install.run_pipeline(ctx, "install", install.Options())
+        return rc, seen
+
+    def git_repo(self) -> tuple[Path, dict]:
+        repo = Path(self._tmp.name) / "checkout"
+        repo.mkdir()
+        env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": str(self.home),
+               "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1",
+               "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.invalid",
+               "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.invalid"}
+
+        def git(*args):
+            subprocess.run(["git", "-C", str(repo), *args], env=env, check=True,
+                           capture_output=True)
+        git("init", "-q")
+        (repo / "zshrc").write_text("alias td='tmux detach'\n")
+        git("add", "zshrc")
+        git("commit", "-q", "-m", "one")
+        return repo, git
+
+    def isolated_git_runner(self):
+        class GitRunner(Runner):
+            def run(inner, argv, **kw):
+                env = dict(kw.pop("env", None) or {})
+                env.update({"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1",
+                            "PATH": "/usr/bin:/bin"})
+                return Runner.run(inner, argv, env=env, **kw)
+        return GitRunner()
+
+    def test_post_actions_write_the_content_generation(self):
+        repo, _ = self.git_repo()
+        ctx = self.ctx(self.isolated_git_runner())
+        ctx.repo_root = repo
+        rc, seen = self.pipeline(ctx=ctx)
+        self.assertEqual(rc, 0)
+        marker = self.target.state_root / "generation"
+        generation = install.checkout_generation(ctx.runner, repo, {})
+        self.assertRegex(generation, r"^[0-9a-f]{64}$")
+        self.assertNotIn(ctx.run_id, generation)
+        self.assertEqual(marker.read_text(), f"{generation}\n")
+        self.assertEqual(seen["generation"], (None, generation))  # (previous, new)
+        self.assertEqual(marker.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(self.target.state_root.stat().st_mode & 0o777, 0o700)
+        # Not before the post actions: nothing existed when they started, and
+        # the write happens inside them (after plugins, before converge).
+        self.assertIsNone(seen["at_post_install"])
+        self.assertEqual(seen["after_record"], f"{generation}\n")
+        self.assertEqual(seen["tmux_env"], {})
+        self.assertEqual(sorted(p.name for p in self.target.state_root.iterdir()),
+                         ["generation", "status.json"])
+
+    def test_generation_follows_content_not_the_run(self):
+        repo, git = self.git_repo()
+        runner = self.isolated_git_runner()
+        first = install.checkout_generation(runner, repo, {})
+        self.assertEqual(install.checkout_generation(runner, repo, {}), first)
+        # A local edit counts; reverting it gives the first generation back.
+        (repo / "zshrc").write_text("alias td='tmux detach'\nalias x=y\n")
+        edited = install.checkout_generation(runner, repo, {})
+        self.assertNotEqual(edited, first)
+        (repo / "zshrc").write_text("alias td='tmux detach'\nalias x=z\n")
+        self.assertNotEqual(install.checkout_generation(runner, repo, {}), edited)
+        (repo / "zshrc").write_text("alias td='tmux detach'\n")
+        self.assertEqual(install.checkout_generation(runner, repo, {}), first)
+        # An untracked file counts, and so does its content (git status
+        # lists only its name); an ignored file does not.
+        (repo / "new").write_text("x")
+        untracked = install.checkout_generation(runner, repo, {})
+        self.assertNotEqual(untracked, first)
+        (repo / "new").write_text("y")
+        self.assertNotEqual(install.checkout_generation(runner, repo, {}), untracked)
+        (repo / "new").write_text("x")
+        self.assertEqual(install.checkout_generation(runner, repo, {}), untracked)
+        (repo / "sub").mkdir()
+        (repo / "sub" / "deep").write_text("1")
+        deep = install.checkout_generation(runner, repo, {})
+        (repo / "sub" / "deep").write_text("2")
+        self.assertNotEqual(install.checkout_generation(runner, repo, {}), deep)
+        shutil.rmtree(repo / "sub")
+        self.assertEqual(install.checkout_generation(runner, repo, {}), untracked)
+        (repo / "link").symlink_to("new")
+        linked = install.checkout_generation(runner, repo, {})
+        (repo / "link").unlink()
+        (repo / "link").symlink_to("other")
+        self.assertNotEqual(install.checkout_generation(runner, repo, {}), linked)
+        (repo / "link").unlink()
+        (repo / ".git" / "info" / "exclude").write_text("ignored.txt\n")
+        (repo / "ignored.txt").write_text("1")
+        self.assertEqual(install.checkout_generation(runner, repo, {}), untracked)
+        (repo / "ignored.txt").write_text("2")
+        self.assertEqual(install.checkout_generation(runner, repo, {}), untracked)
+        git("add", "new")
+        git("commit", "-q", "-m", "two")
+        second = install.checkout_generation(runner, repo, {})
+        self.assertNotIn(second, (first, edited))
+        # A caller's GIT_DIR/GIT_INDEX_FILE never redirect it.
+        self.assertEqual(install.checkout_generation(
+            runner, repo, {"GIT_DIR": "/nonexistent", "GIT_INDEX_FILE": "/x"}), second)
+        # Read-only: every git call skips optional locks, and the diff is
+        # plumbing (diff-index never refreshes the index).
+        recorded = ScriptedRunner()
+        install.checkout_generation(recorded, repo, {})
+        self.assertEqual([c[:4] for c in recorded.calls],
+                         [["git", "--no-optional-locks", "-C", str(repo)]] * 4)
+        self.assertEqual([c[4:] for c in recorded.calls],
+                         [["rev-parse", "--verify", "-q", "HEAD"],
+                          ["status", "--porcelain=v1", "-z"],
+                          ["diff-index", "-p", "--no-ext-diff", "--no-textconv",
+                           "--no-color", "--binary", "HEAD", "--"],
+                          ["ls-files", "-o", "--exclude-standard", "-z"]])
+
+    def test_generation_never_writes_the_index(self):
+        # A stat-dirty tracked file (touched, same content) made 'git diff'
+        # rewrite .git/index and take index.lock in the user's checkout.
+        repo, _ = self.git_repo()
+        runner = self.isolated_git_runner()
+        first = install.checkout_generation(runner, repo, {})
+        index = repo / ".git" / "index"
+        later = time.time() + 100
+        os.utime(repo / "zshrc", (later, later))
+        before = (index.read_bytes(), index.stat().st_mtime_ns)
+        self.assertEqual(install.checkout_generation(runner, repo, {}), first)
+        self.assertEqual((index.read_bytes(), index.stat().st_mtime_ns), before)
+        self.assertFalse((repo / ".git" / "index.lock").exists())
+        # A real edit still counts, and still writes nothing.
+        (repo / "zshrc").write_text("alias td='tmux detach'\nalias q=r\n")
+        self.assertNotEqual(install.checkout_generation(runner, repo, {}), first)
+        self.assertEqual((index.read_bytes(), index.stat().st_mtime_ns), before)
+
+    def test_unchanged_repair_keeps_the_generation(self):
+        repo, _ = self.git_repo()
+        ctx = self.ctx(self.isolated_git_runner())
+        ctx.repo_root = repo
+        _, first = self.pipeline(ctx=ctx)
+        ctx2 = self.ctx(self.isolated_git_runner())
+        ctx2.repo_root = repo
+        ctx2.run_id = "20260102T000000Z-89abcdef"
+        _, second = self.pipeline(ctx=ctx2)
+        generation = first["generation"][1]
+        # The second run sees the first's generation as the previous one.
+        self.assertEqual(second["generation"], (generation, generation))
+        self.assertEqual(second["at_post_install"], f"{generation}\n")
+        self.assertFalse(phases.generation_changed(*reversed(second["generation"])))
+
+    def test_checkout_without_git_is_hashed_by_its_files(self):
+        plain = Path(self._tmp.name) / "plain"
+        plain.mkdir()
+        (plain / "a").write_text("1")
+        runner = ScriptedRunner(responses={("git", "--no-optional-locks", "-C"): 128})
+        first = install.checkout_generation(runner, plain, {})
+        self.assertEqual(install.checkout_generation(runner, plain, {}), first)
+        (plain / "a").write_text("2")
+        self.assertNotEqual(install.checkout_generation(runner, plain, {}), first)
+
+    def test_failed_transaction_keeps_the_previous_generation(self):
+        install.write_generation(self.target, "previous")
+        with mock.patch.object(phases, "post_install_phase",
+                               side_effect=AssertionError("post actions ran")):
+            rc, _ = self.pipeline(tx_status="FAIL")
+        self.assertEqual(rc, 1)
+        self.assertEqual((self.target.state_root / "generation").read_text(),
+                         "previous\n")
+
+    def test_rewrite_is_atomic_and_private(self):
+        path = install.write_generation(self.target, "a")
+        os.chmod(path, 0o644)
+        with mock.patch.object(install.os, "replace", side_effect=OSError("full")):
+            with self.assertRaises(OSError):
+                install.write_generation(self.target, "b")
+        self.assertEqual(path.read_text(), "a\n")  # never half-written
+        self.assertEqual([p.name for p in path.parent.iterdir()], ["generation"])
+        install.write_generation(self.target, "c")
+        self.assertEqual((path.read_text(), path.stat().st_mode & 0o777), ("c\n", 0o600))
+        for bad in ("", "a\nb", "a\tb"):
+            with self.assertRaises(ValueError):
+                install.write_generation(self.target, bad)
+
+    def test_record_generation_returns_the_previous_one(self):
+        repo, _ = self.git_repo()
+        ctx = self.ctx(self.isolated_git_runner())
+        ctx.repo_root = repo
+        self.assertIsNone(install.read_generation(self.target))
+        previous, generation = install.record_generation(ctx)
+        self.assertEqual((previous, install.read_generation(self.target)), (None, generation))
+        self.assertEqual(install.record_generation(ctx), (generation, generation))
+        install.write_generation(self.target, "older")
+        self.assertEqual(install.record_generation(ctx), ("older", generation))
+        # Not a regular file, or unreadable: as if none was recorded.
+        path = self.target.state_root / "generation"
+        path.unlink()
+        path.mkdir()
+        self.assertIsNone(install.read_generation(self.target))
+
+    def test_unchanged_generation_reaches_the_converge(self):
+        seen = {}
+
+        def converge(target, runner, env, **kw):
+            seen.update(kw)
+            return [], {"outcome": "converged", "respawn": "generation-unchanged",
+                        "respawned_panes": 0, "busy_panes": 0}
+
+        out = io.StringIO()
+        with mock.patch.object(phases, "converge_running_tmux", side_effect=converge), \
+                redirect_stdout(out):
+            r = phases.post_install_phase(
+                self.target, ScriptedRunner(), repo_root=self.home,
+                run_id="20260101T000000Z-0123abcd", systemd_units_applied=False,
+                record_generation=lambda: ("g1", "g1"))
+        self.assertEqual((seen["previous_generation"], seen["generation"]), ("g1", "g1"))
+        self.assertFalse(r.details["generation_changed"])
+        self.assertEqual(out.getvalue().strip().splitlines(),
+                         ["tmux: applied the new config"])
+
+    def test_generation_write_failure_is_reported_not_fatal(self):
+        seen = {}
+
+        def converge(target, runner, env, **kw):
+            seen.update(kw)
+            return [], {"outcome": "no-running-server", "respawned_panes": 0,
+                        "busy_panes": 0}
+
+        def boom():
+            raise OSError("ro")
+
+        with mock.patch.object(phases, "converge_running_tmux", side_effect=converge):
+            r = phases.post_install_phase(
+                self.target, ScriptedRunner(), repo_root=self.home,
+                run_id="20260101T000000Z-0123abcd", systemd_units_applied=False,
+                record_generation=boom)
+        self.assertNotEqual(r.status, "FAIL")
+        self.assertIn("could not write the generation file: ro", r.reasons)
+        # So no shell is respawned: no generation, no change.
+        self.assertEqual((seen["generation"], seen["previous_generation"]), (None, None))
+
+    def test_order_plugins_systemd_generation_converge(self):
+        events = []
+        runner = ScriptedRunner(which={"systemctl": "/bin/systemctl", "zsh": "/fake/zsh"})
+        original = runner.run
+
+        def run(argv, **kw):
+            events.append(" ".join(map(str, argv[:3])))
+            return original(argv, **kw)
+        runner.run = run
+
+        def converge(target, runner_, env, **kw):
+            events.append(f"converge {kw['previous_generation']} {kw['generation']}")
+            return [], {"outcome": "converged", "respawned_panes": 2, "busy_panes": 3}
+
+        def record():
+            events.append("generation")
+            return "g1", "g2"
+
+        out = io.StringIO()
+        with mock.patch.object(phases, "install_tmux_plugins",
+                               side_effect=lambda *a: (events.append("tmux-plugins")
+                                                       or ("PASS", [], {}))), \
+                mock.patch.object(phases, "converge_running_tmux", side_effect=converge), \
+                redirect_stdout(out):
+            r = phases.post_install_phase(
+                self.target, runner, repo_root=self.home,
+                run_id="20260101T000000Z-0123abcd", systemd_units_applied=True,
+                record_generation=record)
+        self.assertEqual(r.status, "PASS", r.reasons)
+        self.assertEqual(r.details["generation"], "g2")
+        self.assertTrue(r.details["generation_changed"])
+        order = [e.split()[0] if not e.startswith("systemctl") else e for e in events]
+        self.assertEqual(order[0], "tmux-plugins")
+        self.assertLess(order.index("systemctl --user daemon-reload"),
+                        order.index("/fake/zsh"))
+        self.assertEqual(order[-2:], ["generation", "converge"])
+        self.assertEqual(events[-1], "converge g1 g2")
+        # One neutral summary line, nothing about an earlier state.
+        printed = out.getvalue().strip().splitlines()
+        self.assertEqual(printed, ["tmux: applied the new config; restarted 2 idle shells"])
+        self.assertEqual(r.reasons, [])
+
+
+# One rule for "an interactive shell invocation", shared by the tmux
+# converge (installer/phases.py) and bin/dotfiles' parent check.
+INTERACTIVE_ARGVS = (
+    ["-zsh"], ["zsh"], ["zsh", "-il"], ["zsh", "-l"], ["/bin/bash", "-i"],
+    ["bash", "--login"], ["-bash"], ["fish", "-l"], ["sh", "+x"], ["-zsh", "-l"],
+    ["/usr/bin/zsh", "--login"])
+NON_INTERACTIVE_ARGVS = (
+    [], [""], ["bash", "-c", "read -p continue? x"], ["zsh", "-ic", "x"],
+    ["-zsh", "-c", "x"], ["-bash", "-c", "dotfiles update; true"],
+    ["-bash", "-lc", "x"], ["bash", "script.sh"], ["sh", "./x"],
+    ["-bash", "script.sh"], ["zsh", "-o", "nolog"], ["bash", "--rcfile", "f"],
+    ["bash", "--rcfile=f"], ["fish", "--command=x"], ["fish", "--init-command", "x"],
+    ["bash", "-"], ["bash", "--"], ["zsh", "-l", "x.zsh"], ["bash", "x"],
+    ["zsh", "-i", "--", "x"])
+
+
+class ConvergeUnitTests(TempHome):
+    """The pieces of converge_running_tmux that need no tmux server."""
+
+    def test_reset_lines(self):
+        defaults = phases.TmuxDefaults(
+            keys=["bind-key -T prefix d detach-client"],
+            notes=[("prefix", "d", "Detach the current client"), ("prefix", "'", "it's")],
+            options={"-g": {"default-shell": ("default-shell /usr/bin/zsh",),
+                            "status": ("status on",),
+                            "status-format": ('status-format[0] "x"',)},
+                     "-gw": {"automatic-rename": ("automatic-rename on",)},
+                     "-s": {"escape-time": ("escape-time 500",)}},
+            hooks={"-g": {"session-created": ("session-created",)}})
+        lines = phases._reset_lines(
+            defaults,
+            keys=["bind-key -T prefix s choose-tree", "bind-key -T resize-pane k x"],
+            options={"-g": {"default-shell": ("default-shell /bin/sh",),
+                            "status": ("status on",),
+                            "status-format": ('status-format[0] "y"',),
+                            "@plugin": ("@plugin tpm",),
+                            "@tmux-restore-complete": ("@tmux-restore-complete on",),
+                            "@continuum-save-last-timestamp": ("@c 1",),
+                            "only-in-another-version": ("only-in-another-version 1",)},
+                     "-gw": {"automatic-rename": ("automatic-rename off",)},
+                     "-s": {"escape-time": ("escape-time 0",)}},
+            hooks={"-g": {"session-created": ("session-created[0] x",)}})
+        self.assertEqual(lines[:2], ["unbind-key -a -T 'prefix'",
+                                     "unbind-key -a -T 'resize-pane'"])
+        self.assertIn("bind-key -T prefix d detach-client", lines)
+        self.assertIn("bind-key -N 'Detach the current client' -T 'prefix' 'd'", lines)
+        self.assertIn('bind-key -N "it\'s" -T \'prefix\' "\'"', lines)
+        self.assertIn("set-option -g default-shell /usr/bin/zsh", lines)  # not -u
+        self.assertIn("set-option -gu status-format", lines)              # arrays: -u
+        self.assertIn("set-option -gu @plugin", lines)
+        self.assertIn("set-option -gw automatic-rename on", lines)
+        self.assertIn("set-option -s escape-time 500", lines)
+        self.assertIn("set-hook -gu session-created", lines)
+        joined = "\n".join(lines)
+        self.assertNotIn("set-option -g status on", joined)  # already the default
+        self.assertNotIn("restore-complete", joined)       # runtime state kept
+        self.assertNotIn("continuum-save-last", joined)
+        self.assertNotIn("only-in-another-version", joined)
+
+    def test_config_is_inlined_after_the_reset(self):
+        conf = self.home / ".tmux.conf"
+        conf.write_text("set -g status off\n%if 1\nset -g mouse on\n%endif\n")
+        self.assertEqual(phases.default_config_files(self.target)[-1], conf)
+        lines = phases._config_lines([conf])
+        self.assertEqual(lines[1:-1], ["set -g status off", "%if 1", "set -g mouse on",
+                                       "%endif"])
+        self.assertTrue(lines[0].startswith("#"))
+
+    def test_respawn_argv(self):
+        path = "/usr/bin:/bin"
+        self.assertEqual(phases._respawn_argv("zsh -il", "/bin/sh", path),
+                         ["zsh", "-il"])
+        self.assertEqual(phases._respawn_argv("cat x; exec zsh", "/bin/sh", path),
+                         ["cat x; exec zsh"])
+        self.assertEqual(phases._respawn_argv("", "/bin/sh", path), ["/bin/sh", "-l"])
+        self.assertIsNone(phases._respawn_argv("", "relative", path))
+        self.assertIsNone(phases._respawn_argv("no-such-shell-xyz -l", "/bin/sh", path))
+
+    def test_interactive_invocation(self):
+        for argv in INTERACTIVE_ARGVS:
+            self.assertTrue(phases.interactive_invocation(argv), argv)
+        for argv in NON_INTERACTIVE_ARGVS:
+            self.assertFalse(phases.interactive_invocation(argv), argv)
+
+    def test_interactive_invocation_parity_with_bin_dotfiles(self):
+        """bin/dotfiles applies the same rule to its parent shell. It cannot
+        import installer/ (it runs before the checkout is complete), so the
+        two are kept in parity here, on the same vectors."""
+        from importlib.machinery import SourceFileLoader
+        import importlib.util
+        loader = SourceFileLoader("dotfiles_cmd_parity", str(REPO_ROOT / "bin" / "dotfiles"))
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        module = importlib.util.module_from_spec(spec)
+        with mock.patch.object(sys, "argv", ["dotfiles"]):
+            loader.exec_module(module)
+        rule = next((getattr(module, name) for name in
+                     ("interactive_invocation", "_interactive_invocation")
+                     if callable(getattr(module, name, None))), None)
+        if rule is None:
+            self.skipTest("bin/dotfiles has no interactive_invocation(argv) yet")
+        for argv in INTERACTIVE_ARGVS + NON_INTERACTIVE_ARGVS:
+            self.assertEqual(bool(rule(list(argv))), phases.interactive_invocation(argv),
+                             argv)
+
+    def hook_file(self) -> Path:
+        path = phases.shell_hook_path(self.target)
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        path.touch(mode=0o600)
+        return path
+
+    def holder(self, path: Path, *, cloexec=True, then="exec sleep 30"):
+        """A child that holds a read-only fd on ``path`` (as the zsh module
+        does), then runs ``then`` with /bin/sh."""
+        code = ("import os, sys\n"
+                f"fd = os.open({str(path)!r}, os.O_RDONLY | "
+                f"{'os.O_CLOEXEC' if cloexec else '0'})\n"
+                f"os.set_inheritable(fd, {not cloexec!r})\n"
+                "sys.stdout.write('ready\\n'); sys.stdout.flush()\n"
+                f"os.execv('/bin/sh', ['sh', '-c', {then!r}])\n")
+        child = subprocess.Popen([sys.executable, "-B", "-c", code], stdout=subprocess.PIPE,
+                                 start_new_session=True)
+        self.addCleanup(lambda: (child.kill(), child.wait(), child.stdout.close()))
+        self.assertEqual(child.stdout.readline(), b"ready\n")
+        return child
+
+    def wait_exec(self, pid: int, comm: str):
+        for _ in range(200):
+            stat = phases._proc_stat(pid)
+            if stat and stat[0] == comm:
+                return
+            time.sleep(0.01)
+        self.fail(f"{pid} never became {comm}")
+
+    def test_shell_hooked(self):
+        path = self.hook_file()
+        self.assertEqual(path, self.target.state_root / "shell-hook")
+        # The fd survives the holder's exec only when it is inheritable:
+        # a close-on-exec fd (what the zsh module uses) closes on 'exec bash'.
+        kept = self.holder(path, cloexec=False)
+        dropped = self.holder(path, cloexec=True)
+        self.wait_exec(kept.pid, "sleep")
+        self.wait_exec(dropped.pid, "sleep")
+        self.assertTrue(phases.shell_hooked(kept.pid, path))
+        self.assertFalse(phases.shell_hooked(dropped.pid, path))
+        self.assertFalse(phases.shell_hooked(os.getpid(), path))
+        self.assertIsNone(phases.shell_hooked(2 ** 22 + 7, path))  # no such process
+        # The file removed (or replaced) since: still the hook.
+        path.unlink()
+        self.assertTrue(phases.shell_hooked(kept.pid, path))
+        path.touch(mode=0o600)
+        self.assertTrue(phases.shell_hooked(kept.pid, path))
+        # Another state directory's hook file (another XDG_STATE_HOME): hooked.
+        other = self.home / "elsewhere" / "personal-dotfiles" / "shell-hook"
+        self.assertTrue(phases.shell_hooked(kept.pid, other))
+        # The same inode under another name (a symlinked state directory).
+        alias_dir = self.home / "alias"
+        alias_dir.symlink_to(self.target.state_root)
+        third = self.holder(alias_dir / "shell-hook", cloexec=False)
+        self.assertTrue(phases.shell_hooked(third.pid, path))
+        # A file merely named shell-hook elsewhere is not the hook.
+        stray = self.home / "shell-hook"
+        stray.touch()
+        fourth = self.holder(stray, cloexec=False)
+        self.assertFalse(phases.shell_hooked(fourth.pid, path))
+
+    def test_shell_hooked_cannot_tell(self):
+        with mock.patch.object(phases.os, "listdir", side_effect=PermissionError("no")):
+            self.assertIsNone(phases.shell_hooked(os.getpid(), self.hook_file()))
+
+    def test_shell_restart_check_without_a_terminal(self):
+        def shell(script):
+            return subprocess.Popen(["/bin/sh", "-c", script], start_new_session=True,
+                                    cwd=self.home)
+
+        check = dict(hook_path=self.hook_file())
+        lone = shell("sleep 30")
+        try:
+            # Not a zsh (and not a terminal's foreground group): never.
+            self.assertEqual(phases.shell_restart_check(lone.pid, "/dev/pts/0", **check),
+                             (None, "not-zsh"))
+        finally:
+            lone.kill()
+            lone.wait()
+        zsh = shutil.which("zsh", path="/usr/bin:/bin")
+        if zsh:
+            # A zsh that is not its terminal's foreground group: busy.
+            waiting = subprocess.Popen([zsh, "-f"], stdin=subprocess.PIPE,
+                                       start_new_session=True, cwd=self.home)
+            try:
+                self.wait_exec(waiting.pid, "zsh")
+                self.assertEqual(phases.shell_restart_check(waiting.pid, "/dev/pts/0",
+                                                            **check), (None, "busy"))
+            finally:
+                waiting.kill()
+                waiting.wait()
+                waiting.stdin.close()
+        self.assertEqual(phases.shell_restart_check(os.getpid(), "/dev/pts/0", **check),
+                         (None, "not-zsh"))
+        self.assertEqual(phases.shell_restart_check(2 ** 22 + 7, "/dev/pts/0", **check),
+                         (None, "gone"))
+
+    def test_exe_name_of_an_upgraded_binary(self):
+        with mock.patch.object(phases.os, "readlink", return_value="/usr/bin/zsh (deleted)"):
+            self.assertEqual(phases._exe_name(1), "zsh")
+
+    def test_pane_check_uses_what_tmux_knows(self):
+        fields = ["%1", str(os.getpid()), "0", "0", "0", "30", "/dev/pts/0", "zsh",
+                  "1", "0", "s"]
+        hook = self.hook_file()
+        for index, value in ((2, "1"), (3, "1"), (4, "1"), (1, "x")):
+            changed = list(fields)
+            changed[index] = value
+            self.assertEqual(phases._pane_check(changed, hook), (None, "busy"), index)
+        for current in ("bash", "sh", "fish", "-bash", "python3"):
+            changed = list(fields)
+            changed[7] = current
+            self.assertEqual(phases._pane_check(changed, hook), (None, "not-zsh"))
+        # A zsh as tmux sees it, but /proc says python: not a zsh either.
+        self.assertEqual(phases._pane_check(fields, hook), (None, "not-zsh"))
+
+    def test_generation_changed(self):
+        self.assertTrue(phases.generation_changed("g2", "g1"))
+        self.assertTrue(phases.generation_changed("g1", None))  # first install
+        self.assertFalse(phases.generation_changed("g1", "g1"))
+        self.assertFalse(phases.generation_changed(None, "g1"))  # none written
+        self.assertFalse(phases.generation_changed(None, None))
+
+    def test_converge_summary(self):
+        self.assertEqual(phases.converge_summary({"outcome": "converged",
+                                                  "respawned_panes": 1}),
+                         "tmux: applied the new config; restarted 1 idle shell")
+        self.assertEqual(phases.converge_summary({"outcome": "converged",
+                                                  "respawned_panes": 0}),
+                         "tmux: applied the new config; restarted 0 idle shells")
+        self.assertEqual(phases.converge_summary({"outcome": "converged",
+                                                  "respawn": "generation-unchanged"}),
+                         "tmux: applied the new config")
+        for outcome in ("failed", "no-running-server", "running-server-uses-another-config"):
+            self.assertIsNone(phases.converge_summary({"outcome": outcome}))
+
+    def test_wait_out_continuum_restore(self):
+        runner = ScriptedRunner()
+        slept = []
+        with mock.patch.object(phases, "_sleep", side_effect=slept.append), \
+                mock.patch.object(phases.time, "time", return_value=1000.0):
+            self.assertEqual(phases._wait_out_continuum_restore(
+                "tmux", runner, {}, "995"), 7.0)
+            self.assertEqual(phases._wait_out_continuum_restore(
+                "tmux", runner, {}, "900"), 0.0)
+            self.assertEqual(phases._wait_out_continuum_restore(
+                "tmux", runner, {}, ""), 0.0)
+        self.assertEqual(slept, [7.0])
+
+
 class AuthTests(TempHome):
     class CliRunner(ScriptedRunner):
         def __init__(self, answers):
@@ -845,6 +1412,35 @@ class PostInstallTests(TempHome):
         self.assertEqual(r.status, "PASS")
         self.assertEqual(r.details["vim_plugins"], "nvim-not-installed")
 
+    def test_converge_without_tmux_is_a_no_op(self):
+        r = self.reachable_post(ScriptedRunner())
+        self.assertEqual(r.details["tmux_converge"],
+                         {"outcome": "no-running-server", "respawned_panes": 0,
+                          "busy_panes": 0})
+
+    def test_converge_error_is_reported_not_fatal(self):
+        with mock.patch.object(phases, "converge_running_tmux",
+                               side_effect=RuntimeError("boom")):
+            r = self.reachable_post(ScriptedRunner())
+        self.assertNotEqual(r.status, "FAIL")
+        self.assertEqual(r.details["tmux_converge"]["outcome"], "failed")
+        self.assertTrue(any("boom" in reason for reason in r.reasons))
+
+    def test_converge_addresses_tmux_with_the_unstripped_env(self):
+        seen = {}
+
+        def converge(target, runner, env, **kw):
+            seen["env"] = env
+            return [], {"outcome": "no-running-server", "respawned_panes": 0,
+                        "busy_panes": 0}
+
+        with mock.patch.object(phases, "converge_running_tmux", side_effect=converge):
+            phases.post_install_phase(
+                self.target, ScriptedRunner(), repo_root=self.home,
+                run_id="20260101T000000Z-0123abcd", systemd_units_applied=False,
+                env={"HOME": "x"}, tmux_env={"TMUX_TMPDIR": "/private"})
+        self.assertEqual(seen["env"], {"TMUX_TMPDIR": "/private"})
+
     def test_bad_plugin_manifest_fails(self):
         repo_root = self.home / "repo"
         (repo_root / "manifests").mkdir(parents=True)
@@ -1053,15 +1649,15 @@ class UiTests(unittest.TestCase):
         neither = "\n".join(phases.completion_lines([PhaseResult(
             "packages", "PASS", [], {"tools_selected": ["node", "neovim"]})]))
         self.assertNotIn("Sign in to the AI CLIs", neither)
-        # A tmux server that was running before the install was reloaded:
-        # its existing shells still have the old settings.
-        reloaded = "\n".join(phases.completion_lines([PhaseResult(
-            "post-install", "PASS", [phases.TMUX_RELOADED], {"tmux_reload": "reloaded"})]))
-        self.assertIn("exec zsh", reloaded)
-        self.assertIn("tmux was already running", reloaded)
-        quiet = "\n".join(phases.completion_lines([PhaseResult(
-            "post-install", "PASS", [], {"tmux_reload": "no-running-server"})]))
-        self.assertNotIn("tmux was already running", quiet)
+        # A running tmux server was converged: nothing is left for the user to
+        # do, so there is no "restart your shell" or before-install wording.
+        for outcome in ("converged", "no-running-server", "failed"):
+            text = "\n".join(phases.completion_lines([PhaseResult(
+                "post-install", "PASS", [], {"tmux_converge": {
+                    "outcome": outcome, "respawned_panes": 2, "busy_panes": 1}})]))
+            for wording in ("exec zsh", "restart shell", "already running",
+                            "already open", "before"):
+                self.assertNotIn(wording, text, outcome)
         bad = "\n".join(phases.completion_lines([PhaseResult("smoke", "FAIL", ["zsh"])]))
         self.assertIn("You have   1 warnings or errors", bad)
         self.assertNotIn("codex login", bad)

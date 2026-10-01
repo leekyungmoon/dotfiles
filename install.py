@@ -26,6 +26,7 @@ import inspect  # noqa: E402
 import json  # noqa: E402
 import os  # noqa: E402
 import pwd  # noqa: E402
+import stat  # noqa: E402
 import subprocess  # noqa: E402
 import time  # noqa: E402
 from pathlib import Path  # noqa: E402
@@ -690,6 +691,180 @@ def finish(ctx: Context, command: str, results: list[PhaseResult], *,
     return phases.exit_code(results)
 
 
+GENERATION_FILE = "generation"
+GENERATION_GIT_TIMEOUT = 120.0
+GENERATION_MAX_BYTES = 4096
+
+
+def _git_bytes(runner, repo: Path, env: dict, *args: str) -> bytes | None:
+    """stdout of a read-only git command in ``repo``, or None on failure."""
+
+    try:
+        done = runner.run(["git", "--no-optional-locks", "-C", str(repo), *args],
+                          timeout=GENERATION_GIT_TIMEOUT, check=False, env=env,
+                          read_only=True)
+    except Exception:
+        return None
+    if done.returncode != 0:
+        return None
+    out = done.stdout or b""
+    return out if isinstance(out, bytes) else str(out).encode("utf-8")
+
+
+def _tree_digest(root: Path) -> str:
+    """Content digest of a checkout git cannot read (paths, link targets and
+    file bytes; .git left out)."""
+
+    digest = hashlib.sha256()
+    for top, dirs, files in os.walk(root):
+        dirs[:] = sorted(d for d in dirs if d != ".git")
+        for name in sorted(files + [d for d in dirs if os.path.islink(os.path.join(top, d))]):
+            path = os.path.join(top, name)
+            rel = os.path.relpath(path, root)
+            digest.update(rel.encode("utf-8", "surrogateescape") + b"\0")
+            try:
+                if os.path.islink(path):
+                    digest.update(b"l" + os.readlink(path).encode("utf-8", "surrogateescape"))
+                else:
+                    with open(path, "rb") as handle:
+                        digest.update(b"f" + hashlib.sha256(handle.read()).digest())
+            except OSError:
+                digest.update(b"?")
+            digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def _untracked_digest(repo: Path, listed: bytes) -> str:
+    """Digest of the untracked, non-ignored files ``git ls-files -o
+    --exclude-standard -z`` listed: each path with its content (a link with
+    its target), so editing such a file is a new generation too."""
+
+    digest = hashlib.sha256()
+    for name in sorted(set(filter(None, listed.split(b"\0")))):
+        path = os.path.join(os.fsencode(repo), name)
+        digest.update(name + b"\0")
+        try:
+            st = os.lstat(path)
+            if stat.S_ISLNK(st.st_mode):
+                digest.update(b"l" + os.readlink(path))
+            elif stat.S_ISREG(st.st_mode):
+                fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+                             | os.O_CLOEXEC)
+                file_digest = hashlib.sha256()
+                with os.fdopen(fd, "rb") as handle:
+                    for chunk in iter(lambda: handle.read(1 << 20), b""):
+                        file_digest.update(chunk)
+                digest.update(b"f" + file_digest.digest())
+            else:  # a nested repository's directory, a FIFO, ...
+                digest.update(b"o%o" % stat.S_IFMT(st.st_mode))
+        except OSError:
+            digest.update(b"?")
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def checkout_generation(runner, repo: Path, env: dict | None = None) -> str:
+    """The generation of the checkout, from its content, not from the run.
+
+    sha256 over the HEAD commit, the digest of ``git status --porcelain=v1
+    -z``, the digest of ``git diff-index -p HEAD`` and the content digest of
+    the untracked, non-ignored files (``git ls-files -o --exclude-standard
+    -z``), so every uncommitted local edit counts, and an update or repair
+    that changes nothing gives the same generation (and so respawns and
+    reloads nothing). None of these writes the index: diff-index is
+    plumbing that never refreshes it (``git diff`` would, despite
+    GIT_OPTIONAL_LOCKS=0, whenever a file is only stat-dirty), so no run
+    takes index.lock in the checkout. A checkout git cannot read is hashed
+    by its files instead.
+    """
+
+    git_env = {k: v for k, v in (os.environ if env is None else env).items()
+               if not k.startswith("GIT_")}  # no GIT_DIR, GIT_INDEX_FILE, ...
+    git_env["GIT_OPTIONAL_LOCKS"] = "0"
+    head = _git_bytes(runner, repo, git_env, "rev-parse", "--verify", "-q", "HEAD")
+    status = _git_bytes(runner, repo, git_env, "status", "--porcelain=v1", "-z")
+    diff = _git_bytes(runner, repo, git_env, "diff-index", "-p", "--no-ext-diff",
+                      "--no-textconv", "--no-color", "--binary", "HEAD", "--")
+    untracked = _git_bytes(runner, repo, git_env, "ls-files", "-o", "--exclude-standard",
+                           "-z")
+    digest = hashlib.sha256(b"personal-dotfiles generation 2\0")
+    if head is None or status is None or diff is None or untracked is None:
+        digest.update(b"tree\0" + _tree_digest(Path(repo)).encode("ascii"))
+    else:
+        digest.update(b"git\0" + head.strip() + b"\0")
+        digest.update(hashlib.sha256(status).hexdigest().encode("ascii") + b"\0")
+        digest.update(hashlib.sha256(diff).hexdigest().encode("ascii") + b"\0")
+        digest.update(_untracked_digest(Path(repo), untracked).encode("ascii"))
+    return digest.hexdigest()
+
+
+def read_generation(target: plat.Target) -> str | None:
+    """The generation recorded now, or None (none yet, or unreadable)."""
+
+    path = target.state_root / GENERATION_FILE
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    except OSError:
+        return None
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None
+        data = os.read(fd, GENERATION_MAX_BYTES)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+    text = data.decode("utf-8", "replace").split("\n", 1)[0]
+    return text or None
+
+
+def write_generation(target: plat.Target, generation: str) -> Path:
+    """Record the installed generation for long-running shells.
+
+    ``{state}/personal-dotfiles/generation`` holds ``"<generation>\n"``
+    (:func:`checkout_generation`). It is rewritten at the end of the post
+    actions of every successful install, repair and update (which runs the
+    install), atomically and private (0600). A hooked zsh
+    (zsh/zsh.d/dotfiles-reload.zsh) compares it when Enter is pressed on its
+    primary prompt and before each prompt, and reloads itself when it
+    changed; the tmux converge respawns idle unhooked zsh panes only when
+    :func:`record_generation` saw it change.
+    """
+
+    if not generation or "\n" in generation or "\t" in generation:
+        raise ValueError(f"bad generation {generation!r}")
+    root = target.state_root
+    root.mkdir(parents=True, exist_ok=True)
+    os.chmod(root, 0o700)
+    path = root / GENERATION_FILE
+    tmp = root / f".{GENERATION_FILE}.{os.getpid()}.tmp"
+    if os.path.lexists(tmp):
+        os.unlink(tmp)
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(f"{generation}\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        if os.path.lexists(tmp):
+            os.unlink(tmp)
+        raise
+    return path
+
+
+def record_generation(ctx: Context) -> tuple[str | None, str]:
+    """Compute the checkout's generation and write it; returns
+    ``(previous, generation)``, ``previous`` being the one recorded before
+    (None: none), so the tmux converge respawns shells only on a change."""
+
+    generation = checkout_generation(ctx.runner, Path(ctx.repo_root), ctx.env)
+    previous = read_generation(ctx.target)
+    write_generation(ctx.target, generation)
+    return previous, generation
+
+
 def _report(results: list[PhaseResult], result: PhaseResult) -> PhaseResult:
     results.append(result)
     status = result.status
@@ -735,7 +910,12 @@ def run_pipeline(ctx: Context, command: str, opts: Options) -> int:
     _report(results, phases.post_install_phase(
         ctx.target, ctx.runner, repo_root=Path(ctx.repo_root), run_id=ctx.run_id,
         systemd_units_applied=systemd_applied, env=child_env,
-        skip_zplug=opts.skip_zplug, skip_vimplug=opts.skip_vimplug))
+        skip_zplug=opts.skip_zplug, skip_vimplug=opts.skip_vimplug,
+        tmux_env=dict(ctx.env),
+        # At the end of the post actions, before the running tmux server is
+        # converged: respawned shells and every hooked zsh (at its next
+        # Enter or prompt) pick up this generation.
+        record_generation=lambda: record_generation(ctx)))
     smoke = _report(results, phases.smoke_phase(ctx.target, ctx.runner, ctx.env))
     # The login shell changes only after the smoke checks passed.
     _report(results, phases.login_shell_phase(

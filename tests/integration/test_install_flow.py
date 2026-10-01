@@ -310,6 +310,39 @@ class InstallFlowTests(unittest.TestCase):
         self.assertEqual(_git(self.git_env, "-C", str(checkout), "status",
                               "--porcelain", "--ignored"), "")
 
+    def expected_generation(self) -> str:
+        """The checkout's content generation, computed here independently:
+        HEAD, the digests of 'git status --porcelain=v1 -z' and 'git diff
+        HEAD', and the content digest of the untracked, non-ignored files."""
+
+        def git(*args) -> bytes:
+            return subprocess.run(["git", "--no-optional-locks", "-C", str(self.checkout),
+                                   *args], env=self.git_env, check=True,
+                                  capture_output=True, timeout=120).stdout
+        digest = hashlib.sha256(b"personal-dotfiles generation 2\0git\0")
+        digest.update(git("rev-parse", "--verify", "-q", "HEAD").strip() + b"\0")
+        digest.update(hashlib.sha256(git("status", "--porcelain=v1", "-z"))
+                      .hexdigest().encode() + b"\0")
+        digest.update(hashlib.sha256(git("diff", "--no-ext-diff", "--no-textconv",
+                                         "--no-color", "--binary", "HEAD", "--"))
+                      .hexdigest().encode() + b"\0")
+        untracked = hashlib.sha256()
+        for name in sorted(filter(None, git("ls-files", "-o", "--exclude-standard",
+                                            "-z").split(b"\0"))):
+            path = self.checkout / os.fsdecode(name)
+            content = (b"l" + os.fsencode(os.readlink(path)) if path.is_symlink()
+                       else b"f" + hashlib.sha256(path.read_bytes()).digest())
+            untracked.update(name + b"\0" + content + b"\0")
+        digest.update(untracked.hexdigest().encode())
+        return digest.hexdigest()
+
+    def assert_generation(self, generation: str | None = None):
+        marker = self.target.state_root / "generation"
+        self.assertEqual(marker.read_text(), f"{generation or self.expected_generation()}\n")
+        self.assertEqual(marker.stat().st_mode & 0o777, 0o600)
+        self.assertEqual([p.name for p in marker.parent.iterdir()
+                          if p.name.startswith(".generation")], [])
+
     # -- tests -----------------------------------------------------------------
 
     # The symlinks upstream wookayin/dotfiles' install.py creates, relative to
@@ -417,15 +450,37 @@ class InstallFlowTests(unittest.TestCase):
         # zsh plugin prefill ran (fake zsh), nvim is absent here.
         self.assertTrue(any(c[1:2] == ["-c"] and "antidote" in c[-1]
                             for c in runner.ran("zsh")))
-        # The running-server reload probed the user's default server (no -L/-S),
-        # read-only; the fake answers with no config inside this home, so
-        # nothing was sourced into it.
+        # The running-server converge probed the user's default server (no
+        # -L/-S), read-only; the fake answers with no config inside this home,
+        # so nothing was sourced into it and no pane was restarted.
         tmux = runner.ran("tmux")
         probes = [c for c in tmux if c[1:2] == ["display-message"]]
-        self.assertEqual(probes, [[f"{FAKE}/tmux", "display-message", "-p", "#{config_files}"]])
-        self.assertEqual(by_phase["post-install"]["details"]["tmux_reload"],
-                         "running-server-uses-another-config")
+        self.assertEqual(probes, [[f"{FAKE}/tmux", "display-message", "-p",
+                                   "#{pid}\t#{start_time}\t#{version}\t#{config_files}"]])
+        self.assertEqual(by_phase["post-install"]["details"]["tmux_converge"],
+                         {"outcome": "running-server-uses-another-config",
+                          "respawned_panes": 0, "busy_panes": 0})
         self.assertFalse(any("source-file" in c and "-L" not in c for c in tmux))
+        self.assertFalse(any("respawn-pane" in c for c in tmux))
+        # No before-install wording: open shells pick up the new setup.
+        self.assertNotIn("exec zsh", out)
+        self.assertNotIn("tmux was already running", out)
+        # The generation marker for open shells: the checkout's content
+        # (not the run id), private.
+        self.assert_generation()
+        self.assertNotIn(status["run_id"], (self.target.state_root / "generation").read_text())
+        self.assertEqual(by_phase["post-install"]["details"]["generation"],
+                         self.expected_generation())
+        # Written at the end of the post actions: after the plugin step,
+        # right before the running tmux server is probed and converged.
+        generation_calls = [i for i, c in enumerate(runner.calls)
+                            if c[:2] == ["git", "--no-optional-locks"]]
+        self.assertEqual(len(generation_calls), 4)
+        plugin_step = max(i for i, c in enumerate(runner.calls)
+                          if c[1:2] == ["-c"] and "antidote" in c[-1])
+        probe = runner.calls.index(probes[0])
+        self.assertLess(plugin_step, generation_calls[0])
+        self.assertEqual(generation_calls[-1] + 1, probe)
         # Smoke checks used an isolated -L socket and killed exactly it.
         smoke = [c for c in tmux if "-L" in c]
         sockets = {c[c.index("-L") + 1] for c in smoke}
@@ -530,10 +585,37 @@ class InstallFlowTests(unittest.TestCase):
         self.clone()
         self.assertEqual(self.install()[0], 0)
         (self.home / ".zshrc").unlink()
+        first = (self.target.state_root / "generation").read_text()
         rc, out, _ = self.main("repair", *FLAGS)
         self.assertEqual(rc, 0, out)
         self.assert_installed()
         self.assertEqual(self.status()["command"], "repair")
+        # The checkout did not change: the same generation, so no open shell
+        # reloads and no tmux pane is restarted for nothing.
+        self.assert_generation()
+        self.assertEqual((self.target.state_root / "generation").read_text(), first)
+        # An uncommitted local edit in the checkout is a new generation.
+        readme = self.checkout / "README.md"
+        readme.write_text(readme.read_text() + "\nlocal edit\n")
+        rc, out, _ = self.main("repair", *FLAGS)
+        self.assertEqual(rc, 0, out)
+        edited = (self.target.state_root / "generation").read_text()
+        self.assertNotEqual(edited, first)
+        self.assert_generation()
+        # So is a new untracked file, and an edit of its content (git status
+        # alone would list only its name).
+        extra = self.checkout / "zsh" / "zsh.d" / "local-extra.zsh"
+        extra.write_text("alias one=1\n")
+        self.assertEqual(self.main("repair", *FLAGS)[0], 0)
+        untracked = (self.target.state_root / "generation").read_text()
+        self.assertNotEqual(untracked, edited)
+        self.assert_generation()
+        extra.write_text("alias one=2\n")
+        self.assertEqual(self.main("repair", *FLAGS)[0], 0)
+        self.assertNotIn((self.target.state_root / "generation").read_text(),
+                         (first, edited, untracked))
+        self.assert_generation()
+        extra.unlink()
 
     def test_login_shell_change_reports_relogin(self):
         self.clone()
@@ -634,6 +716,7 @@ class InstallFlowTests(unittest.TestCase):
 
         rc, out, _ = self.main("--dry-run", "--no-packages", runner=IsolatedDry())
         self.assertEqual(rc, 0, out)
+        self.assertFalse((self.target.state_root / "generation").exists())
         self.assertIn(f"replace {self.home / '.zshrc'}", out)
         self.assertIn("dry run: nothing was changed", out)
         self.assertEqual(_tree_digest(self.home), before)
