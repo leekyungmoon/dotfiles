@@ -11,16 +11,24 @@ against a temporary home.
 The repository is a local bare mirror of a scratch repository that carries
 the working-tree ``install.py``, ``installer/`` and manifests (no
 submodules), so no network access is needed.
+
+A fake ``zsh`` on PATH records how the final 'exec zsh -l' started it (a fake
+``getent`` stands in for the passwd login shell when zsh is not on PATH). The
+piped runs have no controlling terminal (like a harness or cron), so they must
+never start it; the pty runs give the script a real terminal.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import pty
+import select
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -43,6 +51,11 @@ FAKE_PYTHON = r'''#!/bin/bash
 # Fake python3: real interpreter for -c probes; install.py runs are recorded
 # and only parsed (never executed) with the real interpreter.
 if [[ "$1" == -c ]]; then exec "@REAL@" "$@"; fi
+# FAKE_INSTALL_PY_RC: make the install.py run fail with that status.
+if [[ -n "${FAKE_INSTALL_PY_RC:-}" ]]; then
+  printf '%s\0' "$@" > "@LOG@.argv"
+  exit "$FAKE_INSTALL_PY_RC"
+fi
 tty=no; [[ -t 0 ]] && tty=yes
 printf '%s\n' "$PWD" > "@LOG@.cwd"
 printf '%s\0' "$@" > "@LOG@.argv"
@@ -57,6 +70,16 @@ with open(sys.argv[1], "a") as log:
 '''
 
 FAKE_RECORDER = '#!/bin/sh\necho "{name} $*" >> "{log}"\nexit {rc}\n'
+
+# Fake zsh: records its arguments and whether stdin/stdout are terminals.
+FAKE_ZSH = r'''#!/bin/sh
+in=no; out=no
+[ -t 0 ] && in=yes
+[ -t 1 ] && out=yes
+echo "zsh $* stdin-tty=$in stdout-tty=$out" >> "@LOG@"
+echo "FAKE-ZSH-STARTED"
+exit 0
+'''
 
 # Fake ssh for GIT_SSH_COMMAND (GIT_SSH_VARIANT=simple: "<host> <command>"):
 # serves every git-upload-pack request from the local mirror.
@@ -127,6 +150,10 @@ class EtcInstallTests(unittest.TestCase):
         python.write_text(FAKE_PYTHON.replace("@REAL@", REAL_PYTHON)
                           .replace("@LOG@", str(self.py_log)))
         python.chmod(0o755)
+        self.zsh_log = case / "zsh.log"
+        zsh = self.bin / "zsh"
+        zsh.write_text(FAKE_ZSH.replace("@LOG@", str(self.zsh_log)))
+        zsh.chmod(0o755)
         self.case = case
 
     def tearDown(self):
@@ -134,16 +161,94 @@ class EtcInstallTests(unittest.TestCase):
 
     def run_piped(self, script: bytes | None = None, *, args=(), path=None, **extra):
         """Run etc/install; an ``extra`` value of None removes that variable."""
-        env = {"HOME": str(self.home), "PATH": path or f"{self.bin}:{os.environ['PATH']}",
-               "GIT_CONFIG_GLOBAL": str(self.gitconfig), "GIT_CONFIG_NOSYSTEM": "1",
-               "GIT_TERMINAL_PROMPT": "0", "LANG": "C", "TERM": "dumb",
-               "DOTFILES_REPO_URL": str(self.mirror), **extra}
-        env = {k: v for k, v in env.items() if v is not None}
+        env = self.env_for(path, **extra)
         body = ETC_INSTALL.read_bytes() if script is None else script
         argv = ["/bin/bash"] + (["-s", "--", *args] if args else [])
         return subprocess.run(argv, input=body, env=env, stdout=subprocess.PIPE,
                               stderr=subprocess.PIPE, timeout=120,
                               start_new_session=True)  # no controlling terminal
+
+    def env_for(self, path=None, **extra) -> dict[str, str]:
+        env = {"HOME": str(self.home), "PATH": path or f"{self.bin}:{os.environ['PATH']}",
+               "GIT_CONFIG_GLOBAL": str(self.gitconfig), "GIT_CONFIG_NOSYSTEM": "1",
+               "GIT_TERMINAL_PROMPT": "0", "LANG": "C", "TERM": "dumb",
+               "DOTFILES_REPO_URL": str(self.mirror), **extra}
+        return {k: v for k, v in env.items() if v is not None}
+
+    def run_in_terminal(self, *, args=(), stdout_file=None, **extra):
+        """Run 'bash -s' with the script on stdin (as 'curl | bash' does) and a
+        pseudo-terminal as the controlling terminal and stdout/stderr.
+
+        Returns (exit status, terminal output). With ``stdout_file``, stdout
+        goes to that file instead (the terminal stays the controlling one).
+        """
+        script = self.case / "install.sh"
+        script.write_bytes(ETC_INSTALL.read_bytes())
+        env = self.env_for(**extra)
+        argv = ["/bin/bash", "-s", "--", *args] if args else ["/bin/bash", "-s"]
+        pid, fd = pty.fork()
+        if pid == 0:  # child: the pty is its controlling terminal
+            try:
+                stdin = os.open(script, os.O_RDONLY)
+                os.dup2(stdin, 0)
+                if stdout_file is not None:
+                    out = os.open(stdout_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                    os.dup2(out, 1)
+                os.execve(argv[0], argv, env)
+            finally:
+                os._exit(127)
+        chunks = []
+        deadline = time.monotonic() + 120
+        try:
+            while time.monotonic() < deadline:
+                ready, _, _ = select.select([fd], [], [], 1.0)
+                if not ready:
+                    continue
+                try:
+                    data = os.read(fd, 65536)
+                except OSError:  # EIO: every writer of the terminal is gone
+                    break
+                if not data:
+                    break
+                chunks.append(data)
+            else:
+                os.kill(pid, 9)
+                self.fail("etc/install did not finish in a terminal")
+        finally:
+            _, status = os.waitpid(pid, 0)
+            os.close(fd)
+        return os.waitstatus_to_exitcode(status), b"".join(chunks).decode(errors="replace")
+
+    def run_on_terminal_without_ctty(self):
+        """stdout/stderr on a pseudo-terminal, but in a new session that has
+        no controlling terminal: /dev/tty cannot be opened."""
+        master, slave = os.openpty()
+        try:
+            proc = subprocess.Popen(["/bin/bash", "-s"], stdin=subprocess.PIPE,
+                                    stdout=slave, stderr=slave, env=self.env_for(),
+                                    start_new_session=True)
+        finally:
+            os.close(slave)
+        proc.stdin.write(ETC_INSTALL.read_bytes())
+        proc.stdin.close()
+        chunks = []
+        while True:
+            ready, _, _ = select.select([master], [], [], 1.0)
+            if ready:
+                try:
+                    data = os.read(master, 65536)
+                except OSError:
+                    data = b""
+                if not data:
+                    break
+                chunks.append(data)
+            elif proc.poll() is not None:
+                break
+        os.close(master)
+        return proc.wait(timeout=120), b"".join(chunks).decode(errors="replace")
+
+    def zsh_runs(self) -> list[str]:
+        return self.zsh_log.read_text().splitlines() if self.zsh_log.exists() else []
 
     def calls(self) -> str:
         return self.log.read_text() if self.log.exists() else ""
@@ -223,6 +328,131 @@ class EtcInstallTests(unittest.TestCase):
         self.assertIn("python3 install.py --no-packages --no-gui --no-shell-change", err)
         self.assertNotIn("sudo", self.calls())
         self.assertEqual(self.backups(), [])
+        # No terminal (a harness, cron, CI): the script ends, no shell starts.
+        self.assertEqual(self.zsh_runs(), [])
+        self.assertNotIn("Starting a new zsh", out)
+
+    # -- the final 'exec zsh -l' -------------------------------------------------
+
+    def test_terminal_run_ends_in_a_login_zsh_on_the_terminal(self):
+        status, out = self.run_in_terminal(args=["--no-packages", "--no-gui"])
+        self.assertEqual(status, 0, out)
+        self.assertEqual(len(self.installer_runs()), 1)
+        self.assertEqual(self.zsh_runs(), ["zsh -l stdin-tty=yes stdout-tty=yes"])
+        # "All Done!" comes first, then the new shell takes over the terminal.
+        self.assertIn("All Done!", out)
+        self.assertIn("FAKE-ZSH-STARTED", out)
+        self.assertLess(out.index("All Done!"), out.index("FAKE-ZSH-STARTED"))
+        self.assertIn("Starting a new zsh with the new setup.", out)
+        self.assertNotIn("WARNING", out)
+        self.assertNotRegex(out, r"exec zsh|predates|old setup|previous shell")
+
+    def test_failed_install_never_starts_the_shell(self):
+        status, out = self.run_in_terminal(FAKE_INSTALL_PY_RC="3")
+        self.assertEqual(status, 3, out)
+        self.assertTrue(self.py_log.with_suffix(".log.argv").exists())  # it did run
+        self.assertNotIn("All Done!", out)
+        self.assertEqual(self.zsh_runs(), [])
+
+    def test_failed_clone_never_starts_the_shell(self):
+        status, out = self.run_in_terminal(DOTFILES_REPO_URL=str(self.case / "missing.git"))
+        self.assertNotEqual(status, 0, out)
+        self.assertIn("nothing was installed", out)
+        self.assertEqual(self.zsh_runs(), [])
+
+    def test_opt_out_help_and_redirected_output_never_start_the_shell(self):
+        cases = {
+            "DOTFILES_EXEC_SHELL=0": {"extra": {"DOTFILES_EXEC_SHELL": "0"}},
+            "--help": {"args": ["--help"]},
+            "stdout redirected": {"stdout_file": self.case / "out.log"},
+        }
+        for name, case in cases.items():
+            with self.subTest(name):
+                self.zsh_log.unlink(missing_ok=True)
+                status, out = self.run_in_terminal(args=case.get("args", ()),
+                                                   stdout_file=case.get("stdout_file"),
+                                                   **case.get("extra", {}))
+                self.assertEqual(status, 0, out)
+                self.assertEqual(self.zsh_runs(), [])
+        self.assertIn("All Done!", (self.case / "out.log").read_text())
+        with self.subTest("terminal output but no controlling terminal"):
+            self.zsh_log.unlink(missing_ok=True)
+            status, out = self.run_on_terminal_without_ctty()
+            self.assertEqual(status, 0, out)
+            self.assertIn("All Done!", out)
+            self.assertNotIn("Starting a new zsh", out)
+            self.assertEqual(self.zsh_runs(), [])
+
+    def path_without_zsh(self) -> str:
+        """PATH without any zsh: the fakes, then the system's bin directories
+        minus zsh. A fake getent in the fakes answers the passwd lookup."""
+        (self.bin / "zsh").unlink()
+        tools = self.case / "tools"
+        tools.mkdir()
+        for directory in ("/usr/bin", "/bin"):
+            for entry in os.scandir(directory):
+                if entry.name != "zsh" and not (tools / entry.name).exists():
+                    os.symlink(entry.path, tools / entry.name)
+        return f"{self.bin}:{tools}"
+
+    def fake_getent(self, shell: str | None, rc: int = 0):
+        """getent passwd <uid> prints a passwd line with this login shell."""
+        log = self.case / "getent.log"
+        line = "" if shell is None else (
+            f"fixture:x:{os.getuid()}:{os.getgid()}::{self.home}:{shell}")
+        getent = self.bin / "getent"
+        getent.write_text(f"#!/bin/sh\necho \"getent $*\" >> '{log}'\n"
+                          f"[ -n '{line}' ] && echo '{line}'\nexit {rc}\n")
+        getent.chmod(0o755)
+        return log
+
+    def test_missing_zsh_falls_back_to_the_passwd_login_shell(self):
+        path = self.path_without_zsh()
+        login_log = self.case / "login.log"
+        login = self.case / "login-shell" / "fixture-sh"
+        login.parent.mkdir()
+        login.write_text(FAKE_ZSH.replace("@LOG@", str(login_log)).replace("zsh $*",
+                                                                           "fixture-sh $*"))
+        login.chmod(0o755)
+        getent_log = self.fake_getent(str(login))
+        status, out = self.run_in_terminal(PATH=path)
+        self.assertEqual(status, 0, out)
+        self.assertIn("All Done!", out)
+        self.assertEqual(getent_log.read_text().split(),
+                         ["getent", "passwd", str(os.getuid())])
+        self.assertEqual(login_log.read_text().splitlines(),
+                         ["fixture-sh -l stdin-tty=yes stdout-tty=yes"])
+        self.assertIn("Starting a new fixture-sh with the new setup.", out)
+        self.assertLess(out.index("All Done!"), out.index("FAKE-ZSH-STARTED"))
+        self.assertNotIn("WARNING", out)
+        self.assertNotRegex(out, r"exec zsh|predates|old setup|previous shell")
+
+    def test_missing_zsh_and_no_usable_login_shell_ends_normally(self):
+        path = self.path_without_zsh()
+        cases = {
+            "nologin": dict(shell="/usr/sbin/nologin"),
+            "missing file": dict(shell=str(self.case / "no-such-shell")),
+            "relative": dict(shell="zsh"),
+            "lookup fails": dict(shell=None, rc=2),
+        }
+        for name, case in cases.items():
+            with self.subTest(name):
+                self.fake_getent(**case)
+                status, out = self.run_in_terminal(PATH=path)
+                self.assertEqual(status, 0, out)
+                self.assertIn("All Done!", out)
+                self.assertNotIn("Starting a new", out)
+                self.assertNotIn("WARNING", out)
+
+    def test_failed_exec_keeps_the_exit_status(self):
+        # A zsh that cannot be executed: the script warns and still exits 0.
+        (self.bin / "zsh").write_bytes(b"\x7fELF\x00\x00\x00 not a binary")
+        status, out = self.run_in_terminal()
+        self.assertEqual(status, 0, out)
+        self.assertIn("Starting a new zsh", out)
+        self.assertIn(f"could not start {self.bin / 'zsh'}", out)
+        # neutral: no hint at an old state or a manual step
+        self.assertNotRegex(out, r"(?i)new terminal|old setup|WARNING")
 
     def test_existing_unrelated_dotfiles_is_moved_aside(self):
         old = self.home / ".dotfiles"

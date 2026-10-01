@@ -15,7 +15,13 @@
 # so a failed clone leaves the existing checkout where it was.
 #
 # Environment: DOTFILES_REPO_URL (clone source), DOTFILES_REF (branch, tag or
-# commit).
+# commit), DOTFILES_EXEC_SHELL=0 (do not start the new shell at the end).
+#
+# When install.py succeeds and the one-liner runs in a terminal, the script
+# ends like oh-my-zsh's installer: it execs a login zsh (or, without zsh on
+# PATH, the passwd login shell) on that terminal, so the terminal is on the
+# new setup at once (open zsh shells reload themselves before their next
+# command, see zsh/zsh.d/dotfiles-reload.zsh).
 #
 # Everything runs inside main(), which is called on the very last line, so a
 # truncated download never runs a partial script.
@@ -170,6 +176,42 @@ EOF
 
   { set +x; } 2> /dev/null
   echo "All Done!"
+
+  # Only reached when install.py succeeded (set -e stops at a failure).
+  _exec_new_shell "$@"
+}
+
+# Replace this script with a login shell on the terminal, as oh-my-zsh's
+# installer does, so the terminal that ran the one-liner is on the new setup
+# at once. The shell is zsh from PATH, else the login shell from passwd
+# (getent), e.g. when zsh landed where the pre-install PATH does not reach.
+# Only with a terminal (/dev/tty readable and writable, stdout a terminal:
+# not under a test harness, cron or a captured run), never for --help, and
+# never with DOTFILES_EXEC_SHELL=0. A failed exec ends the script with
+# status 0 (the install itself succeeded).
+_exec_new_shell() {
+  local arg shell_bin
+  [[ "${DOTFILES_EXEC_SHELL:-1}" != 0 ]] || return 0
+  for arg in "$@"; do
+    case "$arg" in -h | --help) return 0 ;; esac
+  done
+  { : < /dev/tty > /dev/tty; } 2> /dev/null || return 0
+  [[ -t 1 ]] || return 0
+  shell_bin="$(command -v zsh 2> /dev/null || true)"
+  if [[ "$shell_bin" != /* ]]; then
+    shell_bin="$(getent passwd "$(id -u)" 2> /dev/null | cut -d: -f7 || true)"
+  fi
+  [[ "$shell_bin" == /* && -f "$shell_bin" && -x "$shell_bin" ]] || return 0
+  case "${shell_bin##*/}" in nologin | false | true) return 0 ;; esac
+  echo "Starting a new ${shell_bin##*/} with the new setup."
+  # set -e would end the script on a failed exec even with execfail.
+  set +e
+  shopt -s execfail
+  exec "$shell_bin" -l < /dev/tty
+  # A failed exec keeps its redirection: stdin is now the terminal, and
+  # 'bash -s' would read the rest of its script from there. Stop here.
+  echo "could not start ${shell_bin}" >&2
+  exit 0
 }
 
 # Remove the temporary sibling clone (only ever a path this run created).

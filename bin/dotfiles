@@ -24,7 +24,9 @@ import collections
 import json
 import os
 import os.path
+import pwd
 import shlex
+import stat
 import tempfile
 
 
@@ -162,6 +164,7 @@ def update(fast=False,
         git merge --ff-only && \
             git submodule update --init --recursive && \
             %s -B install.py %s || { ret=$?; }
+        { set +x; } 2> /dev/null
         if [ "$stashed" = 1 ]; then
             n=0; found=0
             for id in $(_stash_ids); do
@@ -218,6 +221,214 @@ def update(fast=False,
         if ret == 0:
             ret = STASH_CONFLICT_RC
     return ret
+
+
+# --- the invoking terminal ----------------------------------------------------
+#
+# After an update or repair that changed the installed generation, the
+# terminal that ran the command must be on the new setup too. A zsh with
+# zsh/zsh.d/dotfiles-reload.zsh ("hooked") reloads itself: it is at its
+# prompt right after this command, and its precmd hook sees the changed
+# generation before that prompt. A shell without the hook (one that predates
+# it, or a bash) would stay on the old setup, so this command replaces itself
+# with the user's login shell (from passwd, with -l) on the same terminal, as
+# etc/install's final exec does. That happens only when all of these hold:
+#   - the run succeeded and changed the generation file
+#     (${XDG_STATE_HOME:-~/.local/state}/personal-dotfiles/generation): a run
+#     that changes nothing starts no shell;
+#   - stdin and stdout are this terminal, and this process group is its
+#     foreground group (not 'dotfiles update &');
+#   - the parent is zsh or bash (comm and exe) on the same terminal, run as
+#     an interactive shell (no -c, no operand, also for a '-bash' login
+#     argv[0]: 'su - -c CMD' gives '-bash -c CMD');
+#   - the parent is not hooked: none of its /proc/<pid>/fd links is the
+#     static file ${XDG_STATE_HOME:-~/.local/state}/personal-dotfiles/
+#     shell-hook that every hooked zsh keeps open.
+# Anything that cannot be read counts against the exec. The new login shell
+# runs on top of the parent, which waits for it: run as part of a longer
+# command line ('dotfiles update && make') or from a sourced script, the rest
+# runs once that shell exits.
+
+_SHELL_NAMES = ('zsh', 'bash')
+HOOK_FILE_SUFFIX = '/personal-dotfiles/shell-hook'
+GENERATION_MAX_BYTES = 4096
+# replaced by the tests
+_execvp = os.execvp
+
+
+def _state_home():
+    '''$XDG_STATE_HOME, or ~/.local/state when it is unset or not absolute.'''
+    value = os.environ.get('XDG_STATE_HOME', '')
+    if not os.path.isabs(value):
+        value = os.path.join(os.path.expanduser('~'), '.local', 'state')
+    return value
+
+
+def _shell_hook_file():
+    return os.path.join(_state_home(), 'personal-dotfiles', 'shell-hook')
+
+
+def _read_generation():
+    '''The first line of the generation file, or None (missing, unreadable,
+    not a regular file, empty); as install.py read_generation.'''
+    path = os.path.join(_state_home(), 'personal-dotfiles', 'generation')
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    except OSError:
+        return None
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None
+        data = os.read(fd, GENERATION_MAX_BYTES)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+    return data.decode('utf-8', 'replace').split('\n', 1)[0] or None
+
+
+def _is_hooked(pid, hook_file=None):
+    '''pid holds a file descriptor on the shell-hook file: a link that names
+    it (or any .../personal-dotfiles/shell-hook, deleted or not, e.g. from a
+    shell with another XDG_STATE_HOME), or the same inode. True as well when
+    the fd table cannot be read (then there is no exec).'''
+    hook_file = hook_file or _shell_hook_file()
+    try:
+        st_hook = os.stat(hook_file)
+        hook_id = (st_hook.st_dev, st_hook.st_ino)
+    except OSError:
+        hook_id = None
+    fd_dir = '/proc/%d/fd' % pid
+    try:
+        names = os.listdir(fd_dir)
+    except OSError:
+        return True
+    for name in names:
+        link = os.path.join(fd_dir, name)
+        try:
+            target = os.readlink(link)
+        except FileNotFoundError:
+            continue  # closed since the listing
+        except OSError:
+            return True
+        if target.endswith(' (deleted)'):
+            target = target[:-len(' (deleted)')]
+        if target == hook_file or target.endswith(HOOK_FILE_SUFFIX):
+            return True
+        if hook_id is not None and target.startswith('/'):
+            try:
+                st = os.stat(link)
+            except OSError:
+                continue
+            if (st.st_dev, st.st_ino) == hook_id:
+                return True
+    return False
+
+
+# Options that make a shell run commands instead of reading the terminal.
+_COMMAND_OPTIONS = ("c",)
+_LONG_COMMAND_OPTIONS = ("--command", "--init-command")
+
+
+def interactive_invocation(argv):
+    """Whether a shell's argv is an interactive invocation (kept identical to
+    installer/phases.py interactive_invocation; a unit test checks parity).
+
+    Every argument after argv[0] must be an option word (``-l``, ``-il``,
+    ``+x``, ``--login``): no ``-c``, no non-option operand such as a script
+    file (``bash script.sh``) and no option argument (``--rcfile FILE``,
+    ``-o OPT``), which is refused as an operand too. argv[0] starting with
+    '-' is how login and tmux start a login shell; that alone is not enough
+    (``-zsh -c ...`` is still refused).
+    """
+
+    if not argv or not argv[0]:
+        return False
+    for word in argv[1:]:
+        if word in ("-", "--", "+", "++") or not word[:1] in ("-", "+"):
+            return False
+        if word.startswith("--"):
+            name = word.split("=", 1)[0]
+            if "=" in word or name in _LONG_COMMAND_OPTIONS or name == "--rcfile":
+                return False
+            continue
+        letters = word[1:]
+        if not letters.isalpha() or any(c in letters for c in _COMMAND_OPTIONS):
+            return False
+        if "o" in letters:  # -o takes the next word
+            return False
+    return True
+
+
+def _cmdline(pid):
+    with open('/proc/%d/cmdline' % pid, 'rb') as f:
+        data = f.read()
+    if not data:
+        return []
+    return data.rstrip(b'\0').decode('utf-8', 'surrogateescape').split('\0')
+
+
+def _shell_process(pid):
+    '''pid runs zsh or bash, by its comm and by its executable.'''
+    with open('/proc/%d/comm' % pid) as f:
+        comm = f.read().strip()
+    exe = os.readlink('/proc/%d/exe' % pid)
+    if exe.endswith(' (deleted)'):
+        exe = exe[:-len(' (deleted)')]
+    return comm in _SHELL_NAMES and os.path.basename(exe) in _SHELL_NAMES
+
+
+def _same_terminal(pid, tty):
+    for fd in (0, 1):
+        try:
+            if os.path.realpath(os.readlink('/proc/%d/fd/%d' % (pid, fd))) != tty:
+                return False
+        except OSError:
+            return False
+    return True
+
+
+def _login_shell(uid):
+    shell = pwd.getpwuid(uid).pw_shell
+    if not shell or not os.path.isabs(shell) or not os.access(shell, os.X_OK):
+        return None
+    if os.path.basename(shell) in ('nologin', 'false', 'true'):
+        return None
+    return shell
+
+
+def _refresh_terminal():
+    '''Called only after an update or repair that succeeded and changed the
+    generation: exec the login shell (-l) on this terminal when the
+    conditions above hold. Returns False when nothing was done (and never
+    prints anything).'''
+    try:
+        if not (os.isatty(0) and os.isatty(1)):
+            return False
+        tty = os.path.realpath(os.ttyname(1))
+        if os.path.realpath(os.ttyname(0)) != tty:
+            return False
+        if os.tcgetpgrp(1) != os.getpgrp():
+            return False  # a background job
+        ppid = os.getppid()
+        if ppid <= 1 or not _shell_process(ppid):
+            return False
+        if not interactive_invocation(_cmdline(ppid)) or not _same_terminal(ppid, tty):
+            return False
+        if _is_hooked(ppid):
+            return False  # it reloads itself before its next prompt
+        shell = _login_shell(os.getuid())
+        if shell is None:
+            return False
+    except (OSError, KeyError, ValueError):
+        return False
+    sys.stdout.flush()
+    sys.stderr.flush()
+    try:
+        _execvp(shell, [os.path.basename(shell), '-l'])
+    except OSError:
+        return False
+    return True
 
 
 def open_github(argv=()):
@@ -284,9 +495,7 @@ def install_local(target, force=False, argv=()):
 
         print(GREEN("\n[*] Installation successful: {}".format(t)))
 
-    print(GREEN("\n\n[*] Installation(s) successful. You may need to run ") + \
-          WHITE("`exec zsh`") + \
-          GREEN(" to reflect changes in PATH."))
+    print(GREEN("\n\n[*] Installation(s) successful."))
 
 
 @add_argument('--json', action='store_true', help='Machine-readable output')
@@ -382,7 +591,16 @@ def main():
         sys.exit(1)
     if unknown:
         kwargs['argv'] = unknown
+    refresh = command in ('update', 'repair')
+    before = _read_generation() if refresh else None
     ret = COMMANDS[command](**kwargs)
+
+    # Only after a run that succeeded and changed the generation: the
+    # terminal that ran it gets the new setup too.
+    if refresh and not ret:
+        after = _read_generation()
+        if after is not None and after != before:
+            _refresh_terminal()
 
     if ret:  # non-zero exit code
         sys.exit(ret)

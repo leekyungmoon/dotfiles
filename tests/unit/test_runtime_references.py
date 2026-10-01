@@ -430,6 +430,66 @@ class RuntimeWriterAuditTests(unittest.TestCase):
                   for i, k in w.get("managed_paths", {}).items() if k == "copy"}
         self.assertEqual(copies, {"gitconfig", "pudb"})
 
+    def test_generation_file_contract(self):
+        """The generation file the reload hook reads is the documented one
+        (XDG state, with the default for an unset or relative value)."""
+        contract = self.manifest["path_contract"]["generation"]
+        self.assertTrue(contract.startswith(
+            "${XDG_STATE_HOME:-$HOME/.local/state}/personal-dotfiles/generation "))
+        text = (REPO_ROOT / "zsh/zsh.d/dotfiles-reload.zsh").read_text(encoding="utf-8")
+        for needle in ("if [[ ${XDG_STATE_HOME:-} == /* ]]; then",
+                       "    state=$XDG_STATE_HOME\n",
+                       "    state=$HOME/.local/state\n",
+                       "_pd_reload_dir=$state/personal-dotfiles\n",
+                       "_pd_reload_file=$_pd_reload_dir/generation\n"):
+            self.assertIn(needle, text)
+        writers = {w["id"]: w for w in self.manifest["writers"]}
+        self.assertEqual(writers["zsh-reload-history-flush"]["status"], "outside-checkout")
+
+    def test_shell_hook_contract(self):
+        """The hook mark every hooked zsh holds is the file bin/dotfiles looks
+        for, at the documented path; the old per-shell markers are gone."""
+        contract = self.manifest["path_contract"]["shell_hook"]
+        self.assertTrue(contract.startswith(
+            "${XDG_STATE_HOME:-$HOME/.local/state}/personal-dotfiles/shell-hook "))
+        self.assertNotIn("shell_markers", self.manifest["path_contract"])
+        zsh = (REPO_ROOT / "zsh/zsh.d/dotfiles-reload.zsh").read_text(encoding="utf-8")
+        self.assertIn("_pd_reload_hook_file=$_pd_reload_dir/shell-hook\n", zsh)
+        cmd = (REPO_ROOT / "bin/dotfiles").read_text(encoding="utf-8")
+        self.assertIn("value = os.environ.get('XDG_STATE_HOME', '')", cmd)
+        self.assertIn("value = os.path.join(os.path.expanduser('~'), '.local', 'state')", cmd)
+        self.assertIn("return os.path.join(_state_home(), 'personal-dotfiles', 'shell-hook')", cmd)
+        self.assertIn("HOOK_FILE_SUFFIX = '/personal-dotfiles/shell-hook'", cmd)
+        for text in (zsh, cmd):
+            self.assertNotIn("_DOTFILES_RUNTIME_ROOT", text)
+            self.assertNotIn("/shells", text)
+        writers = {w["id"]: w for w in self.manifest["writers"]}
+        self.assertEqual(writers["zsh-shell-hook"]["status"], "outside-checkout")
+        self.assertNotIn("zsh-shell-markers", writers)
+
+    def test_reload_handover_contract(self):
+        """The hand-over a reloading zsh writes goes where the contract says:
+        a private XDG_RUNTIME_DIR, else the state directory, never a fixed
+        /run/user path; it never passes through the environment."""
+        contract = self.manifest["path_contract"]["reload_handover"]
+        self.assertTrue(contract.startswith("$XDG_RUNTIME_DIR/personal-dotfiles (0700) "))
+        self.assertIn("${XDG_STATE_HOME:-$HOME/.local/state}/personal-dotfiles", contract)
+        zsh = (REPO_ROOT / "zsh/zsh.d/dotfiles-reload.zsh").read_text(encoding="utf-8")
+        for needle in ("REPLY=$XDG_RUNTIME_DIR/personal-dotfiles\n",
+                       "REPLY=$_pd_reload_dir\n",
+                       "file=$REPLY/.handover.$$\n",
+                       "hist=${_pd_reload_wfile:h}/.hist.$$\n",
+                       "!(st[mode] & 8#077)"):
+            self.assertIn(needle, zsh)
+        self.assertNotIn("/run/user", zsh)
+        # Only descriptor numbers and the pid go through the environment.
+        exported = {name for line in re.findall(r"^\s*export .*$", zsh, re.M)
+                    for name in re.findall(r"\b(_PD_RELOAD_[A-Z]+)=", line)}
+        self.assertEqual(exported, {"_PD_RELOAD_PID", "_PD_RELOAD_FD", "_PD_RELOAD_HOOKFD"})
+        rc = (REPO_ROOT / "zsh/zshrc").read_text(encoding="utf-8")
+        self.assertTrue(rc.rstrip().splitlines()[-1].startswith("# vim:"))
+        self.assertIn("|| _pd_reload_startup\n", rc)
+
     def test_writer_markers(self):
         for writer in self.manifest["writers"]:
             for check in writer.get("checks", []):

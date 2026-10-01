@@ -171,6 +171,27 @@
     },
     {
       "file": "etc/install",
+      "line": "# commit), DOTFILES_EXEC_SHELL=0 (do not start the new shell at the end).",
+      "kind": "identifier",
+      "classification": "comment",
+      "purpose": "documents the opt-out of the final 'exec zsh -l'"
+    },
+    {
+      "file": "etc/install",
+      "line": "# never with DOTFILES_EXEC_SHELL=0. A failed exec ends the script with",
+      "kind": "identifier",
+      "classification": "comment",
+      "purpose": "documents the opt-out of the final 'exec zsh -l'"
+    },
+    {
+      "file": "etc/install",
+      "line": "[[ \"${DOTFILES_EXEC_SHELL:-1}\" != 0 ]] || return 0",
+      "kind": "identifier",
+      "classification": "identifier",
+      "purpose": "DOTFILES_EXEC_SHELL=0: skip the final 'exec zsh -l' on the terminal (e.g. an automated run under a pty); not a path"
+    },
+    {
+      "file": "etc/install",
       "line": "local ref=\"${DOTFILES_REF:-}\"",
       "kind": "identifier",
       "classification": "identifier",
