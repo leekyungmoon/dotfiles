@@ -178,7 +178,7 @@
     },
     {
       "file": "etc/install",
-      "line": "# never with DOTFILES_EXEC_SHELL=0. A failed exec ends the script with",
+      "line": "# DOTFILES_EXEC_SHELL=0. A failed exec ends the script with status 0 (the",
       "kind": "identifier",
       "classification": "comment",
       "purpose": "documents the opt-out of the final 'exec zsh -l'"
@@ -225,6 +225,20 @@
       "kind": "link",
       "classification": "runtime-link",
       "purpose": "bootstrap clone destination (the checkout)"
+    },
+    {
+      "file": "etc/install",
+      "line": "# Run as ~/.dotfiles/etc/install itself, which is what ./install does (clone &",
+      "kind": "link",
+      "classification": "comment",
+      "purpose": "bootstrap header: run from ~/.dotfiles, this file works in place"
+    },
+    {
+      "file": "etc/install",
+      "line": "# In place when this very file, resolved, is ~/.dotfiles/etc/install ('curl",
+      "kind": "link",
+      "classification": "comment",
+      "purpose": "documents when the in-place run applies"
     },
     {
       "file": "etc/install-neovim.sh",
@@ -361,24 +375,10 @@
     },
     {
       "file": "install.py",
-      "line": "\"    cd ~/.dotfiles && python3 install.py\\n\\n\"",
-      "kind": "link",
-      "classification": "guidance",
-      "purpose": "usage/error text: install.py runs from the ~/.dotfiles checkout (clone instructions)"
-    },
-    {
-      "file": "install.py",
-      "line": "\"\"\"Why ``here`` is not the ``~/.dotfiles`` checkout, or None.\"\"\"",
+      "line": "\"\"\"Why ``here`` is not the ``~/.dotfiles`` checkout, or None; with what to",
       "kind": "link",
       "classification": "comment",
       "purpose": "docstring"
-    },
-    {
-      "file": "install.py",
-      "line": "\"Clone the repository into ~/.dotfiles and run it from there:\\n\\n\"",
-      "kind": "link",
-      "classification": "guidance",
-      "purpose": "usage/error text: install.py runs from the ~/.dotfiles checkout (clone instructions)"
     },
     {
       "file": "install.py",
@@ -386,28 +386,6 @@
       "kind": "link",
       "classification": "guidance",
       "purpose": "usage/error text: install.py runs from the ~/.dotfiles checkout (clone instructions)"
-    },
-    {
-      "file": "install.py",
-      "line": "cd ~/.dotfiles && python3 install.py",
-      "kind": "link",
-      "classification": "guidance",
-      "purpose": "usage/error text: install.py runs from the ~/.dotfiles checkout (clone instructions)"
-    },
-    {
-      "file": "install.py",
-      "line": "f\"    git clone --recursive {repo.DEFAULT_REPO_URL} ~/.dotfiles\\n\"",
-      "kind": "link",
-      "classification": "guidance",
-      "purpose": "usage/error text: install.py runs from the ~/.dotfiles checkout (clone instructions)"
-    },
-    {
-      "file": "install.py",
-      "line": "git clone --recursive https://github.com/",
-      "kind": "link",
-      "classification": "guidance",
-      "purpose": "usage/error text: install.py runs from the ~/.dotfiles checkout (clone instructions)",
-      "match": "prefix"
     },
     {
       "file": "installer/phases.py",
@@ -1073,6 +1051,104 @@
       "classification": "runtime-link",
       "purpose": "user-facing hint: how to install a skipped AI CLI later from the ~/.dotfiles checkout",
       "count": 1
+    },
+    {
+      "file": "install.py",
+      "line": "\"Clone the repository into ~/.dotfiles and install it from there:\\n\\n\"",
+      "kind": "link",
+      "classification": "guidance",
+      "purpose": "usage/error text: install.py runs from the ~/.dotfiles checkout (clone & install)"
+    },
+    {
+      "file": "install.py",
+      "line": "f\"    git clone --recursive {repo.DEFAULT_REPO_URL} ~/.dotfiles && ~/.dotfiles/install\\n\\n\"",
+      "kind": "link",
+      "classification": "guidance",
+      "purpose": "usage/error text: install.py runs from the ~/.dotfiles checkout (clone & install)"
+    },
+    {
+      "file": "install.py",
+      "line": "git clone --recursive https://github.com/leekyungmoon/dotfiles.git ~/.dotfiles && ~/.dotfiles/install",
+      "kind": "link",
+      "classification": "guidance",
+      "purpose": "usage/error text: install.py runs from the ~/.dotfiles checkout (clone & install)"
+    },
+    {
+      "file": "install.py",
+      "line": "run instead, which depends on what ``~/.dotfiles`` is.\"\"\"",
+      "kind": "link",
+      "classification": "comment",
+      "purpose": "docstring"
+    },
+    {
+      "file": "install.py",
+      "line": "return head + \"Install that checkout:\\n\\n    ~/.dotfiles/install\"",
+      "kind": "link",
+      "classification": "guidance",
+      "purpose": "usage/error text: install.py runs from the ~/.dotfiles checkout (clone & install)"
+    },
+    {
+      "file": "install.py",
+      "line": "return head + (\"~/.dotfiles is another checkout. The one-line installer moves it aside \"",
+      "kind": "link",
+      "classification": "guidance",
+      "purpose": "usage/error text: install.py runs from the ~/.dotfiles checkout (clone & install)"
+    },
+    {
+      "file": "install",
+      "line": "#   git clone --recursive https://github.com/leekyungmoon/dotfiles.git ~/.dotfiles && ~/.dotfiles/install",
+      "kind": "link",
+      "classification": "comment",
+      "purpose": "clone & install usage"
+    },
+    {
+      "file": "install",
+      "line": "# Installs the ~/.dotfiles checkout as it is: local edits and commits stay,",
+      "kind": "link",
+      "classification": "comment",
+      "purpose": "clone & install header"
+    },
+    {
+      "file": "install",
+      "line": "dest=\"$(readlink -e -- \"${HOME}/.dotfiles\")\" || dest=\"\"",
+      "kind": "link",
+      "classification": "runtime-link",
+      "purpose": "the ~/.dotfiles checkout, compared with the clone ./install runs from (read-only)"
+    },
+    {
+      "file": "install",
+      "line": "echo \"Clone & install into ~/.dotfiles:\" >&2",
+      "kind": "link",
+      "classification": "guidance",
+      "purpose": "run outside ~/.dotfiles: says where to clone instead (changes nothing)"
+    },
+    {
+      "file": "install",
+      "line": "echo \"  git clone --recursive https://github.com/leekyungmoon/dotfiles.git ~/.dotfiles && ~/.dotfiles/install\" >&2",
+      "kind": "link",
+      "classification": "guidance",
+      "purpose": "run outside ~/.dotfiles: the clone & install line to use"
+    },
+    {
+      "file": "install",
+      "line": "echo \"Install the checkout at ~/.dotfiles:\" >&2",
+      "kind": "link",
+      "classification": "guidance",
+      "purpose": "run outside ~/.dotfiles, with this repository's checkout there: run that one"
+    },
+    {
+      "file": "install",
+      "line": "echo \"  ~/.dotfiles/install\" >&2",
+      "kind": "link",
+      "classification": "guidance",
+      "purpose": "run outside ~/.dotfiles, with this repository's checkout there: run that one"
+    },
+    {
+      "file": "install",
+      "line": "echo \"~/.dotfiles is another checkout. The one-liner moves it aside (nothing is deleted) and installs:\" >&2",
+      "kind": "link",
+      "classification": "guidance",
+      "purpose": "run outside ~/.dotfiles, with another checkout there: the one-liner"
     },
     {
       "file": "systemd/user/tmux.service",

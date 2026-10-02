@@ -737,7 +737,7 @@ class InstallFlowTests(unittest.TestCase):
         other = self.clone(Path(self._home_tmp.name) / "elsewhere")
         rc, out, runner = self.main(*FLAGS, here=other)
         self.assertEqual(rc, 2)
-        self.assertIn("git clone --recursive", out)
+        self.assertIn("~/.dotfiles && ~/.dotfiles/install", out)
         self.assertEqual(runner.calls, [])
         self.assertEqual(sorted(p.name for p in self.home.iterdir()), [])
 

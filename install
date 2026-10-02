@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+#
+# Clone & install:
+#
+#   git clone --recursive https://github.com/leekyungmoon/dotfiles.git ~/.dotfiles && ~/.dotfiles/install
+#
+# Installs the ~/.dotfiles checkout as it is: local edits and commits stay,
+# nothing is pulled or moved. This runs etc/install there, which does the same
+# checks as the one-liner, then install.py (options go to it, e.g. ./install
+# --no-gui), then, when it installed, starts a new login shell. Anywhere else
+# it changes nothing and prints what to run instead.
+
+# Started as 'sh install' or 'zsh install': run it with bash.
+if [ -z "${BASH_VERSION:-}" ]; then exec bash "$0" "$@"; fi
+
+set -eu
+CDPATH=
+
+if [[ "${BASH_SOURCE@a}" != *a* ]]; then
+  echo "BASH_SOURCE is set in the environment; unset it and rerun." >&2
+  exit 2
+fi
+
+here="$(dirname -- "$(readlink -e -- "${BASH_SOURCE[0]}")")"
+dest="$(readlink -e -- "${HOME}/.dotfiles")" || dest=""
+
+if [[ "$here" != "$dest" ]]; then
+  if [[ -z "$dest" ]]; then
+    echo "Clone & install into ~/.dotfiles:" >&2
+    echo "  git clone --recursive https://github.com/leekyungmoon/dotfiles.git ~/.dotfiles && ~/.dotfiles/install" >&2
+  elif [[ -f "$dest/install" && -f "$dest/etc/install" && -d "$dest/installer" ]]; then
+    echo "Install the checkout at ~/.dotfiles:" >&2
+    echo "  ~/.dotfiles/install" >&2
+  else
+    echo "~/.dotfiles is another checkout. The one-liner moves it aside (nothing is deleted) and installs:" >&2
+    echo "  curl -fsSL https://raw.githubusercontent.com/leekyungmoon/dotfiles/HEAD/etc/install | bash" >&2
+  fi
+  exit 2
+fi
+
+exec bash "$here/etc/install" "$@"

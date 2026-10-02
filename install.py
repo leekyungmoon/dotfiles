@@ -46,8 +46,7 @@ MIN_PYTHON = (3, 10)
 USAGE = """\
 Install the dotfiles from this checkout, which must be ~/.dotfiles:
 
-    git clone --recursive https://github.com/leekyungmoon/dotfiles.git ~/.dotfiles
-    cd ~/.dotfiles && python3 install.py
+    git clone --recursive https://github.com/leekyungmoon/dotfiles.git ~/.dotfiles && ~/.dotfiles/install
 
     python3 install.py [-f] [--skip-vimplug] [--skip-zplug] [--no-packages]
                        [--no-gui] [--no-shell-change] [--dry-run]
@@ -392,20 +391,24 @@ def previous_tool_links(ctx: Context) -> list:
 # --- location -------------------------------------------------------------------
 
 def location_error(here: Path, target: plat.Target) -> str | None:
-    """Why ``here`` is not the ``~/.dotfiles`` checkout, or None."""
+    """Why ``here`` is not the ``~/.dotfiles`` checkout, or None; with what to
+    run instead, which depends on what ``~/.dotfiles`` is."""
 
     expected = target.repo_root
     if Path(os.path.realpath(here)) == Path(os.path.realpath(expected)):
         return None
-    return (
-        f"install.py must run from the checkout at {expected}, not {here}.\n"
-        "Clone the repository into ~/.dotfiles and run it from there:\n\n"
-        f"    git clone --recursive {repo.DEFAULT_REPO_URL} ~/.dotfiles\n"
-        "    cd ~/.dotfiles && python3 install.py\n\n"
-        "or use the one-line installer:\n\n"
-        "    curl -fsSL https://raw.githubusercontent.com/leekyungmoon/dotfiles"
-        "/HEAD/etc/install | bash"
-    )
+    head = f"install.py must run from the checkout at {expected}, not {here}.\n"
+    one_liner = ("    curl -fsSL https://raw.githubusercontent.com/leekyungmoon/dotfiles"
+                 "/HEAD/etc/install | bash")
+    if not os.path.lexists(expected):
+        return head + (
+            "Clone the repository into ~/.dotfiles and install it from there:\n\n"
+            f"    git clone --recursive {repo.DEFAULT_REPO_URL} ~/.dotfiles && ~/.dotfiles/install\n\n"
+            "or use the one-line installer:\n\n" + one_liner)
+    if all((expected / name).exists() for name in ("install", "etc/install", "installer")):
+        return head + "Install that checkout:\n\n    ~/.dotfiles/install"
+    return head + ("~/.dotfiles is another checkout. The one-line installer moves it aside "
+                   "(nothing is deleted) and installs:\n\n" + one_liner)
 
 
 # --- phases -------------------------------------------------------------------

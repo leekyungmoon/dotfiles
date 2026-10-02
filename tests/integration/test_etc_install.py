@@ -57,6 +57,7 @@ if [[ -n "${FAKE_INSTALL_PY_RC:-}" ]]; then
   exit "$FAKE_INSTALL_PY_RC"
 fi
 tty=no; [[ -t 0 ]] && tty=yes
+printf '%s\n' "$tty" > "@LOG@.tty"
 printf '%s\n' "$PWD" > "@LOG@.cwd"
 printf '%s\0' "$@" > "@LOG@.argv"
 exec "@REAL@" -B -c '
@@ -109,7 +110,7 @@ class EtcInstallTests(unittest.TestCase):
         env = cls.git_env(root)
         source = root / "source"
         subprocess.run(["git", "init", "--quiet", str(source)], env=env, check=True)
-        for rel in ["install.py", "etc/install"] + [
+        for rel in ["install.py", "install", "etc/install"] + [
                 str(p.relative_to(REPO_ROOT)) for p in sorted(REPO_ROOT.glob("installer/*.py"))
         ] + [str(p.relative_to(REPO_ROOT)) for p in sorted(REPO_ROOT.glob("manifests/*.json"))]:
             dst = source / rel
@@ -168,6 +169,12 @@ class EtcInstallTests(unittest.TestCase):
                               stderr=subprocess.PIPE, timeout=120,
                               start_new_session=True)  # no controlling terminal
 
+    def run_wrapper(self, install: Path, *, args=(), **extra):
+        """Run a clone's ./install (clone & install) without a terminal."""
+        return subprocess.run([str(install), *args], env=self.env_for(**extra),
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              timeout=120, start_new_session=True, cwd=str(self.case))
+
     def env_for(self, path=None, **extra) -> dict[str, str]:
         env = {"HOME": str(self.home), "PATH": path or f"{self.bin}:{os.environ['PATH']}",
                "GIT_CONFIG_GLOBAL": str(self.gitconfig), "GIT_CONFIG_NOSYSTEM": "1",
@@ -175,22 +182,28 @@ class EtcInstallTests(unittest.TestCase):
                "DOTFILES_REPO_URL": str(self.mirror), **extra}
         return {k: v for k, v in env.items() if v is not None}
 
-    def run_in_terminal(self, *, args=(), stdout_file=None, **extra):
+    def run_in_terminal(self, *, args=(), stdout_file=None, command=None, **extra):
         """Run 'bash -s' with the script on stdin (as 'curl | bash' does) and a
         pseudo-terminal as the controlling terminal and stdout/stderr.
 
         Returns (exit status, terminal output). With ``stdout_file``, stdout
         goes to that file instead (the terminal stays the controlling one).
+        With ``command`` (an argv, e.g. ~/.dotfiles/install), that runs
+        instead, with the terminal as stdin too.
         """
         script = self.case / "install.sh"
         script.write_bytes(ETC_INSTALL.read_bytes())
         env = self.env_for(**extra)
-        argv = ["/bin/bash", "-s", "--", *args] if args else ["/bin/bash", "-s"]
+        if command is not None:
+            argv = [str(a) for a in command] + list(args)
+        else:
+            argv = ["/bin/bash", "-s", "--", *args] if args else ["/bin/bash", "-s"]
         pid, fd = pty.fork()
         if pid == 0:  # child: the pty is its controlling terminal
             try:
-                stdin = os.open(script, os.O_RDONLY)
-                os.dup2(stdin, 0)
+                if command is None:
+                    stdin = os.open(script, os.O_RDONLY)
+                    os.dup2(stdin, 0)
                 if stdout_file is not None:
                     out = os.open(stdout_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
                     os.dup2(out, 1)
@@ -331,6 +344,235 @@ class EtcInstallTests(unittest.TestCase):
         # No terminal (a harness, cron, CI): the script ends, no shell starts.
         self.assertEqual(self.zsh_runs(), [])
         self.assertNotIn("Starting a new zsh", out)
+
+    # -- clone & install (./install) ----------------------------------------------
+
+    FLAGS = ("--no-packages", "--no-gui", "--no-shell-change")
+
+    def checkout(self, path=None) -> Path:
+        """~/.dotfiles (or ``path``) as a clone of the mirror."""
+        path = path or self.home / ".dotfiles"
+        self.git("clone", "--quiet", str(self.mirror), str(path))
+        return path
+
+    def local_work(self, checkout: Path) -> str:
+        """A local commit, an uncommitted edit and an untracked file; returns
+        the new HEAD."""
+        (checkout / "LOCAL").write_text("committed\n")
+        self.git("-C", str(checkout), "add", "LOCAL")
+        self.git("-C", str(checkout), "commit", "--quiet", "-m", "local work")
+        (checkout / "LOCAL").write_text("committed\nand edited\n")
+        (checkout / "UNTRACKED").write_text("mine\n")
+        return self.git("-C", str(checkout), "rev-parse", "HEAD")
+
+    def assert_in_place(self, completed, checkout: Path, head: str):
+        out, err = completed.stdout.decode(), completed.stderr.decode()
+        self.assertEqual(completed.returncode, 0, err)
+        self.assertIn("All Done!", out)
+        self.assertEqual(len(self.installer_runs()), 1)
+        self.assertEqual(Path(self.py_log.with_suffix(".log.cwd").read_text().strip()),
+                         self.home / ".dotfiles")
+        # Nothing cloned, fetched, pulled, checked out or moved.
+        for command in ("git clone", "pull --ff-only", "fetch origin", "checkout", "mv "):
+            self.assertNotIn(command, err)
+        self.assertEqual(self.git("-C", str(checkout), "rev-parse", "HEAD"), head)
+        self.assertEqual((checkout / "LOCAL").read_text(), "committed\nand edited\n")
+        self.assertTrue((checkout / "UNTRACKED").exists())
+        self.assertEqual(self.backups(), [])
+        self.assertEqual(self.leftovers(), [])
+
+    def test_install_in_dotfiles_installs_that_checkout_as_it_is(self):
+        dotfiles = self.checkout()
+        head = self.local_work(dotfiles)
+        completed = self.run_wrapper(dotfiles / "install", args=self.FLAGS)
+        self.assert_in_place(completed, dotfiles, head)
+        self.assertIn("@leekyungmoon's", completed.stdout.decode())
+        opts = self.installer_runs()[0]["opts"]
+        self.assertTrue(opts["no_packages"] and opts["no_gui"] and opts["no_shell_change"])
+        self.assertEqual(self.zsh_runs(), [])  # no terminal: no new shell
+
+    def test_install_started_by_sh_zsh_or_bash_or_from_anywhere_is_in_place(self):
+        # 'sh install' (dash) and 'zsh install' run it with bash; the cwd
+        # never decides which checkout it is.
+        zsh = shutil.which("zsh")
+        starts = [("cwd", ["sh", "install"]), ("cwd", ["bash", "install"]),
+                  ("case", ["sh", "{dotfiles}/install"]), ("case", ["{dotfiles}/install"])]
+        if zsh:
+            starts += [("cwd", [zsh, "install"]), ("case", [zsh, "{dotfiles}/install"])]
+        for where, argv in starts:
+            with self.subTest(argv=argv, cwd=where):
+                shutil.rmtree(self.home / ".dotfiles", ignore_errors=True)
+                if self.py_log.exists():
+                    self.py_log.unlink()
+                dotfiles = self.checkout()
+                head = self.local_work(dotfiles)
+                cwd = dotfiles if where == "cwd" else self.case
+                command = [a.format(dotfiles=dotfiles) for a in argv] + list(self.FLAGS)
+                completed = subprocess.run(command, env=self.env_for(), cwd=str(cwd),
+                                           stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                           timeout=120, start_new_session=True)
+                self.assert_in_place(completed, dotfiles, head)
+
+    def test_install_through_symlinks_is_in_place(self):
+        # ~/.dotfiles a symlink to the checkout, and a link to ./install itself
+        real = self.checkout(self.case / "real-checkout")
+        head = self.local_work(real)
+        (self.home / ".dotfiles").symlink_to(real)
+        link = self.case / "dotfiles-install"
+        link.symlink_to(self.home / ".dotfiles" / "install")
+        completed = self.run_wrapper(link, args=self.FLAGS)
+        self.assert_in_place(completed, real, head)
+        self.assertTrue((self.home / ".dotfiles").is_symlink())
+
+    def test_install_from_a_clone_elsewhere_changes_nothing(self):
+        # It says what to run for what ~/.dotfiles is, and touches nothing.
+        dotfiles = self.checkout()
+        head = self.local_work(dotfiles)
+        elsewhere = self.checkout(self.case / "src" / "dotfiles")
+        completed = self.run_wrapper(elsewhere / "install", args=self.FLAGS)
+        self.assertEqual(completed.returncode, 2)
+        self.assertEqual(completed.stdout.decode(), "")
+        self.assertIn("Install the checkout at ~/.dotfiles:\n  ~/.dotfiles/install\n",
+                      completed.stderr.decode())
+        self.assertEqual(self.installer_runs(), [])
+        self.assertEqual(self.git("-C", str(dotfiles), "rev-parse", "HEAD"), head)
+        self.assertEqual((dotfiles / "LOCAL").read_text(), "committed\nand edited\n")
+        self.assertEqual(self.backups(), [])
+        # Another checkout there (no ./install): the one-liner, which moves it aside.
+        (dotfiles / "install").unlink()
+        completed = self.run_wrapper(elsewhere / "install")
+        self.assertEqual(completed.returncode, 2)
+        self.assertIn("moves it aside (nothing is deleted)", completed.stderr.decode())
+        self.assertIn("/HEAD/etc/install | bash", completed.stderr.decode())
+        self.assertTrue((dotfiles / "UNTRACKED").exists())
+        # Without any ~/.dotfiles: the clone & install line; nothing is created.
+        shutil.rmtree(dotfiles)
+        completed = self.run_wrapper(elsewhere / "install")
+        self.assertEqual(completed.returncode, 2)
+        self.assertIn("git clone --recursive https://github.com/leekyungmoon/dotfiles.git "
+                      "~/.dotfiles && ~/.dotfiles/install", completed.stderr.decode())
+        self.assertFalse(os.path.lexists(self.home / ".dotfiles"))
+        self.assertEqual(self.installer_runs(), [])
+
+    def test_etc_install_run_from_dotfiles_is_in_place(self):
+        # The file itself under any spelling or shell, not only through
+        # ./install; only the resolved file counts.
+        link = self.case / "links" / "dotfiles-setup"
+        link.parent.mkdir()
+        zsh = shutil.which("zsh")
+        starts = [("case", ["bash", "{dotfiles}/etc/install"]),
+                  ("case", ["{dotfiles}/etc/install"]),
+                  ("etc", ["./install"]), ("etc", ["bash", "install"]),
+                  ("case", ["bash", "{dotfiles}/etc/./install"]),
+                  ("case", [str(link)])]
+        if zsh:
+            starts.append(("case", [zsh, "{dotfiles}/etc/install"]))
+        for where, argv in starts:
+            with self.subTest(argv=argv, cwd=where):
+                shutil.rmtree(self.home / ".dotfiles", ignore_errors=True)
+                if self.py_log.exists():
+                    self.py_log.unlink()
+                dotfiles = self.checkout()
+                head = self.local_work(dotfiles)
+                if link.is_symlink():
+                    link.unlink()
+                link.symlink_to(dotfiles / "etc" / "install")
+                cwd = dotfiles / "etc" if where == "etc" else self.case
+                command = [a.format(dotfiles=dotfiles) for a in argv] + list(self.FLAGS)
+                completed = subprocess.run(command, env=self.env_for(), cwd=str(cwd),
+                                           stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                           timeout=120, start_new_session=True)
+                self.assert_in_place(completed, dotfiles, head)
+
+    def test_bash_source_from_the_environment_is_refused(self):
+        # An exported BASH_SOURCE would replace bash's own: it must not
+        # decide in place, in either direction.
+        dotfiles = self.checkout()
+        head = self.local_work(dotfiles)
+        spoof = str(dotfiles / "etc" / "install")
+        for run in (lambda: self.run_piped(args=list(self.FLAGS), BASH_SOURCE=spoof),
+                    lambda: self.run_wrapper(dotfiles / "install", args=self.FLAGS,
+                                             BASH_SOURCE="/x")):
+            completed = run()
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertIn("BASH_SOURCE is set in the environment", completed.stderr.decode())
+        self.assertEqual(self.installer_runs(), [])
+        self.assertEqual(self.git("-C", str(dotfiles), "rev-parse", "HEAD"), head)
+        self.assertEqual(self.backups(), [])
+
+    def test_install_in_dotfiles_in_a_terminal_ends_in_a_login_zsh(self):
+        dotfiles = self.checkout()
+        status, out = self.run_in_terminal(args=self.FLAGS, command=[dotfiles / "install"])
+        self.assertEqual(status, 0, out)
+        self.assertEqual(len(self.installer_runs()), 1)
+        # install.py read the terminal; the new shell runs on it.
+        self.assertEqual(self.py_log.with_suffix(".log.tty").read_text().strip(), "yes")
+        self.assertEqual(self.zsh_runs(), ["zsh -l stdin-tty=yes stdout-tty=yes"])
+        self.assertIn("FAKE-ZSH-STARTED", out)
+
+    def test_help_dry_run_and_status_install_nothing_and_start_no_shell(self):
+        dotfiles = self.checkout()
+        # install.py's own parser decides: abbreviations and flag groups too
+        for args in (["--help"], ["-fh"], ["--he"], ["--dry-run", *self.FLAGS],
+                     ["--dry", *self.FLAGS], ["repair", "--dry"], ["status"]):
+            with self.subTest(args=args):
+                if self.zsh_log.exists():
+                    self.zsh_log.unlink()
+                status, out = self.run_in_terminal(args=args, command=[dotfiles / "install"])
+                self.assertEqual(status, 0, out)
+                self.assertNotIn("All Done!", out)
+                self.assertEqual(self.zsh_runs(), [])
+                if "h" in args[0]:
+                    self.assertIn("usage:", out)  # install.py's own help
+        # (the fake records parsed runs; help exits while parsing)
+        runs = self.installer_runs()
+        self.assertEqual([r["command"] for r in runs], ["install", "install", "repair", "status"])
+        self.assertTrue(all(r["opts"].get("dry_run") for r in runs[:3]))
+
+    def test_install_in_place_refuses_root(self):
+        dotfiles = self.checkout()
+        completed = self.run_wrapper(dotfiles / "install", args=self.FLAGS,
+                                     _DOTFILES_INSTALL_SIMULATE_ROOT="1")
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("do not run this as root", completed.stderr.decode())
+        self.assertEqual(self.installer_runs(), [])
+
+    def test_plain_clone_gets_its_missing_submodules(self):
+        # 'git clone' without --recursive: the submodules it left out (one
+        # with a space in its path) are fetched before install.py, which
+        # then finds them all checked out.
+        env = self.git_env(self.case)
+        file_ok = ["-c", "protocol.file.allow=always"]
+        mirror = self.case / "with-subs.git"
+        work = self.case / "with-subs"
+        subprocess.run(["git", "clone", "--quiet", str(self.mirror), str(work)],
+                       env=env, check=True)
+        for name in ("one", "my plugin"):
+            sub = self.case / f"sub-{name.replace(' ', '-')}"
+            subprocess.run(["git", "init", "--quiet", str(sub)], env=env, check=True)
+            (sub / "f").write_text(f"{name}\n")
+            subprocess.run(["git", "-C", str(sub), "add", "f"], env=env, check=True)
+            subprocess.run(["git", "-C", str(sub), "commit", "--quiet", "-m", name],
+                           env=env, check=True)
+            subprocess.run(["git", *file_ok, "-C", str(work), "submodule", "--quiet", "add",
+                            str(sub), f"plugins/{name}"], env=env, check=True)
+        subprocess.run(["git", "-C", str(work), "commit", "--quiet", "-m", "subs"],
+                       env=env, check=True)
+        subprocess.run(["git", "clone", "--quiet", "--bare", str(work), str(mirror)],
+                       env=env, check=True)
+        dotfiles = self.home / ".dotfiles"
+        subprocess.run(["git", "clone", "--quiet", str(mirror), str(dotfiles)], env=env,
+                       check=True)
+        completed = self.run_wrapper(dotfiles / "install", args=self.FLAGS,
+                                     GIT_CONFIG_COUNT="1",
+                                     GIT_CONFIG_KEY_0="protocol.file.allow",
+                                     GIT_CONFIG_VALUE_0="always")
+        self.assertEqual(completed.returncode, 0, completed.stderr.decode())
+        self.assertEqual((dotfiles / "plugins" / "one" / "f").read_text(), "one\n")
+        self.assertEqual((dotfiles / "plugins" / "my plugin" / "f").read_text(), "my plugin\n")
+        status = self.git("-C", str(dotfiles), "submodule", "status")
+        self.assertFalse([l for l in status.splitlines() if l[:1] in ("-", "+", "U")], status)
+        self.assertEqual(len(self.installer_runs()), 1)
 
     # -- the final 'exec zsh -l' -------------------------------------------------
 

@@ -173,9 +173,32 @@ class MainGateTests(TempHome):
             self.assertEqual(rc, 2, argv)
             self.assertIn("clone", err)
             self.assertIn(str(self.home / ".dotfiles"), err)
-            self.assertIn("git clone --recursive", err)
+            self.assertIn("~/.dotfiles && ~/.dotfiles/install", err)
         self.assertEqual(runner.calls, [])
         self.assertEqual(list(self.home.iterdir()), [])
+
+    def test_refusal_says_what_to_run_for_what_dotfiles_is(self):
+        elsewhere = Path(self._tmp.name) / "elsewhere"
+        elsewhere.mkdir()
+        dotfiles = self.home / ".dotfiles"
+        # this repository's checkout at ~/.dotfiles: install that one
+        (dotfiles / "etc").mkdir(parents=True)
+        (dotfiles / "installer").mkdir()
+        for name in ("install", "etc/install"):
+            (dotfiles / name).write_text("")
+        rc, _, err = self.run_main([], runner=ScriptedRunner(), here=elsewhere)
+        self.assertEqual(rc, 2)
+        self.assertIn("    ~/.dotfiles/install", err)
+        self.assertNotIn("git clone", err)
+        # something else there (an upstream clone, say): the one-liner moves it aside
+        shutil.rmtree(dotfiles)
+        (dotfiles / "etc").mkdir(parents=True)
+        (dotfiles / "etc" / "install").write_text("")
+        rc, _, err = self.run_main([], runner=ScriptedRunner(), here=elsewhere)
+        self.assertEqual(rc, 2)
+        self.assertIn("moves it aside", err)
+        self.assertIn("/HEAD/etc/install | bash", err)
+        self.assertNotIn("git clone", err)
 
     def test_dotfiles_symlink_to_checkout_is_accepted(self):
         real = Path(self._tmp.name) / "real-checkout"

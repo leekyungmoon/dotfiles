@@ -20,8 +20,7 @@ curl -fsSL https://raw.githubusercontent.com/leekyungmoon/dotfiles/HEAD/etc/inst
 <p>
 
 ```bash
-$ git clone --recursive https://github.com/leekyungmoon/dotfiles.git ~/.dotfiles
-$ cd ~/.dotfiles && python3 install.py
+$ git clone --recursive https://github.com/leekyungmoon/dotfiles.git ~/.dotfiles && ~/.dotfiles/install
 ```
 
 </p>

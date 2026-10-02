@@ -1,5 +1,13 @@
 #!/bin/bash
 
+# Started by another shell (zsh etc/install, sh etc/install): run this file
+# with bash. Piped into another shell, there is no file to run: stop.
+if [ -z "${BASH_VERSION:-}" ]; then
+  if [ -f "$0" ]; then exec bash "$0" "$@"; fi
+  echo "ERROR: run this with bash: curl -fsSL https://raw.githubusercontent.com/leekyungmoon/dotfiles/HEAD/etc/install | bash" >&2
+  exit 1
+fi
+
 # Usage:
 #   curl -fsSL https://raw.githubusercontent.com/leekyungmoon/dotfiles/HEAD/etc/install | bash
 #   wget -qO- https://raw.githubusercontent.com/leekyungmoon/dotfiles/HEAD/etc/install | bash
@@ -14,14 +22,21 @@
 # but only after the new clone (made in a temporary sibling) has succeeded,
 # so a failed clone leaves the existing checkout where it was.
 #
+# Run as ~/.dotfiles/etc/install itself, which is what ./install does (clone &
+# install), it works in place: the same checks, then install.py in that
+# checkout as it is (no clone, no pull, nothing moved aside). Submodules a
+# plain 'git clone' left out are fetched first; install.py then brings all
+# of them to the commits the checkout records, as upstream does.
+#
 # Environment: DOTFILES_REPO_URL (clone source), DOTFILES_REF (branch, tag or
 # commit), DOTFILES_EXEC_SHELL=0 (do not start the new shell at the end).
 #
-# When install.py succeeds and the one-liner runs in a terminal, the script
-# ends like oh-my-zsh's installer: it execs a login zsh (or, without zsh on
-# PATH, the passwd login shell) on that terminal, so the terminal is on the
-# new setup at once (open zsh shells reload themselves before their next
-# command, see zsh/zsh.d/dotfiles-reload.zsh).
+# When install.py installed (not for --help, --dry-run, or the status,
+# restore, gui-apply and packages commands) and the script runs in a
+# terminal, it ends like oh-my-zsh's installer: it execs a login zsh (or,
+# without zsh on PATH, the passwd login shell) on that terminal, so the
+# terminal is on the new setup at once (open zsh shells reload themselves
+# before their next command, see zsh/zsh.d/dotfiles-reload.zsh).
 #
 # Everything runs inside main(), which is called on the very last line, so a
 # truncated download never runs a partial script.
@@ -47,6 +62,17 @@ EOF
   _pending_clone=""
   # Stop tracing first, so the cleanup does not echo its own internals.
   trap '{ set +x; } 2> /dev/null; _discard_pending_clone' EXIT
+
+  # In place when this very file, resolved, is ~/.dotfiles/etc/install ('curl
+  # | bash' has no file: BASH_SOURCE is "main" there). Only bash's own
+  # BASH_SOURCE counts, never one from the environment.
+  [[ "${BASH_SOURCE@a}" == *a* ]] || _die "BASH_SOURCE is set in the environment; unset it and rerun."
+  local in_place=0 self="" checkout=""
+  if self="$(readlink -e -- "${BASH_SOURCE[0]}" 2> /dev/null)" \
+      && checkout="$(readlink -e -- "$dest" 2> /dev/null)" \
+      && [[ "$self" == "$checkout/etc/install" ]]; then
+    in_place=1
+  fi
 
   # Refuse root: everything is installed for (and owned by) your own user.
   # _DOTFILES_INSTALL_SIMULATE_ROOT can only add this refusal (tests).
@@ -96,9 +122,12 @@ EOF
   if [[ -t 0 ]]; then tty_in=/dev/stdin; elif { : < /dev/tty; } 2> /dev/null; then tty_in=/dev/tty; fi
 
   # What to do with an existing "$dest": a clean clone of this repository
-  # is fast-forwarded; anything else is moved aside (never deleted).
+  # is fast-forwarded; anything else is moved aside (never deleted). In
+  # place, it is used as it is.
   local existing=none
-  if [[ -e "$dest" || -L "$dest" ]]; then
+  if (( in_place )); then
+    existing=here
+  elif [[ -e "$dest" || -L "$dest" ]]; then
     existing=move
     if [[ -d "$dest" && ! -L "$dest" && -e "$dest/.git" ]] \
         && [[ "$(git -C "$dest" rev-parse --show-toplevel 2> /dev/null)" == "$(cd "$dest" && pwd -P)" ]]; then
@@ -124,7 +153,15 @@ EOF
 
   cd ~
 
-  if [[ "$existing" == pull ]]; then
+  if [[ "$existing" == here ]]; then
+    # The submodules a plain 'git clone' left out ('-' lines have no suffix).
+    local unfetched=()
+    mapfile -t unfetched < <(git -C "$dest" submodule status 2> /dev/null \
+      | sed -n 's/^-[0-9a-f]* //p')
+    if (( ${#unfetched[@]} > 0 )); then
+      git -C "$dest" submodule update --init --recursive --jobs 8 -- "${unfetched[@]}"
+    fi
+  elif [[ "$existing" == pull ]]; then
     if [[ -n "$ref" ]]; then
       git -C "$dest" fetch origin
       git -C "$dest" checkout "$ref"
@@ -134,7 +171,7 @@ EOF
         || _die "cannot fast-forward $dest (local commits?); resolve it there, then rerun."
     fi
     git -C "$dest" submodule update --init --recursive --jobs 8
-  else
+  elif [[ "$existing" != here ]]; then
     # Clone and check out into a new sibling first; only a complete checkout
     # replaces "$dest". Until then an existing "$dest" is not touched, and a
     # failed clone leaves nothing behind but the error.
@@ -175,10 +212,28 @@ EOF
   fi
 
   { set +x; } 2> /dev/null
-  echo "All Done!"
-
   # Only reached when install.py succeeded (set -e stops at a failure).
+  _installs "$@" || return 0
+  echo "All Done!"
   _exec_new_shell "$@"
+}
+
+# Whether these install.py arguments installed anything: an install or a
+# repair, not a dry run nor --help. install.py's own parser decides (it takes
+# abbreviations such as --dry and grouped flags such as -fh); run in the
+# checkout, after install.py succeeded.
+_installs() {
+  python3 -c '
+import sys
+sys.dont_write_bytecode = True
+sys.path.insert(0, ".")
+import install
+try:
+    args = install.parse_args(sys.argv[1:])
+except SystemExit:
+    sys.exit(1)
+sys.exit(0 if args.command in ("install", "repair") and not getattr(args, "dry_run", False) else 1)
+' "$@" > /dev/null 2>&1
 }
 
 # Replace this script with a login shell on the terminal, as oh-my-zsh's
@@ -186,15 +241,12 @@ EOF
 # at once. The shell is zsh from PATH, else the login shell from passwd
 # (getent), e.g. when zsh landed where the pre-install PATH does not reach.
 # Only with a terminal (/dev/tty readable and writable, stdout a terminal:
-# not under a test harness, cron or a captured run), never for --help, and
-# never with DOTFILES_EXEC_SHELL=0. A failed exec ends the script with
-# status 0 (the install itself succeeded).
+# not under a test harness, cron or a captured run), and never with
+# DOTFILES_EXEC_SHELL=0. A failed exec ends the script with status 0 (the
+# install itself succeeded).
 _exec_new_shell() {
-  local arg shell_bin
+  local shell_bin
   [[ "${DOTFILES_EXEC_SHELL:-1}" != 0 ]] || return 0
-  for arg in "$@"; do
-    case "$arg" in -h | --help) return 0 ;; esac
-  done
   { : < /dev/tty > /dev/tty; } 2> /dev/null || return 0
   [[ -t 1 ]] || return 0
   shell_bin="$(command -v zsh 2> /dev/null || true)"
