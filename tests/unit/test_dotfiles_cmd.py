@@ -87,6 +87,9 @@ TOOLS = {"schema": 1, "tools": {"node": {}, "neovim": {}, "fzf": {}}}
 class DotfilesCmdCase(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory(prefix="pdf-cmd-")
+        # Registered first, so it runs last: after the cleanups that stop the
+        # processes a test started (they may still write here until then).
+        self.addCleanup(self._tmp.cleanup)
         root = Path(self._tmp.name)
         self.root = root
         self.home = root / "home"
@@ -125,9 +128,6 @@ class DotfilesCmdCase(unittest.TestCase):
         self.git("-C", str(self.work), "branch", "--quiet", "-u", "origin/main")
         self.dotfiles = self.home / ".dotfiles"
         self.git("clone", "--quiet", str(self.origin), str(self.dotfiles))
-
-    def tearDown(self):
-        self._tmp.cleanup()
 
     def git(self, *args, check=True) -> str:
         completed = subprocess.run(["git", *args], env=self.env, check=check,
