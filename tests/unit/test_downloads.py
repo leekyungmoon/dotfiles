@@ -7,12 +7,15 @@ import hashlib
 import io
 import os
 import shutil
+import ssl
 import subprocess
 import sys
 import tempfile
+import types
 import unittest
 import urllib.error
 from pathlib import Path
+from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
@@ -193,9 +196,88 @@ class FetchTests(unittest.TestCase):
             dl.fetch("https://example.invalid/x", self.tmp / "x", max_bytes=10)
         self.assertEqual(list(self.tmp.iterdir()), [])
 
+    @staticmethod
+    def cert_error() -> ssl.SSLCertVerificationError:
+        error = ssl.SSLCertVerificationError(
+            1, "[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed")
+        error.verify_message = "unable to get local issuer certificate"
+        return error
 
-@unittest.skipUnless(shutil.which("gpg") and shutil.which("gpgv") and shutil.which("gpgconf"),
-                     "gpg/gpgv not available")
+    def test_certificate_failure_is_not_retried(self):
+        # A python.org Python on macOS without its certificates fails every
+        # attempt the same way; three tries only hide the remedy.
+        for failure in (urllib.error.URLError(self.cert_error()), self.cert_error()):
+            with self.subTest(failure=type(failure).__name__):
+                dl._OPENER = _Opener([failure, b"never"])
+                slept = []
+                with self.assertRaises(DownloadError) as ctx:
+                    dl.fetch("https://example.invalid/x", self.tmp / "x", sleep=slept.append)
+                self.assertEqual(dl._OPENER.calls, 1)
+                self.assertEqual(slept, [])
+                self.assertEqual(list(self.tmp.iterdir()), [])
+                message = str(ctx.exception)
+                self.assertIn("TLS certificate verification failed", message)
+                self.assertIn("unable to get local issuer certificate", message)
+                self.assertIn(dl.certificate_remedy(), message)
+                self.assertNotIn("attempts", message)
+        # Without the verify message the ssl module normally sets: its text.
+        bare = ssl.SSLCertVerificationError(1, "certificate verify failed")
+        dl._OPENER = _Opener([urllib.error.URLError(bare), b"never"])
+        with self.assertRaises(DownloadError) as ctx:
+            dl.fetch("https://example.invalid/x", self.tmp / "x", sleep=lambda s: None)
+        self.assertIn("certificate verify failed", str(ctx.exception))
+        self.assertEqual(dl._OPENER.calls, 1)
+
+    def test_other_tls_errors_are_still_retried(self):
+        dl._OPENER = _Opener([urllib.error.URLError(ssl.SSLError(1, "handshake failure")),
+                              b"payload"])
+        dl.fetch("https://example.invalid/x", self.tmp / "x", sleep=lambda s: None)
+        self.assertEqual(dl._OPENER.calls, 2)
+        self.assertEqual((self.tmp / "x").read_bytes(), b"payload")
+
+    def test_certificate_remedy_per_platform(self):
+        python_org = "/Library/Frameworks/Python.framework/Versions/3.13"
+        mac = dl.certificate_remedy("darwin", prefix=python_org)
+        self.assertIn("brew install python3", mac)
+        self.assertIn("Install Certificates.command", mac)
+        self.assertIn("SSL_CERT_FILE", mac)
+        # Homebrew's own python3 already is that remedy: its CA bundle (the
+        # ca-certificates formula) is what is broken, whatever the prefix.
+        for prefix in (
+                "/opt/homebrew/opt/python@3.13/Frameworks/Python.framework/Versions/3.13",
+                "/usr/local/Cellar/python@3.12/3.12.11/Frameworks/Python.framework/Versions/3.12",
+                "/Users/me/brew/opt/python@3.14/Frameworks/Python.framework/Versions/3.14"):
+            with self.subTest(prefix=prefix):
+                brew = dl.certificate_remedy("darwin", prefix=prefix)
+                self.assertIn("brew reinstall ca-certificates openssl@3", brew)
+                self.assertIn("SSL_CERT_FILE", brew)
+                self.assertNotIn("brew install python3", brew)
+                self.assertNotIn("Install Certificates.command", brew)
+        linux = dl.certificate_remedy("linux")
+        self.assertIn("ca-certificates", linux)
+        self.assertIn("SSL_CERT_FILE", linux)
+        self.assertNotIn("brew", linux)
+        # By default this Python decides; a venv counts as the Python it was
+        # made from (base_prefix, not prefix).
+        host = types.SimpleNamespace(platform="darwin", base_prefix=python_org,
+                                     prefix="/opt/homebrew/opt/python@3.13/venv")
+        with mock.patch.object(dl, "sys", host):
+            self.assertEqual(dl.certificate_remedy(), mac)
+
+
+# Absolute paths: on macOS gnupg comes from Homebrew, outside /usr/bin:/bin.
+_GPG = {name: shutil.which(name) for name in ("gpg", "gpgv", "gpgconf")}
+
+
+def _gpg_search_path() -> str:
+    dirs: list[str] = []
+    for directory in [os.path.dirname(p) for p in _GPG.values() if p] + ["/usr/bin", "/bin"]:
+        if directory not in dirs:
+            dirs.append(directory)
+    return os.pathsep.join(dirs)
+
+
+@unittest.skipUnless(all(_GPG.values()), "gpg/gpgv not available")
 class RealGpgTests(unittest.TestCase):
     """Real OpenPGP material from a throwaway GNUPGHOME; never the user's."""
 
@@ -203,10 +285,11 @@ class RealGpgTests(unittest.TestCase):
     def setUpClass(cls):
         cls.home = Path(tempfile.mkdtemp(prefix="pdg"))
         os.chmod(cls.home, 0o700)
-        cls.env = {"GNUPGHOME": str(cls.home), "PATH": "/usr/bin:/bin", "HOME": str(cls.home)}
+        cls.env = {"GNUPGHOME": str(cls.home), "PATH": _gpg_search_path(),
+                   "HOME": str(cls.home)}
 
         def gpg(*args, data=None):
-            return subprocess.run(["gpg", "--homedir", str(cls.home), "--batch", "--quiet",
+            return subprocess.run([_GPG["gpg"], "--homedir", str(cls.home), "--batch", "--quiet",
                                    "--pinentry-mode", "loopback", "--passphrase", "", *args],
                                   input=data, capture_output=True, check=True, env=cls.env,
                                   timeout=120).stdout
@@ -223,7 +306,7 @@ class RealGpgTests(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
-        subprocess.run(["gpgconf", "--homedir", str(cls.home), "--kill", "all"],
+        subprocess.run([_GPG["gpgconf"], "--homedir", str(cls.home), "--kill", "all"],
                        capture_output=True, env=cls.env, timeout=30)
         shutil.rmtree(cls.home, ignore_errors=True)
 

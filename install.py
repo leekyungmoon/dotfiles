@@ -90,10 +90,110 @@ class Context:
     interactive: object = None  # callable(argv) -> returncode, for chsh
     repo_root: Path | None = None  # the checkout; defaults to target.repo_root
     prompt: object = None  # callable(question) -> str | None, for git identity
+    conditions: dict | None = None  # condition_facts(), computed once per run
 
     def __post_init__(self) -> None:
         if self.repo_root is None:
             self.repo_root = self.target.repo_root
+
+
+# --- platform -------------------------------------------------------------------
+
+# The GNOME settings, input-remapper and their login autostart entry exist only
+# on Linux; installer/gui.py reports the same reason.
+GUI_NOT_APPLICABLE = "not-applicable-on-macos"
+
+
+def platform_system(ctx: Context) -> str:
+    """``linux`` or ``darwin``: the detected platform's, or, for status and
+    restore (which detect none), the kernel's."""
+
+    if ctx.platform is not None:
+        return ctx.platform.system
+    return plat.current_system()
+
+
+def condition_facts(ctx: Context) -> dict[str, bool]:
+    """Whether each manifest ``condition`` holds for this run.
+
+    Computed once per run (kept in ``ctx.conditions``), so the transaction,
+    --dry-run and the tool links never disagree. systemd user managers are
+    only looked for on Linux (on macOS launchd plays their part).
+    """
+
+    if ctx.conditions is None:
+        system = platform_system(ctx)
+        linux = system == "linux"
+        ctx.conditions = {
+            "always": True,
+            "linux": linux,
+            "darwin": system == "darwin",
+            "systemd-user": linux and phases.systemd_user_supported(ctx.runner),
+        }
+    return dict(ctx.conditions)
+
+
+def _condition_skips(resolved: list, facts: dict) -> tuple[list[str], list[str]]:
+    """``(skipped, not_applicable)`` ids of the entries left out by ``facts``.
+
+    ``skipped`` are the systemd-user entries of a Linux machine without a
+    systemd user manager: a degraded install, reported entry by entry as it
+    always was. ``not_applicable`` are entries for another platform.
+    """
+
+    from installer import transaction
+
+    left_out = set(transaction.skipped_by_condition(resolved, conditions=facts))
+    skipped, not_applicable = [], []
+    for entry in resolved:
+        if entry.id not in left_out:
+            continue
+        if entry.condition == "systemd-user" and facts.get("linux"):
+            skipped.append(entry.id)
+        else:
+            not_applicable.append(entry.id)
+    return skipped, not_applicable
+
+
+def _report_not_applicable(ctx: Context, resolved: list, not_applicable: list[str],
+                           details: dict) -> None:
+    """Name the other platform's entries once per kind, never entry by entry.
+
+    Only macOS has any today (the systemd units and the Linux desktop files);
+    a macOS-only entry on Linux is left out silently, so the Linux output and
+    status.json stay what they were.
+    """
+
+    if not not_applicable or platform_system(ctx) != "darwin":
+        return
+    details["not_applicable_ids"] = sorted(not_applicable)
+    by_condition: dict[str, list[str]] = {}
+    for entry in resolved:
+        if entry.id in not_applicable:
+            by_condition.setdefault(entry.condition, []).append(entry.id)
+    for condition, ids in sorted(by_condition.items()):
+        if condition == "systemd-user":
+            ui.log_target("systemd user units",
+                          ui.GRAY("not applicable on macOS, which uses launchd"))
+        elif condition == "linux":
+            ui.log_target("Linux-only files",
+                          ui.GRAY(f"not applicable on macOS ({', '.join(sorted(ids))})"))
+        else:
+            ui.log_target(f"{condition} entries",
+                          ui.GRAY(f"not applicable here ({', '.join(sorted(ids))})"))
+
+
+def _accepts(function, name: str) -> bool:
+    """Whether ``function`` takes a ``name`` keyword (seams written before
+    that keyword existed, or test doubles, may not)."""
+
+    try:
+        parameters = inspect.signature(function).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    keyword = (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+    return any((p.name == name and p.kind in keyword)
+               or p.kind is inspect.Parameter.VAR_KEYWORD for p in parameters)
 
 
 # --- argument parsing ---------------------------------------------------------
@@ -300,6 +400,10 @@ def packages_phase(ctx: Context, *, disabled: bool, dry_run: bool,
 
 
 def gui_phase(ctx: Context, *, disabled: bool, autostart: bool = False) -> PhaseResult:
+    # GNOME settings and input-remapper have no macOS counterpart; the module
+    # is not even loaded there.
+    if platform_system(ctx) == "darwin":
+        return PhaseResult("gui", SKIPPED, [GUI_NOT_APPLICABLE])
     if disabled:
         return PhaseResult("gui", SKIPPED, ["--no-gui"])
     apply = load_seam("gui", "apply_or_defer")
@@ -308,8 +412,13 @@ def gui_phase(ctx: Context, *, disabled: bool, autostart: bool = False) -> Phase
     env = dict(ctx.env)
     if autostart:
         env["PERSONAL_DOTFILES_GUI_AUTOSTART"] = "1"
+    # The platform detected once in main(), so the module does not detect it
+    # again from /etc/os-release.
+    kwargs = {}
+    if ctx.platform is not None and _accepts(apply, "platform"):
+        kwargs["platform"] = ctx.platform
     try:
-        return PhaseResult.coerce(apply(ctx.target, ctx.runner, env), "gui")
+        return PhaseResult.coerce(apply(ctx.target, ctx.runner, env, **kwargs), "gui")
     except Exception as exc:
         return PhaseResult("gui", FAIL, [f"{type(exc).__name__}: {exc}"])
 
@@ -341,6 +450,11 @@ def extra_desired_entries(ctx: Context, packages_result: PhaseResult | None,
     if not packages_complete:
         fresh = {e.id for e in extra}
         extra += [e for e in previous_tool_links(ctx) if e.id not in fresh]
+    # The autostart entry runs 'install.py gui-apply' at a GNOME login, which
+    # macOS never has: it is not installed there, and one managed anyway is
+    # retired like any entry that is no longer wanted.
+    if platform_system(ctx) == "darwin":
+        return extra, warnings
     # --no-gui skips applying desktop settings, but an autostart entry that an
     # earlier run installed stays managed instead of being retired.
     if no_gui:
@@ -413,15 +527,127 @@ def location_error(here: Path, target: plat.Target) -> str | None:
 
 # --- phases -------------------------------------------------------------------
 
-def preflight_phase(ctx: Context) -> PhaseResult:
+# /usr/bin/git on macOS is a shim that runs the Command Line Tools' git, and
+# without the tools only offers to install them and fails; xcode-select -p
+# names the active tools and fails when there are none.
+MACOS_GIT_SHIM = "/usr/bin/git"
+XCODE_SELECT = "/usr/bin/xcode-select"
+XCODE_SELECT_TIMEOUT = 30.0
+
+
+def _macos_python_remedy() -> str:
+    version = ".".join(str(part) for part in sys.version_info[:3])
+    return (f"python {MIN_PYTHON[0]}.{MIN_PYTHON[1]}+ is required, but this is {version} "
+            f"({sys.executable}): run 'brew install python3', then rerun "
+            "~/.dotfiles/install, which runs install.py with Homebrew's python3")
+
+
+def _clt_git_stub(runner, git: str) -> str | None:
+    """Why ``git`` cannot run on this Mac, or None.
+
+    Only the shim at /usr/bin/git depends on the Command Line Tools (a
+    Homebrew git does not); it is not run here, because without the tools
+    running it opens the installation dialog.
+    """
+
+    if git != MACOS_GIT_SHIM and os.path.realpath(git) != MACOS_GIT_SHIM:
+        return None
+    try:
+        done = runner.run([XCODE_SELECT, "-p"], timeout=XCODE_SELECT_TIMEOUT,
+                          check=False, read_only=True)
+    except Exception:  # xcode-select itself missing or hanging
+        developer_dir = None
+    else:
+        out = done.stdout or b""
+        text = out.decode("utf-8", "replace") if isinstance(out, bytes) else str(out)
+        developer_dir = text.strip() if done.returncode == 0 else None
+    if developer_dir and os.path.isdir(developer_dir):
+        return None
+    return ("git is the Xcode Command Line Tools stub (/usr/bin/git) and the tools are "
+            "not installed: run 'xcode-select --install' (or 'brew install git' with "
+            "Homebrew's bin first on PATH), then rerun")
+
+
+def _ssl_ca_problem(verify_paths=None) -> str | None:
+    """Why this Python cannot verify HTTPS certificates, or None.
+
+    A python.org build on macOS has no CA certificates until its 'Install
+    Certificates.command' ran; every pinned download would then fail.
+    ``ssl.get_default_verify_paths()`` reports cafile/capath as None when
+    they do not exist; an empty bundle or directory verifies nothing either.
+    """
+
+    import ssl
+
+    from installer import downloads
+
+    paths = verify_paths if verify_paths is not None else ssl.get_default_verify_paths()
+    try:
+        if paths.cafile and os.path.getsize(paths.cafile) > 0:
+            return None
+        if paths.capath and any(True for _ in os.scandir(paths.capath)):
+            return None
+    except OSError:
+        pass
+    # SSL_CERT_FILE, when set, replaces the bundle the build was made with.
+    looked = os.environ.get(paths.openssl_cafile_env or "") or paths.openssl_cafile
+    return (f"this Python has no CA certificates (it looks for {looked}), so the "
+            f"pinned downloads would fail: {downloads.certificate_remedy('darwin')}")
+
+
+def _lzma_problem() -> str | None:
+    """Why this Python cannot unpack .tar.xz archives (node's), or None."""
+
+    try:
+        importlib.import_module("lzma")
+    except ImportError:
+        return ("this Python was built without lzma (xz), which the pinned node "
+                "archive needs: run 'brew install python3', then rerun ~/.dotfiles/install")
+    return None
+
+
+def _macos_preflight(ctx: Context, *, packages: bool) -> list[str]:
+    """macOS-only reasons the install cannot start."""
+
+    reasons = []
+    git = ctx.runner.which("git")
+    if git is None:
+        reasons.append("git is not installed (run: xcode-select --install, or: "
+                       "brew install git)")
+    else:
+        stub = _clt_git_stub(ctx.runner, git)
+        if stub:
+            reasons.append(stub)
+    # Only the packages phase downloads anything with this Python.
+    if packages:
+        for problem in (_ssl_ca_problem(), _lzma_problem()):
+            if problem:
+                reasons.append(problem)
+    return reasons
+
+
+def preflight_phase(ctx: Context, *, packages: bool = True) -> PhaseResult:
+    """Platform, Python, git, home and checkout checks before any change.
+
+    ``packages`` says whether the packages phase will run (not
+    --no-packages); on macOS it adds the checks only downloads need.
+    """
+
     reasons = []
     details: dict = {}
+    darwin = platform_system(ctx) == "darwin"
     if ctx.platform is not None:
         p = ctx.platform
-        ui.log_target("platform", ui.GREEN(f"{p.distribution} {p.release} ({p.architecture})"))
+        ui.log_target("platform", ui.GREEN(p.describe()))
+        if p.best_effort:
+            details["best_effort"] = True
+            ui.log(ui.YELLOW("Intel Macs are best effort: Homebrew supports them at "
+                             "Tier 3 only, so some formulae may build from source."))
     if sys.version_info < MIN_PYTHON:
-        reasons.append("python 3.10+ is required")
-    if ctx.runner.which("git") is None:
+        reasons.append(_macos_python_remedy() if darwin else "python 3.10+ is required")
+    if darwin:
+        reasons += _macos_preflight(ctx, packages=packages)
+    elif ctx.runner.which("git") is None:
         reasons.append("git is not installed (run etc/install, or: sudo apt-get "
                        "install -y git)")
     if not ctx.target.home.is_dir():
@@ -553,7 +779,8 @@ def transaction_phase(ctx: Context, *, extra_entries: list | None = None,
 
     Returns the result and whether systemd-user entries were applied.
     ``force`` (``-f``) lets the transaction overwrite copied files the user
-    changed, when the transaction supports keeping them.
+    changed, when the transaction supports keeping them. Only entries whose
+    condition holds (:func:`condition_facts`) are applied.
     """
 
     from installer import manifest as manifest_mod
@@ -580,14 +807,16 @@ def transaction_phase(ctx: Context, *, extra_entries: list | None = None,
         ui.log(ui.RED(reason))
         return PhaseResult("transaction", FAIL, [reason]), False
 
-    systemd_ok = phases.systemd_user_supported(ctx.runner)
-    skipped = transaction.skipped_by_condition(resolved, systemd_user=systemd_ok)
+    facts = condition_facts(ctx)
+    systemd_ok = facts["systemd-user"]
+    skipped, not_applicable = _condition_skips(resolved, facts)
     desired = transaction.entries_from_manifest(resolved, ctx.target,
-                                                systemd_user=systemd_ok)
+                                                systemd_user=systemd_ok,
+                                                conditions=facts)
     desired += list(extra_entries or [])
     return _apply_entries(ctx, desired, resolved=resolved, skipped=skipped,
                           systemd_ok=systemd_ok, manifest_path=manifest_path,
-                          force=force)
+                          force=force, not_applicable=not_applicable)
 
 
 def _apply_kwargs(tx, generation: dict, force: bool) -> dict:
@@ -603,7 +832,8 @@ def _apply_kwargs(tx, generation: dict, force: bool) -> dict:
 
 def _apply_entries(ctx: Context, desired: list, *, resolved: list, skipped: list,
                    systemd_ok: bool, manifest_path: Path | None,
-                   force: bool = False) -> tuple[PhaseResult, bool]:
+                   force: bool = False, not_applicable: list | None = None
+                   ) -> tuple[PhaseResult, bool]:
     from installer import transaction
 
     checkout = Path(ctx.repo_root)
@@ -656,13 +886,24 @@ def _apply_entries(ctx: Context, desired: list, *, resolved: list, skipped: list
         reasons.append("kept your local changes to "
                        + ", ".join(entry_id for entry_id, _ in kept)
                        + " (use -f to overwrite)")
+    _report_condition_skips(ctx, resolved, skipped, list(not_applicable or []),
+                            details, reasons)
+    return PhaseResult("transaction", PASS, reasons, details), bool(systemd_ok)
+
+
+def _report_condition_skips(ctx: Context, resolved: list, skipped: list,
+                            not_applicable: list, details: dict, reasons: list) -> None:
+    """Report what :func:`_condition_skips` left out, the same way for the
+    transaction and for --dry-run."""
+
     if skipped:
         details["skipped_ids"] = skipped
         reasons.append("systemd-user entries skipped: no systemd user manager")
         for entry in resolved:
             if entry.id in skipped:
                 ui.log_target(entry.dest, ui.GRAY("skipped (no systemd user manager)"))
-    return PhaseResult("transaction", PASS, reasons, details), bool(systemd_ok)
+    # Another platform's entries are not a degradation: no reason, one line.
+    _report_not_applicable(ctx, resolved, not_applicable, details)
 
 
 def finish(ctx: Context, command: str, results: list[PhaseResult], *,
@@ -883,7 +1124,7 @@ def run_pipeline(ctx: Context, command: str, opts: Options) -> int:
     results: list[PhaseResult] = []
 
     ui.section("Checking platform")
-    if _report(results, preflight_phase(ctx)).status == FAIL:
+    if _report(results, preflight_phase(ctx, packages=not opts.no_packages)).status == FAIL:
         return finish(ctx, command, results, closing=True)
 
     ui.section("Installing packages")
@@ -929,7 +1170,7 @@ def run_pipeline(ctx: Context, command: str, opts: Options) -> int:
                                                prompt=ctx.prompt))
     _report(results, phases.auth_phase(ctx.target, ctx.runner, ctx.env))
 
-    ui.section("GNOME settings")
+    ui.section("Desktop settings" if platform_system(ctx) == "darwin" else "GNOME settings")
     _report(results, gui_phase(ctx, disabled=opts.no_gui))
     return finish(ctx, command, results, closing=True)
 
@@ -941,7 +1182,7 @@ def dry_run_install(ctx: Context, opts: Options | None = None) -> int:
 
     opts = opts or Options(dry_run=True)
     ui.section("Checking platform")
-    results = [preflight_phase(ctx)]
+    results = [preflight_phase(ctx, packages=not opts.no_packages)]
     ui.section("Installing packages")
     results.append(packages_phase(ctx, disabled=opts.no_packages, dry_run=True,
                                   exclude=ai_cli_exclusions(ctx, opts, record=False)))
@@ -953,8 +1194,13 @@ def dry_run_install(ctx: Context, opts: Options | None = None) -> int:
     except manifest_mod.ManifestError as exc:
         results.append(PhaseResult("plan", FAIL, [f"manifest: {exc}"]))
     else:
+        # The real run's conditions: what it would leave out is not planned.
+        skipped, not_applicable = _condition_skips(resolved, condition_facts(ctx))
+        left_out = set(skipped) | set(not_applicable)
         plan = {}
         for entry in sorted(resolved, key=lambda e: str(e.dest)):
+            if entry.id in left_out:
+                continue
             action = _planned_action(entry)
             plan[entry.id] = f"{action} {entry.dest}"
             color = ui.GREEN if action in ("unchanged", "keep-absent") else ui.YELLOW
@@ -962,7 +1208,10 @@ def dry_run_install(ctx: Context, opts: Options | None = None) -> int:
                                             if action not in ("unchanged", "keep-absent")
                                             else "already up-to-date"))
             print(f"  {plan[entry.id]}")
-        results.append(PhaseResult("plan", PASS, [], {"entries": plan}))
+        reasons: list[str] = []
+        details: dict = {"entries": plan}
+        _report_condition_skips(ctx, resolved, skipped, not_applicable, details, reasons)
+        results.append(PhaseResult("plan", PASS, reasons, details))
     for result in results:
         print(f"[{result.phase}] {result.status}"
               + (f": {'; '.join(result.reasons)}" if result.reasons else ""))
@@ -1041,14 +1290,18 @@ def cmd_restore(ctx: Context, args) -> int:
 
     # A full baseline restore also returns the GNOME keys and input-remapper
     # presets to their pre-install values; they are not files, so the file
-    # transaction above cannot. Restoring a single id or run stays file-only.
+    # transaction above cannot. Restoring a single id or run stays file-only,
+    # and macOS has no such settings at all.
     gui_status = None
-    if which == "baseline" and not args.ids:
+    if which == "baseline" and not args.ids and platform_system(ctx) != "darwin":
         restore_gui = load_seam("gui", "restore_gui")
         if restore_gui is not None:
+            kwargs = {}
+            if ctx.platform is not None and _accepts(restore_gui, "platform"):
+                kwargs["platform"] = ctx.platform
             try:
-                gui_result = PhaseResult.coerce(restore_gui(ctx.target, ctx.runner, ctx.env),
-                                           "gui-restore")
+                gui_result = PhaseResult.coerce(restore_gui(ctx.target, ctx.runner, ctx.env,
+                                                            **kwargs), "gui-restore")
             except Exception as exc:  # the file restore already succeeded
                 gui_result = PhaseResult("gui-restore", phases.FAIL,
                                          [f"{type(exc).__name__}: {exc}"])
@@ -1228,6 +1481,13 @@ def main(argv: list[str] | None = None, *, env: dict | None = None,
             plat.require_supported_platform(platform)
     except plat.PlatformError as exc:
         print(ui.RED(f"error: {exc}"), file=sys.stderr)
+        return 2
+
+    # Before the location gate: no checkout location would make it apply.
+    if command == "gui-apply" and platform is not None and platform.is_darwin:
+        print(ui.RED("error: gui-apply applies GNOME settings and input-remapper "
+                     "presets, which macOS does not have; there is nothing to apply "
+                     "on this Mac"), file=sys.stderr)
         return 2
 
     if command in LOCATED_COMMANDS and not getattr(args, "allow_any_location", False):

@@ -1095,6 +1095,20 @@
       "purpose": "usage/error text: install.py runs from the ~/.dotfiles checkout (clone & install)"
     },
     {
+      "file": "install.py",
+      "line": "\"~/.dotfiles/install, which runs install.py with Homebrew's python3\")",
+      "kind": "link",
+      "classification": "guidance",
+      "purpose": "macOS preflight remedy when install.py runs on a Python older than 3.10 (the Xcode Command Line Tools' 3.9): brew install python3, then rerun the ~/.dotfiles/install wrapper, which runs install.py with Homebrew's python3"
+    },
+    {
+      "file": "install.py",
+      "line": "\"archive needs: run 'brew install python3', then rerun ~/.dotfiles/install\")",
+      "kind": "link",
+      "classification": "guidance",
+      "purpose": "macOS preflight remedy when this Python lacks lzma (the pinned node .tar.xz needs it): rerun the ~/.dotfiles/install wrapper after installing Homebrew's python3"
+    },
+    {
       "file": "install",
       "line": "#   git clone --recursive https://github.com/leekyungmoon/dotfiles.git ~/.dotfiles && ~/.dotfiles/install",
       "kind": "link",
@@ -1165,6 +1179,13 @@
       "classification": "runtime-link",
       "purpose": "at every login, refreshes the graphical environment of a tmux server that outlived the last login",
       "count": 1
+    },
+    {
+      "file": "installer/downloads.py",
+      "line": "return (\"use Homebrew's python3 ('brew install python3'; ~/.dotfiles/install \"",
+      "kind": "link",
+      "classification": "guidance",
+      "purpose": "macOS certificate-verification remedy for a Python that is not Homebrew's (downloads.fetch and the install.py preflight CA probe): use Homebrew's python3, which the ~/.dotfiles/install wrapper runs install.py with, or run python.org's Install Certificates.command"
     }
   ],
   "writers": [

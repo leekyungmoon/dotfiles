@@ -36,8 +36,9 @@ import re
 import secrets
 import shutil
 import stat
+import sys
 from pathlib import Path
-from typing import Callable, Iterable
+from typing import Callable, Iterable, Mapping
 
 from .manifest import ResolvedEntry, check_dest_placement
 from .platform import Target, _is_within, is_generation_id
@@ -397,18 +398,52 @@ class DesiredEntry:
     staged_dir: Path | None = None
 
 
+def default_conditions(
+    *, systemd_user: bool = True, system: str | None = None
+) -> dict[str, bool]:
+    """The manifest condition facts for a caller that passes none.
+
+    The platform comes from ``system`` (default ``sys.platform``), and
+    ``systemd-user`` from ``systemd_user`` exactly as before, so a caller
+    that never heard of conditions keeps its behaviour. The installer passes
+    its own facts instead (``install.condition_facts``), which only ever
+    find systemd user managers on Linux.
+    """
+
+    system = sys.platform if system is None else system
+    return {
+        "always": True,
+        "linux": system.startswith("linux"),
+        "darwin": system == "darwin",
+        "systemd-user": bool(systemd_user),
+    }
+
+
+def _applies(entry: ResolvedEntry, conditions: Mapping[str, bool]) -> bool:
+    # A condition the facts do not name is false: the entry stays out
+    # rather than landing on a platform nobody checked it for.
+    return entry.condition == "always" or bool(conditions.get(entry.condition, False))
+
+
 def entries_from_manifest(
     resolved: Iterable[ResolvedEntry],
     target: Target,
     *,
     systemd_user: bool = True,
+    conditions: Mapping[str, bool] | None = None,
 ) -> list[DesiredEntry]:
-    """Translate resolved manifest entries; ``systemd-user`` ones are dropped
-    when ``systemd_user`` is false (see :func:`skipped_by_condition`)."""
+    """Translate resolved manifest entries whose condition holds.
 
+    ``conditions`` maps each condition name to whether it holds here
+    (``install.condition_facts``); without it the facts come from
+    :func:`default_conditions` with ``systemd_user``. Entries whose condition
+    does not hold are left out (see :func:`skipped_by_condition`).
+    """
+
+    facts = default_conditions(systemd_user=systemd_user) if conditions is None else conditions
     desired: list[DesiredEntry] = []
     for entry in resolved:
-        if entry.condition == "systemd-user" and not systemd_user:
+        if not _applies(entry, facts):
             continue
         if entry.kind in ("symlink", "link"):
             desired.append(
@@ -433,11 +468,15 @@ def entries_from_manifest(
 
 
 def skipped_by_condition(
-    resolved: Iterable[ResolvedEntry], *, systemd_user: bool
+    resolved: Iterable[ResolvedEntry],
+    *,
+    systemd_user: bool = True,
+    conditions: Mapping[str, bool] | None = None,
 ) -> list[str]:
-    return [
-        e.id for e in resolved if e.condition == "systemd-user" and not systemd_user
-    ]
+    """Ids :func:`entries_from_manifest` leaves out, in manifest order."""
+
+    facts = default_conditions(systemd_user=systemd_user) if conditions is None else conditions
+    return [e.id for e in resolved if not _applies(e, facts)]
 
 
 @dataclasses.dataclass
@@ -1451,6 +1490,7 @@ __all__ = [
     "RestoreResult",
     "Transaction",
     "TransactionError",
+    "default_conditions",
     "entries_from_manifest",
     "load_status",
     "new_run_id",

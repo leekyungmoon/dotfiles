@@ -37,6 +37,11 @@ State layout (dirs 0700, files 0600, atomic writes)::
 
 Every ``gsettings.json`` set can be passed to :func:`restore_gui` as the
 ``generation`` to return to it.
+
+macOS has neither GNOME nor input-remapper: there every entry point returns
+``SKIPPED`` (``not-applicable-on-macos``) before touching any state. The
+caller's ``platform`` decides when given; without one only the kernel name
+is read, never ``/etc/os-release``.
 """
 
 from __future__ import annotations
@@ -56,7 +61,7 @@ import time
 from pathlib import Path
 from typing import Callable, Iterable, Mapping
 
-from .platform import Platform, PlatformError, Target, detect_platform
+from .platform import Platform, PlatformError, Target, current_system, detect_platform
 from .runner import RunnerError
 from .transaction import DesiredEntry
 
@@ -103,6 +108,7 @@ RESTORED = "restored"
 FILES_WRITTEN = "files-written"
 
 REASON_V1_REMAPPER = "input-remapper-1.4-cannot-express-intent"
+REASON_MACOS = "not-applicable-on-macos"
 
 # Phase statuses (installer/phases.py contract).
 PASS = "PASS"
@@ -992,6 +998,19 @@ def _error(phase: str, exc: BaseException, **details) -> dict:
             "details": details}
 
 
+def _macos_skip(phase: str, platform: Platform | None) -> dict | None:
+    """``SKIPPED`` on macOS (no GNOME, no input-remapper), else None.
+
+    The given platform decides; without one the kernel name does, because
+    :func:`detect_platform` would run the macOS probes only to learn this.
+    """
+
+    system = platform.system if platform is not None else current_system()
+    if system != "darwin":
+        return None
+    return {"phase": phase, "status": SKIPPED, "reasons": [REASON_MACOS], "details": {}}
+
+
 # --------------------------------------------------------------------------
 # Public entry points
 
@@ -1010,6 +1029,9 @@ def apply_or_defer(target: Target, runner, env: Mapping[str, str], *,
     read and written under ``gui/gui.lock`` (waiting up to LOCK_WAIT).
     """
 
+    skipped = _macos_skip("gui", platform)
+    if skipped is not None:
+        return skipped
     env = dict(env)
     if env.get(AUTOSTART_ENV) == "1":
         return run_autostart(target, runner, env, now=now, sleep=sleep, platform=platform,
@@ -1058,6 +1080,9 @@ def run_autostart(target: Target, runner, env: Mapping[str, str], *,
     ``gui-apply`` is never blocked for the whole schedule.
     """
 
+    skipped = _macos_skip("gui", platform)
+    if skipped is not None:
+        return skipped
     start = now()
     deadline_at = start + DEADLINE
     try:
@@ -1140,6 +1165,9 @@ def restore_gui(target: Target, runner, env: Mapping[str, str],
     """
 
     phase = "gui-restore"
+    skipped = _macos_skip(phase, platform)
+    if skipped is not None:
+        return skipped
     env = dict(env)
     name = "baseline" if generation is None else generation
     try:

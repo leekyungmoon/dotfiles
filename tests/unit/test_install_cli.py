@@ -41,8 +41,12 @@ class ScriptedRunner(Runner):
         rc = self.responses.get(tuple(argv[:3]), 0)
         return subprocess.CompletedProcess(argv, rc, b"", b"")
 
-    def which(self, name):
+    def which(self, name, path=None):
         return self.whiches.get(name)
+
+
+NOBLE = Platform("ubuntu", "24.04", "amd64")
+TAHOE = Platform("macos", "26", "arm64", "darwin")
 
 
 def make_target(home: Path) -> Target:
@@ -61,9 +65,8 @@ class TempHome(unittest.TestCase):
     def tearDown(self):
         self._tmp.cleanup()
 
-    def ctx(self, runner=None) -> install.Context:
-        return install.Context(target=self.target,
-                               platform=Platform("ubuntu", "24.04", "amd64"),
+    def ctx(self, runner=None, platform=NOBLE) -> install.Context:
+        return install.Context(target=self.target, platform=platform,
                                runner=runner or ScriptedRunner(), env={},
                                run_id="20260101T000000Z-0123abcd")
 
@@ -805,6 +808,10 @@ class GenerationTests(TempHome):
         self.assertEqual(r.reasons, [])
 
 
+# These read /proc, which only Linux has; macOS process inspection
+# (installer/darwin_proc.py) needs its own tests.
+LINUX_PROC = unittest.skipUnless(sys.platform.startswith("linux"), "reads /proc")
+
 # One rule for "an interactive shell invocation", shared by the tmux
 # converge (installer/phases.py) and bin/dotfiles' parent check.
 INTERACTIVE_ARGVS = (
@@ -938,6 +945,7 @@ class ConvergeUnitTests(TempHome):
             time.sleep(0.01)
         self.fail(f"{pid} never became {comm}")
 
+    @LINUX_PROC
     def test_shell_hooked(self):
         path = self.hook_file()
         self.assertEqual(path, self.target.state_root / "shell-hook")
@@ -974,6 +982,7 @@ class ConvergeUnitTests(TempHome):
         with mock.patch.object(phases.os, "listdir", side_effect=PermissionError("no")):
             self.assertIsNone(phases.shell_hooked(os.getpid(), self.hook_file()))
 
+    @LINUX_PROC
     def test_shell_restart_check_without_a_terminal(self):
         def shell(script):
             return subprocess.Popen(["/bin/sh", "-c", script], start_new_session=True,
@@ -1010,6 +1019,7 @@ class ConvergeUnitTests(TempHome):
         with mock.patch.object(phases.os, "readlink", return_value="/usr/bin/zsh (deleted)"):
             self.assertEqual(phases._exe_name(1), "zsh")
 
+    @LINUX_PROC
     def test_pane_check_uses_what_tmux_knows(self):
         fields = ["%1", str(os.getpid()), "0", "0", "0", "30", "/dev/pts/0", "zsh",
                   "1", "0", "s"]
@@ -1476,7 +1486,10 @@ class PostInstallTests(TempHome):
 
 
 def _real_tmux() -> str | None:
-    for candidate in ("/usr/bin/tmux", "/bin/tmux"):
+    candidates = ("/usr/bin/tmux", "/bin/tmux")
+    if sys.platform == "darwin":  # Homebrew's, Apple silicon then Intel
+        candidates += ("/opt/homebrew/bin/tmux", "/usr/local/bin/tmux")
+    for candidate in candidates:
         if os.access(candidate, os.X_OK):
             return candidate
     return None
@@ -1487,7 +1500,7 @@ class TmuxSmokeTests(TempHome):
     """Real tmux on a private socket; never the caller's server."""
 
     class TmuxRunner(Runner):
-        def which(self, name):
+        def which(self, name, path=None):
             return _real_tmux() if name == "tmux" else None
 
     def smoke(self, conf: str):
@@ -1750,6 +1763,578 @@ class AiCliChoiceTests(unittest.TestCase):
         opts = install.options_from(args)
         self.assertIsNone(opts.claude_code)
         self.assertIs(opts.codex, False)
+
+
+# --- macOS and manifest conditions ---------------------------------------------
+
+
+class ConditionFactsTests(TempHome):
+    """One place decides which manifest conditions hold for a run."""
+
+    def test_linux_asks_for_a_systemd_user_manager(self):
+        for supported in (True, False):
+            with mock.patch.object(phases, "systemd_user_supported",
+                                   return_value=supported) as probe:
+                facts = install.condition_facts(self.ctx())
+            self.assertEqual(facts, {"always": True, "linux": True, "darwin": False,
+                                     "systemd-user": supported})
+            probe.assert_called_once()
+
+    def test_macos_never_asks_for_systemd(self):
+        with mock.patch.object(phases, "systemd_user_supported",
+                               side_effect=AssertionError("systemd probed on macOS")):
+            facts = install.condition_facts(self.ctx(platform=TAHOE))
+        self.assertEqual(facts, {"always": True, "linux": False, "darwin": True,
+                                 "systemd-user": False})
+        self.assertEqual(install.platform_system(self.ctx(platform=TAHOE)), "darwin")
+
+    def test_status_and_restore_use_the_kernel_name(self):
+        # Neither detects a platform (they run from anywhere, on any host).
+        with mock.patch.object(install.plat, "current_system", return_value="darwin"), \
+                mock.patch.object(phases, "systemd_user_supported",
+                                  side_effect=AssertionError("systemd probed on macOS")):
+            ctx = self.ctx(platform=None)
+            self.assertEqual(install.platform_system(ctx), "darwin")
+            self.assertTrue(install.condition_facts(ctx)["darwin"])
+        with mock.patch.object(install.plat, "current_system", return_value="linux"), \
+                mock.patch.object(phases, "systemd_user_supported", return_value=True):
+            self.assertEqual(install.condition_facts(self.ctx(platform=None)),
+                             {"always": True, "linux": True, "darwin": False,
+                              "systemd-user": True})
+
+    def test_facts_are_computed_once_per_run(self):
+        ctx = self.ctx()
+        with mock.patch.object(phases, "systemd_user_supported", return_value=False) as probe:
+            first = install.condition_facts(ctx)
+            first["systemd-user"] = True  # a caller's copy, not the run's facts
+            self.assertFalse(install.condition_facts(ctx)["systemd-user"])
+        probe.assert_called_once()
+
+    @unittest.skipUnless(sys.platform == "darwin", "needs a real macOS kernel name")
+    def test_real_kernel_name_on_macos(self):
+        with mock.patch.object(phases, "systemd_user_supported",
+                               side_effect=AssertionError("systemd probed on macOS")):
+            self.assertEqual(install.condition_facts(self.ctx(platform=None)),
+                             {"always": True, "linux": False, "darwin": True,
+                              "systemd-user": False})
+
+
+class PlatformManifestTests(TempHome):
+    """The transaction and --dry-run install only the entries whose condition
+    holds; Linux reports a missing systemd exactly as before, macOS names the
+    other platform's entries once."""
+
+    def setUp(self):
+        super().setUp()
+        self.repo = Path(self._tmp.name) / "repo"
+        (self.repo / "manifests").mkdir(parents=True)
+        (self.repo / "systemd").mkdir()
+        for name in ("bashrc", "Xmodmap", "agent"):
+            (self.repo / name).write_text(f"# {name}\n")
+        (self.repo / "systemd" / "tmux.service").write_text("[Unit]\n")
+        entries = [
+            {"id": "bashrc", "dest": "{home}/.bashrc", "kind": "symlink", "source": "bashrc"},
+            {"id": "xmodmap", "dest": "{home}/.Xmodmap", "kind": "symlink",
+             "source": "Xmodmap", "condition": "linux"},
+            {"id": "mac-only", "dest": "{home}/.mac-only", "kind": "symlink",
+             "source": "agent", "condition": "darwin"},
+            {"id": "systemd-tmux-service", "dest": "{config}/systemd/user/tmux.service",
+             "kind": "copy", "source": "systemd/tmux.service", "mode": "0644",
+             "condition": "systemd-user"},
+            {"id": "systemd-enable-tmux-service",
+             "dest": "{config}/systemd/user/default.target.wants/tmux.service",
+             "kind": "link", "link_to": "{config}/systemd/user/tmux.service",
+             "condition": "systemd-user"},
+        ]
+        (self.repo / "manifests" / "managed-paths.json").write_text(
+            json.dumps({"schema": 1, "entries": entries}))
+        self.service = self.target.config_home / "systemd/user/tmux.service"
+        self.wants = self.target.config_home / "systemd/user/default.target.wants/tmux.service"
+        self.systemd_ids = ["systemd-tmux-service", "systemd-enable-tmux-service"]
+
+    def ctx(self, runner=None, platform=NOBLE):
+        from installer.transaction import new_run_id
+        ctx = super().ctx(runner, platform=platform)
+        ctx.repo_root = self.repo
+        ctx.run_id = new_run_id()
+        return ctx
+
+    def systemd(self, supported):
+        if supported is None:  # macOS: must not even be asked
+            return mock.patch.object(phases, "systemd_user_supported",
+                                     side_effect=AssertionError("systemd probed on macOS"))
+        return mock.patch.object(phases, "systemd_user_supported", return_value=supported)
+
+    def transaction(self, platform=NOBLE, systemd=True):
+        ui.configure(enabled=False)
+        with self.systemd(systemd), redirect_stdout(io.StringIO()) as out:
+            result, applied = install.transaction_phase(self.ctx(platform=platform))
+        self.assertEqual(result.status, "PASS", result.reasons)
+        return result, applied, out.getvalue()
+
+    def test_linux_with_systemd(self):
+        result, applied, out = self.transaction(NOBLE, True)
+        self.assertTrue(applied)
+        self.assertEqual(result.reasons, [])
+        self.assertTrue((self.home / ".bashrc").is_symlink())
+        self.assertTrue((self.home / ".Xmodmap").is_symlink())
+        self.assertTrue(self.service.is_file())
+        self.assertTrue(self.wants.is_symlink())
+        self.assertFalse(os.path.lexists(self.home / ".mac-only"))
+        self.assertNotIn("skipped_ids", result.details)
+        self.assertNotIn("not_applicable_ids", result.details)
+        self.assertNotIn("not applicable", out)
+        self.assertNotIn("mac-only", out)
+
+    def test_linux_without_systemd_is_reported_as_before(self):
+        result, applied, out = self.transaction(NOBLE, False)
+        self.assertFalse(applied)
+        self.assertEqual(result.reasons,
+                         ["systemd-user entries skipped: no systemd user manager"])
+        self.assertEqual(result.details["skipped_ids"], self.systemd_ids)
+        lines = out.splitlines()
+        for dest in (self.service, self.wants):
+            self.assertIn(ui.target_line(dest, "skipped (no systemd user manager)"), lines)
+            self.assertFalse(os.path.lexists(dest))
+        self.assertTrue((self.home / ".Xmodmap").is_symlink())
+        # A macOS-only entry is left out silently on Linux.
+        self.assertFalse(os.path.lexists(self.home / ".mac-only"))
+        self.assertNotIn("mac-only", out)
+        self.assertNotIn("not_applicable_ids", result.details)
+
+    def test_macos_names_the_other_platform_once(self):
+        result, applied, out = self.transaction(TAHOE, None)
+        self.assertFalse(applied)
+        self.assertEqual(result.reasons, [])  # a platform difference, not a fault
+        self.assertTrue((self.home / ".bashrc").is_symlink())
+        self.assertTrue((self.home / ".mac-only").is_symlink())
+        for dest in (self.home / ".Xmodmap", self.service, self.wants):
+            self.assertFalse(os.path.lexists(dest), dest)
+        self.assertEqual(result.details["not_applicable_ids"],
+                         sorted(self.systemd_ids + ["xmodmap"]))
+        self.assertNotIn("skipped_ids", result.details)
+        lines = out.splitlines()
+        self.assertEqual([line for line in lines if "not applicable" in line], [
+            ui.target_line("Linux-only files", "not applicable on macOS (xmodmap)"),
+            ui.target_line("systemd user units", "not applicable on macOS, which uses launchd"),
+        ])
+        self.assertNotIn("no systemd user manager", out)
+        self.assertNotIn(str(self.service), out)  # no per-entry noise
+
+    def dry_run(self, platform=NOBLE, systemd=True):
+        ui.configure(enabled=False)
+        ctx = self.ctx(platform=platform)
+        with self.systemd(systemd), \
+                mock.patch.object(install, "preflight_phase",
+                                  return_value=PhaseResult("preflight", "PASS")), \
+                redirect_stdout(io.StringIO()) as out:
+            rc = install.dry_run_install(ctx, install.Options(dry_run=True, no_packages=True))
+        self.assertEqual(rc, 0, out.getvalue())
+        self.assertEqual(list(self.home.iterdir()), [])  # a plan changes nothing
+        return out.getvalue()
+
+    def planned(self, out: str) -> list[str]:
+        return sorted(line.split()[-1] for line in out.splitlines()
+                      if line.startswith("  create "))
+
+    def test_dry_run_plans_what_the_run_would_do(self):
+        bashrc, xmodmap = str(self.home / ".bashrc"), str(self.home / ".Xmodmap")
+        mac_only = str(self.home / ".mac-only")
+        out = self.dry_run(NOBLE, True)
+        self.assertEqual(self.planned(out),
+                         sorted([bashrc, xmodmap, str(self.service), str(self.wants)]))
+        self.assertIn("[plan] PASS\n", out)
+        self.assertNotIn("mac-only", out)
+
+        out = self.dry_run(NOBLE, False)
+        self.assertEqual(self.planned(out), sorted([bashrc, xmodmap]))
+        self.assertIn(ui.target_line(self.service, "skipped (no systemd user manager)"),
+                      out.splitlines())
+        self.assertIn("[plan] PASS: systemd-user entries skipped: no systemd user manager",
+                      out)
+
+        out = self.dry_run(TAHOE, None)
+        self.assertEqual(self.planned(out), sorted([bashrc, mac_only]))
+        self.assertIn(ui.target_line("systemd user units",
+                                     "not applicable on macOS, which uses launchd"),
+                      out.splitlines())
+        self.assertIn(ui.target_line("Linux-only files", "not applicable on macOS (xmodmap)"),
+                      out.splitlines())
+        self.assertIn("[plan] PASS\n", out)
+
+
+class MacosGuiTests(TempHome):
+    """GNOME settings, input-remapper and their autostart entry are Linux only."""
+
+    def test_gui_phase_is_not_applicable_and_loads_nothing(self):
+        with mock.patch.object(install, "load_seam",
+                               side_effect=AssertionError("gui module loaded on macOS")):
+            for disabled in (False, True):
+                result = install.gui_phase(self.ctx(platform=TAHOE), disabled=disabled)
+                self.assertEqual((result.status, result.reasons),
+                                 ("SKIPPED", ["not-applicable-on-macos"]))
+
+    def test_gui_phase_hands_the_platform_to_the_module(self):
+        seen = {}
+
+        def new_style(target, runner, env, *, platform=None):
+            seen["platform"] = platform
+            return {"phase": "gui", "status": "PASS", "reasons": [], "details": {}}
+
+        def old_style(target, runner, env):
+            return {"phase": "gui", "status": "PENDING_GUI", "reasons": ["x"], "details": {}}
+
+        def catch_all(*args, **kwargs):
+            seen["kwargs"] = kwargs
+            return {"phase": "gui", "status": "PASS"}
+
+        ctx = self.ctx()
+        with mock.patch.object(install, "load_seam", return_value=new_style):
+            self.assertEqual(install.gui_phase(ctx, disabled=False).status, "PASS")
+        self.assertIs(seen["platform"], ctx.platform)
+        with mock.patch.object(install, "load_seam", return_value=old_style):
+            self.assertEqual(install.gui_phase(ctx, disabled=False).status, "PENDING_GUI")
+        with mock.patch.object(install, "load_seam", return_value=catch_all):
+            install.gui_phase(ctx, disabled=False)
+        self.assertEqual(seen["kwargs"], {"platform": ctx.platform})
+
+    def test_real_gui_module_does_not_detect_the_platform_again(self):
+        from installer import gui
+        with mock.patch.object(gui, "detect_platform",
+                               side_effect=AssertionError("os-release read again")):
+            result = install.gui_phase(self.ctx(), disabled=False)
+        # No GNOME session in this env: pending, not a detection failure.
+        self.assertEqual(result.status, "PENDING_GUI", result.reasons)
+
+    def test_no_autostart_entry_on_macos(self):
+        from installer.transaction import DesiredEntry
+        link = {"id": "tool-link-fzf", "dest": str(self.home / ".local/bin/fzf"),
+                "link_text": "/opt/fzf"}
+        asked = []
+
+        def seam(module, name):
+            asked.append((module, name))
+            if (module, name) == ("packages", "link_requests"):
+                return lambda details: [DesiredEntry(e["id"], Path(e["dest"]), "symlink",
+                                                     link_text=e["link_text"])
+                                        for e in details["links"]]
+            if module == "gui":
+                raise AssertionError(f"gui seam {name} asked on macOS")
+            return None
+
+        packages = PhaseResult("packages", "PASS", [], {"links": [link]})
+        ctx = self.ctx(platform=TAHOE)
+        with mock.patch.object(install, "load_seam", side_effect=seam), \
+                mock.patch.object(install, "_managed_entries",
+                                  return_value={"gui-autostart": {"dest": "x"}}):
+            for no_gui in (False, True):
+                entries, warnings = install.extra_desired_entries(ctx, packages,
+                                                                  no_gui=no_gui)
+                self.assertEqual([e.id for e in entries], ["tool-link-fzf"])
+                self.assertEqual(warnings, [])
+        self.assertNotIn(("gui", "autostart_desired_entry"), asked)
+
+    def test_pipeline_titles_and_skips_the_desktop_section(self):
+        def run(platform):
+            ctx = self.ctx(platform=platform)
+            ctx.current_shell = "/bin/zsh"
+            passed = lambda name: PhaseResult(name, "PASS")  # noqa: E731
+            preflight = mock.Mock(return_value=passed("preflight"))
+            ui.configure(enabled=False)
+            with mock.patch.object(install, "preflight_phase", preflight), \
+                    mock.patch.object(install, "packages_phase",
+                                      return_value=PhaseResult("packages", "SKIPPED")), \
+                    mock.patch.object(install, "extra_desired_entries",
+                                      return_value=([], [])), \
+                    mock.patch.object(install, "transaction_phase",
+                                      return_value=(passed("transaction"), False)), \
+                    mock.patch.object(phases, "post_install_phase",
+                                      return_value=passed("post-install")), \
+                    mock.patch.object(phases, "smoke_phase", return_value=passed("smoke")), \
+                    mock.patch.object(phases, "git_identity_phase",
+                                      return_value=passed("git-identity")), \
+                    mock.patch.object(phases, "auth_phase",
+                                      return_value=PhaseResult("auth", "SKIPPED")), \
+                    mock.patch.object(install, "load_seam", return_value=None), \
+                    redirect_stdout(io.StringIO()) as out:
+                rc = install.run_pipeline(ctx, "install", install.Options(no_packages=True))
+            self.assertEqual(preflight.call_args.kwargs, {"packages": False})
+            status = {p["phase"]: p for p in phases.read_status(self.target)["phases"]}
+            return rc, out.getvalue(), status["gui"]
+
+        rc, out, gui = run(TAHOE)
+        self.assertEqual(rc, 0)
+        self.assertIn("Desktop settings", out)
+        self.assertNotIn("GNOME settings", out)
+        self.assertEqual((gui["status"], gui["reasons"]), ("SKIPPED", ["not-applicable-on-macos"]))
+        rc, out, gui = run(NOBLE)
+        self.assertIn("GNOME settings", out)
+        self.assertNotIn("Desktop settings", out)
+        self.assertEqual((gui["status"], gui["reasons"]), ("SKIPPED", ["gui-phase-not-available"]))
+
+    def run_restore(self, system, seam):
+        from argparse import Namespace
+        ctx = self.ctx(platform=None)  # restore detects no platform
+        args = Namespace(baseline=True, run=None, force=False, ids=None)
+        restored = {"restored": ["zshrc"], "forced": [], "unchanged": [], "backup_dir": None}
+        ui.configure(enabled=False)
+        with mock.patch.object(install.plat, "current_system", return_value=system), \
+                mock.patch("installer.transaction.restore", return_value=restored), \
+                mock.patch.object(install, "load_seam", side_effect=seam), \
+                redirect_stdout(io.StringIO()) as out:
+            rc = install.cmd_restore(ctx, args)
+        text = out.getvalue()
+        return rc, json.loads(text[text.index("{\n"):])
+
+    def test_restore_baseline_skips_the_gui_on_macos(self):
+        def seam(module, name):
+            raise AssertionError(f"{module}.{name} asked on macOS")
+
+        rc, data = self.run_restore("darwin", seam)
+        self.assertEqual(rc, 0)
+        self.assertEqual(data["restored"], ["zshrc"])
+        self.assertNotIn("gui", data)
+
+    def test_restore_baseline_still_restores_gnome_on_linux(self):
+        seen = {}
+
+        def restore_gui(target, runner, env, generation=None, *, platform=None):
+            seen["platform"] = platform
+            return {"phase": "gui-restore", "status": "PASS", "reasons": [], "details": {}}
+
+        rc, data = self.run_restore("linux", lambda module, name: restore_gui)
+        self.assertEqual(rc, 0)
+        self.assertEqual(data["gui"]["status"], "PASS")
+        # No platform was detected for restore: none is handed over either.
+        self.assertIsNone(seen["platform"])
+
+
+class MacosMainTests(TempHome):
+    # The gate tests' fake passwd and main() runner, without their tests.
+    passwd = MainGateTests.passwd
+    run_main = MainGateTests.run_main
+
+    def test_gui_apply_is_refused_on_macos(self):
+        elsewhere = Path(self._tmp.name) / "elsewhere"
+        elsewhere.mkdir()
+        for here in (None, elsewhere):
+            runner = ScriptedRunner()
+            kw = {} if here is None else {"here": here}
+            rc, _, err = self.run_main(["gui-apply"], runner=runner,
+                                       detect=lambda: TAHOE, **kw)
+            self.assertEqual(rc, 2)
+            self.assertIn("gui-apply", err)
+            self.assertIn("macOS", err)
+            self.assertNotIn("clone", err)  # refused before the location gate
+            self.assertEqual(runner.calls, [])
+        self.assertEqual(list(self.home.iterdir()), [])
+
+    def test_macos_reaches_the_location_gate(self):
+        elsewhere = Path(self._tmp.name) / "elsewhere"
+        elsewhere.mkdir()
+        rc, _, err = self.run_main([], runner=ScriptedRunner(), detect=lambda: TAHOE,
+                                   here=elsewhere)
+        self.assertEqual(rc, 2)
+        self.assertIn("~/.dotfiles && ~/.dotfiles/install", err)
+        self.assertEqual(list(self.home.iterdir()), [])
+
+
+class PreflightTests(TempHome):
+    """Platform line and Python/git/download remedies per platform."""
+
+    class XcodeRunner(ScriptedRunner):
+        """``xcode-select -p`` answers with ``(rc, developer dir)`` or raises."""
+
+        def __init__(self, git, xcode=(0, ""), **kw):
+            super().__init__(which={"git": git} if git else {}, **kw)
+            self.xcode = xcode
+            self.read_only = {}
+
+        def run(self, argv, *, timeout, check=True, env=None, input=None, cwd=None,
+                read_only=False):
+            argv = [str(a) for a in argv]
+            if argv == [install.XCODE_SELECT, "-p"]:
+                self.calls.append(argv)
+                self.read_only["xcode-select"] = read_only
+                if isinstance(self.xcode, Exception):
+                    raise self.xcode
+                rc, out = self.xcode
+                return subprocess.CompletedProcess(argv, rc, out.encode(), b"")
+            return super().run(argv, timeout=timeout, check=check, env=env,
+                               input=input, cwd=cwd, read_only=read_only)
+
+    def setUp(self):
+        super().setUp()
+        (self.target.repo_root / ".git").mkdir(parents=True)  # a checkout
+        ui.configure(enabled=False)
+        self.clean = mock.patch.multiple(install, _ssl_ca_problem=mock.Mock(return_value=None),
+                                         _lzma_problem=mock.Mock(return_value=None))
+
+    def preflight(self, runner, platform=NOBLE, **kw):
+        with redirect_stdout(io.StringIO()) as out:
+            result = install.preflight_phase(self.ctx(runner, platform=platform), **kw)
+        return result, out.getvalue()
+
+    def test_linux_is_unchanged(self):
+        runner = self.XcodeRunner("/usr/bin/git")
+        with mock.patch.multiple(install, _ssl_ca_problem=mock.DEFAULT,
+                                 _lzma_problem=mock.DEFAULT) as probes:
+            for probe in probes.values():
+                probe.side_effect = AssertionError("macOS probe on Linux")
+            result, out = self.preflight(runner)
+        self.assertEqual(result.status, "PASS", result.reasons)
+        self.assertIn(ui.target_line("platform", "ubuntu 24.04 (amd64)"), out.splitlines())
+        self.assertNotIn([install.XCODE_SELECT, "-p"], runner.calls)
+        self.assertNotIn("best_effort", result.details)
+
+    def test_macos_platform_line(self):
+        with self.clean:
+            result, out = self.preflight(self.XcodeRunner("/opt/homebrew/bin/git"), TAHOE)
+        self.assertEqual(result.status, "PASS", result.reasons)
+        self.assertIn(ui.target_line("platform", "macos 26 Tahoe (arm64)"), out.splitlines())
+        self.assertNotIn("best effort", out)
+        intel = Platform("macos", "26", "amd64", "darwin")
+        with self.clean:
+            result, out = self.preflight(self.XcodeRunner("/usr/local/bin/git"), intel)
+        self.assertEqual(result.status, "PASS", result.reasons)
+        self.assertIn(ui.target_line("platform", "macos 26 Tahoe (amd64)"), out.splitlines())
+        self.assertIn("best effort", out)
+        self.assertTrue(result.details["best_effort"])
+
+    def test_python_remedy(self):
+        with mock.patch.object(install, "MIN_PYTHON", (99, 0)):
+            result, _ = self.preflight(self.XcodeRunner("/usr/bin/git"))
+            self.assertEqual(result.reasons, ["python 3.10+ is required"])  # as before
+            with self.clean:
+                result, _ = self.preflight(self.XcodeRunner("/opt/homebrew/bin/git"), TAHOE)
+        self.assertEqual(result.status, "FAIL")
+        self.assertEqual(len(result.reasons), 1)
+        self.assertTrue(result.reasons[0].startswith("python 99.0+ is required"))
+        self.assertIn("brew install python3", result.reasons[0])
+        self.assertIn("~/.dotfiles/install", result.reasons[0])
+        self.assertIn(sys.executable, result.reasons[0])
+
+    def test_git_remedy(self):
+        result, _ = self.preflight(self.XcodeRunner(None))
+        self.assertEqual(result.reasons, ["git is not installed (run etc/install, or: "
+                                          "sudo apt-get install -y git)"])
+        with self.clean:
+            result, _ = self.preflight(self.XcodeRunner(None), TAHOE)
+        self.assertEqual(result.status, "FAIL")
+        self.assertIn("xcode-select --install", result.reasons[0])
+        self.assertIn("brew install git", result.reasons[0])
+        self.assertNotIn("apt-get", result.reasons[0])
+
+    def test_command_line_tools_git_stub(self):
+        developer_dir = Path(self._tmp.name) / "CommandLineTools"
+        developer_dir.mkdir()
+        for xcode in ((2, ""), (0, str(Path(self._tmp.name) / "gone")),
+                      RuntimeError("xcode-select: cannot execute")):
+            with self.subTest(xcode=xcode):
+                runner = self.XcodeRunner("/usr/bin/git", xcode=xcode)
+                with self.clean:
+                    result, _ = self.preflight(runner, TAHOE)
+                self.assertEqual(result.status, "FAIL")
+                self.assertEqual(len(result.reasons), 1)
+                self.assertIn("Command Line Tools", result.reasons[0])
+                self.assertIn("xcode-select --install", result.reasons[0])
+                self.assertIn("brew install git", result.reasons[0])
+                self.assertIs(runner.read_only["xcode-select"], True)
+                # The shim itself never runs (it would open the install dialog).
+                self.assertFalse(any(c[0] == "/usr/bin/git" for c in runner.calls))
+        runner = self.XcodeRunner("/usr/bin/git", xcode=(0, f"{developer_dir}\n"))
+        with self.clean:
+            result, _ = self.preflight(runner, TAHOE)
+        self.assertEqual(result.status, "PASS", result.reasons)
+        # A git outside /usr/bin does not need the tools: no probe at all.
+        runner = self.XcodeRunner("/opt/homebrew/bin/git", xcode=(2, ""))
+        with self.clean:
+            result, _ = self.preflight(runner, TAHOE)
+        self.assertEqual(result.status, "PASS", result.reasons)
+        self.assertNotIn([install.XCODE_SELECT, "-p"], runner.calls)
+
+    @unittest.skipUnless(sys.platform == "darwin", "needs macOS's xcode-select")
+    def test_real_xcode_select_agrees(self):
+        # The probe reads what the real xcode-select says about this Mac.
+        done = subprocess.run([install.XCODE_SELECT, "-p"], capture_output=True,
+                              text=True, timeout=60)
+        developer_dir = done.stdout.strip()
+        stub = install._clt_git_stub(Runner(), install.MACOS_GIT_SHIM)
+        if done.returncode == 0 and os.path.isdir(developer_dir):
+            self.assertIsNone(stub)
+        else:
+            self.assertIn("xcode-select --install", stub)
+        # A git outside /usr/bin never depends on the tools.
+        self.assertIsNone(install._clt_git_stub(Runner(), "/opt/homebrew/bin/git"))
+
+    def test_download_checks_run_only_for_packages(self):
+        with mock.patch.multiple(install, _ssl_ca_problem=mock.Mock(return_value="no CA"),
+                                 _lzma_problem=mock.Mock(return_value="no lzma")):
+            result, _ = self.preflight(self.XcodeRunner("/opt/homebrew/bin/git"), TAHOE)
+            self.assertEqual(result.status, "FAIL")
+            self.assertEqual(result.reasons, ["no CA", "no lzma"])
+            result, _ = self.preflight(self.XcodeRunner("/opt/homebrew/bin/git"), TAHOE,
+                                       packages=False)
+            self.assertEqual(result.status, "PASS", result.reasons)
+            install._ssl_ca_problem.assert_called_once_with()
+            install._lzma_problem.assert_called_once_with()
+
+    def test_ssl_ca_probe(self):
+        import ssl
+        root = Path(self._tmp.name)
+        bundle, empty, certs, no_certs = (root / "cert.pem", root / "empty.pem",
+                                          root / "certs", root / "no-certs")
+        bundle.write_text("-----BEGIN CERTIFICATE-----\n")
+        empty.write_text("")
+        certs.mkdir()
+        (certs / "0123abcd.0").write_text("x")
+        no_certs.mkdir()
+        default = "/Library/Frameworks/Python.framework/Versions/3.13/etc/openssl/cert.pem"
+
+        def paths(cafile=None, capath=None):
+            return ssl.DefaultVerifyPaths(cafile and str(cafile), capath and str(capath),
+                                          "SSL_CERT_FILE", default, "SSL_CERT_DIR",
+                                          default.replace("cert.pem", "certs"))
+
+        from installer import downloads
+        # The macOS remedy for this Python (Homebrew's or another one).
+        remedy = downloads.certificate_remedy("darwin")
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("SSL_CERT_FILE", None)
+            self.assertIsNone(install._ssl_ca_problem(paths(cafile=bundle)))
+            self.assertIsNone(install._ssl_ca_problem(paths(capath=certs)))
+            self.assertIsNone(install._ssl_ca_problem(paths(cafile=empty, capath=certs)))
+            for missing in (paths(), paths(cafile=empty), paths(capath=no_certs)):
+                problem = install._ssl_ca_problem(missing)
+                self.assertIn(default, problem)
+                self.assertIn(remedy, problem)
+            os.environ["SSL_CERT_FILE"] = str(root / "missing.pem")
+            self.assertIn(str(root / "missing.pem"), install._ssl_ca_problem(paths()))
+        # A python.org Python is told about its certificate installer.
+        python_org = "/Library/Frameworks/Python.framework/Versions/3.13"
+        with mock.patch.object(downloads, "sys", mock.Mock(platform="darwin",
+                                                          base_prefix=python_org)):
+            problem = install._ssl_ca_problem(paths())
+        self.assertIn("Install Certificates.command", problem)
+        self.assertIn("brew install python3", problem)
+
+    def test_lzma_probe(self):
+        real = install.importlib.import_module
+
+        def without_lzma(name, *args):
+            if name == "lzma":
+                raise ImportError("No module named '_lzma'")
+            return real(name, *args)
+
+        with mock.patch.object(install.importlib, "import_module", side_effect=without_lzma):
+            problem = install._lzma_problem()
+        self.assertIn("lzma", problem)
+        self.assertIn("brew install python3", problem)
+        try:
+            real("lzma")
+        except ImportError:  # this Python really lacks it
+            return
+        self.assertIsNone(install._lzma_problem())
 
 
 if __name__ == "__main__":

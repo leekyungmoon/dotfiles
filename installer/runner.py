@@ -93,8 +93,16 @@ class Runner:
             raise RunnerError(argv, completed.returncode, _tail(completed.stderr))
         return completed
 
-    def which(self, name: str) -> str | None:
-        return shutil.which(name)
+    def which(self, name: str, path: str | None = None) -> str | None:
+        """``shutil.which``: search ``path`` (directories joined with
+        ``os.pathsep``) when given, else this process's own PATH.
+
+        ``path`` lets a caller look a tool up where its children will find
+        it (on macOS, Homebrew's bin directory is often missing from the
+        installer's PATH right after Homebrew installed the tool).
+        """
+
+        return shutil.which(name, path=path)
 
 
 class DryRunRunner(Runner):

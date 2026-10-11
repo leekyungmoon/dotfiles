@@ -33,6 +33,11 @@ def make_target(home: Path, **overrides) -> Target:
     return Target(**values)
 
 
+# One name, two Unicode spellings: precomposed (NFC) and decomposed (NFD).
+NFC_CAFE = "caf\u00e9"
+NFD_CAFE = "cafe\u0301"
+
+
 def manifest_bytes(entries, **top) -> bytes:
     payload = {"schema": 1, "entries": entries}
     payload.update(top)
@@ -165,6 +170,91 @@ class ValidManifestTests(ManifestTestCase):
             if entry.dest.startswith("{config}/systemd/user/") and entry.source:
                 with self.subTest(entry_id=entry.id):
                     self.assertEqual(entry.kind, "copy")
+
+    def test_platform_conditions(self):
+        resolved = self.resolve(
+            [
+                {"id": "zshrc", "dest": "{home}/.zshrc", "kind": "symlink",
+                 "source": "zsh/zshrc", "condition": "linux"},
+                {"id": "agent", "dest": "{home}/Library/LaunchAgents/x.plist",
+                 "kind": "copy", "source": "systemd/tmux.service", "condition": "darwin"},
+            ]
+        )
+        self.assertEqual({e.id: e.condition for e in resolved},
+                         {"zshrc": "linux", "agent": "darwin"})
+        self.assertEqual(mf.CONDITIONS, ("always", "systemd-user", "linux", "darwin"))
+
+    def test_library_files_are_allowed_one_by_one(self):
+        # A LaunchAgent plist is managed as one file inside the protected
+        # ~/Library/LaunchAgents, never as the directory.
+        resolved = self.resolve(
+            [{"id": "agent", "dest": "{home}/Library/LaunchAgents/com.example.x.plist",
+              "kind": "remove"},
+             {"id": "prefs", "dest": "{home}/Library/Preferences/com.example.x.plist",
+              "kind": "remove"},
+             {"id": "app-data", "dest": "{home}/Library/Application Support/x/config",
+              "kind": "remove"}]
+        )
+        self.assertEqual(resolved[0].dest,
+                         self.home / "Library" / "LaunchAgents" / "com.example.x.plist")
+
+    def test_repository_linux_desktop_files_are_linux_only(self):
+        manifest = mf.load_manifest(REPO_ROOT / "manifests" / "managed-paths.json")
+        conditions = {e.id: e.condition for e in manifest.entries}
+        for entry_id in ("gtkrc", "xmodmap", "terminator"):
+            with self.subTest(entry_id=entry_id):
+                self.assertEqual(conditions[entry_id], "linux")
+        # The clipboard shims stay on both platforms (native fast path on macOS).
+        for entry_id in ("bin-pbcopy", "bin-pbpaste"):
+            with self.subTest(entry_id=entry_id):
+                self.assertEqual(conditions[entry_id], "always")
+        for entry in manifest.entries:
+            if entry.id.startswith("systemd-"):
+                with self.subTest(entry_id=entry.id):
+                    self.assertEqual(entry.condition, "systemd-user")
+            self.assertIn(entry.condition, mf.CONDITIONS)
+
+    def test_repository_dests_are_caselessly_distinct(self):
+        """The repository manifest still passes the macOS (caseless) rules,
+        without needing the submodules checked out."""
+
+        manifest = mf.load_manifest(REPO_ROOT / "manifests" / "managed-paths.json")
+        keys = [mf.caseless_key(e.dest) for e in manifest.entries]
+        self.assertEqual(len(keys), len(set(keys)))
+        present = tuple(e for e in manifest.entries
+                        if e.source is None or os.path.lexists(REPO_ROOT / e.source))
+        import dataclasses
+
+        mf.resolve(dataclasses.replace(manifest, entries=present), self.target, REPO_ROOT)
+
+    def test_caseless_key(self):
+        self.assertEqual(mf.caseless_key("{home}/.Xmodmap"), mf.caseless_key("{home}/.xmodmap"))
+        # NFC and NFD spellings of 'caf\u00e9' are one name on APFS (escaped,
+        # so an editor cannot normalize the two spellings into one).
+        self.assertNotEqual(NFC_CAFE, NFD_CAFE)
+        self.assertEqual(mf.caseless_key(NFC_CAFE), mf.caseless_key(NFD_CAFE))
+        self.assertEqual(mf.caseless_key("CAF\u00c9"), NFC_CAFE)
+        self.assertEqual(mf.caseless_key("설정 file"), "설정 file")
+        self.assertNotEqual(mf.caseless_key("{home}/.a"), mf.caseless_key("{home}/.b"))
+
+    @unittest.skipUnless(sys.platform == "darwin", "needs macOS's default APFS")
+    def test_caseless_key_matches_the_filesystem(self):
+        """Names with one caseless key are one file on the default APFS."""
+
+        probe = self.tmp / "Probe"
+        probe.write_text("x")
+        if not os.path.exists(self.tmp / "probe"):
+            self.skipTest("this volume is case-sensitive")
+        pairs = [(".Xmodmap", ".xmodmap"), (NFC_CAFE, NFD_CAFE),
+                 ("CAF\u00c9", NFC_CAFE), ("Library", "library")]
+        for index, (first, second) in enumerate(pairs):
+            with self.subTest(pair=(first, second)):
+                self.assertEqual(mf.caseless_key(first), mf.caseless_key(second))
+                folder = self.tmp / f"pair-{index}"
+                folder.mkdir()
+                (folder / first).write_text("x")
+                self.assertTrue(os.path.exists(folder / second))
+                self.assertEqual(len(os.listdir(folder)), 1)
 
 
 class RejectionTests(ManifestTestCase):
@@ -312,6 +402,54 @@ class RejectionTests(ManifestTestCase):
     def test_custom_xdg_root_cannot_be_replaced(self):
         self.target = make_target(self.home, config_home=self.home / "cfg")
         self.assertRejected([{"id": "a", "dest": "{home}/cfg", "kind": "remove"}], "broad")
+
+    def test_macos_library_roots_cannot_be_replaced(self):
+        for dest in ("{home}/Library", "{home}/Library/LaunchAgents",
+                     "{home}/Library/Application Support", "{home}/Library/Preferences"):
+            with self.subTest(dest=dest):
+                self.assertRejected([{"id": "a", "dest": dest, "kind": "remove"}], "broad")
+        # Nor through another spelling (APFS ignores case) or token.
+        self.target = make_target(self.home, data_home=self.home / "Library")
+        for dest in ("{home}/library", "{home}/LIBRARY/launchagents", "{data}/LaunchAgents",
+                     "{home}/library/application support"):
+            with self.subTest(dest=dest):
+                self.assertRejected([{"id": "a", "dest": dest, "kind": "remove"}])
+
+    def test_broad_roots_are_compared_caselessly(self):
+        for dest in ("{home}/.CONFIG", "{home}/.Local/Share", "{home}/.SSH",
+                     "{config}/Systemd/User"):
+            with self.subTest(dest=dest):
+                self.assertRejected([{"id": "a", "dest": dest, "kind": "remove"}], "broad")
+        for dest in ("{home}/.Local/State/personal-dotfiles/state.json",
+                     "{home}/.DOTFILES"):
+            with self.subTest(dest=dest):
+                self.assertRejected([{"id": "a", "dest": dest, "kind": "remove"}],
+                                    "installer-owned")
+
+    def test_dests_differing_only_in_case_or_normalization(self):
+        cases = [
+            ("{home}/.Xmodmap", "{home}/.xmodmap"),
+            ("{home}/" + NFC_CAFE, "{home}/" + NFD_CAFE),
+            ("{config}/Nvim", "{config}/nvim"),
+        ]
+        for first, second in cases:
+            with self.subTest(dests=(first, second)):
+                self.assertRejected(
+                    [{"id": "a", "dest": first, "kind": "remove"},
+                     {"id": "b", "dest": second, "kind": "remove"}],
+                    "case-insensitive filesystem",
+                )
+
+    def test_caseless_overlap_across_tokens(self):
+        # {config} is ~/.config: '{home}/.Config/nvim' is the same directory
+        # on macOS, and a file inside it would overlap it.
+        for second in ("{home}/.Config/nvim", "{home}/.config/NVIM/init.lua"):
+            with self.subTest(second=second):
+                self.assertRejected(
+                    [{"id": "nvim", "dest": "{config}/nvim", "kind": "symlink", "source": "nvim"},
+                     {"id": "b", "dest": second, "kind": "remove"}],
+                    "case-insensitive filesystem",
+                )
 
     def test_installer_roots_rejected(self):
         for dest in (

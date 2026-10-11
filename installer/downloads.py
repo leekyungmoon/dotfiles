@@ -19,6 +19,8 @@ import http.client
 import os
 import re
 import socket
+import ssl
+import sys
 import tempfile
 import time
 import urllib.error
@@ -55,6 +57,52 @@ class _HttpsOnlyRedirect(urllib.request.HTTPRedirectHandler):
 _OPENER = urllib.request.build_opener(_HttpsOnlyRedirect)
 
 
+def _certificate_failure(exc: BaseException) -> ssl.SSLCertVerificationError | None:
+    """The certificate verification error behind ``exc`` (urllib wraps it in
+    a URLError), or None."""
+
+    if isinstance(exc, ssl.SSLCertVerificationError):
+        return exc
+    reason = getattr(exc, "reason", None) if isinstance(exc, urllib.error.URLError) else None
+    return reason if isinstance(reason, ssl.SSLCertVerificationError) else None
+
+
+_PROXY_REMEDY = "behind a TLS-inspecting proxy, set SSL_CERT_FILE to its CA bundle"
+
+
+def _homebrew_python(prefix: str) -> bool:
+    """Whether ``prefix`` (``sys.base_prefix``, so a venv counts as its base)
+    is a Homebrew python formula's: <brew>/opt/python@3.x/... or its Cellar
+    path, whatever Homebrew's prefix is."""
+
+    return "/opt/python@" in prefix or "/Cellar/python@" in prefix
+
+
+def certificate_remedy(platform: str | None = None, *, prefix: str | None = None) -> str:
+    """What to do when this Python cannot verify any server certificate.
+
+    On macOS the usual cause is a python.org build, which ships no CA
+    certificates until its 'Install Certificates.command' has run, while
+    Homebrew's python3 uses Homebrew's CA bundle; when Homebrew's own python3
+    fails, that bundle (the ca-certificates formula) or a TLS-inspecting
+    proxy is the cause. ``prefix`` defaults to this Python's
+    ``sys.base_prefix``.
+    """
+
+    platform = sys.platform if platform is None else platform
+    if platform == "darwin":
+        prefix = sys.base_prefix if prefix is None else prefix
+        if _homebrew_python(prefix):
+            return ("this is Homebrew's python3: run 'brew reinstall ca-certificates "
+                    f"openssl@3', then rerun; {_PROXY_REMEDY}")
+        return ("use Homebrew's python3 ('brew install python3'; ~/.dotfiles/install "
+                "runs install.py with it), or, for a python.org Python, run "
+                "'Install Certificates.command' in its /Applications/Python 3.x folder; "
+                f"{_PROXY_REMEDY}")
+    return ("install the system CA certificates ('sudo apt-get install "
+            f"ca-certificates'); {_PROXY_REMEDY}")
+
+
 def fetch(
     url: str,
     dest: Path,
@@ -67,7 +115,8 @@ def fetch(
     """Download ``url`` to ``dest`` atomically; https only, bounded size.
 
     Transient network errors and 5xx/408/429 responses are retried; other
-    client errors and size-limit violations are not.
+    client errors, size-limit violations and certificate verification
+    failures (every retry would fail the same way) are not.
     """
 
     if not url.lower().startswith("https://"):
@@ -110,6 +159,12 @@ def fetch(
         except (urllib.error.URLError, http.client.HTTPException, socket.timeout,
                 TimeoutError, ConnectionError, OSError) as exc:
             tmp.unlink(missing_ok=True)
+            failure = _certificate_failure(exc)
+            if failure is not None:
+                detail = getattr(failure, "verify_message", None) or str(failure)
+                raise DownloadError(
+                    f"{url}: TLS certificate verification failed ({detail}); "
+                    f"{certificate_remedy()}") from None
             last = exc
     raise DownloadError(f"{url}: failed after {max(1, retries)} attempts: {last}")
 
@@ -384,8 +439,9 @@ def verify_detached(
 
 
 __all__ = [
-    "DEFAULT_MAX_BYTES", "DownloadError", "VerificationError", "crc24", "dearmor",
-    "fetch", "file_digest", "is_armored", "iter_packets", "key_fingerprint",
+    "DEFAULT_MAX_BYTES", "DownloadError", "VerificationError", "certificate_remedy",
+    "crc24", "dearmor", "fetch", "file_digest", "is_armored", "iter_packets",
+    "key_fingerprint",
     "normalize_fingerprint", "parse_checksum_file", "pinned_keyring",
     "primary_fingerprints", "verify_detached", "verify_sha256", "verify_sri",
     "write_keyring",

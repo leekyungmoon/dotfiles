@@ -86,6 +86,29 @@ class RunnerTests(unittest.TestCase):
         self.assertIsNotNone(Runner().which("sh"))
         self.assertIsNone(Runner().which("definitely-not-a-command-xyz"))
 
+    def test_which_searches_the_given_path(self):
+        # On macOS a tool Homebrew just installed is in <prefix>/bin, which
+        # the installer's own PATH often lacks; path= looks there instead.
+        with tempfile.TemporaryDirectory() as tmp:
+            first, second = Path(tmp) / "first", Path(tmp) / "second"
+            for directory in (first, second):
+                directory.mkdir()
+            tool = second / "pd-fixture-tool-xyz"
+            tool.write_text("#!/bin/sh\nexit 0\n")
+            os.chmod(tool, 0o755)
+            (first / "pd-fixture-tool-xyz").write_text("not executable\n")
+            search = os.pathsep.join([str(first), str(second)])
+            for runner in (Runner(), DryRunRunner()):
+                with self.subTest(runner=type(runner).__name__):
+                    self.assertEqual(runner.which("pd-fixture-tool-xyz", path=search),
+                                     str(tool))
+                    self.assertEqual(runner.which("pd-fixture-tool-xyz", search), str(tool))
+                    # Only the given directories: not the process PATH ...
+                    self.assertIsNone(runner.which("sh", path=str(first)))
+                    # ... and the process PATH alone without one.
+                    self.assertIsNone(runner.which("pd-fixture-tool-xyz"))
+                    self.assertEqual(runner.which("sh", path=None), Runner().which("sh"))
+
     def test_empty_argv(self):
         with self.assertRaises(RunnerError):
             Runner().run([], timeout=1)
@@ -132,6 +155,17 @@ class ScriptedRunnerTests(unittest.TestCase):
         runner = Scripted()
         self.assertEqual(runner.run(["apt-get", "install"], timeout=1).stdout, b"ok")
         self.assertEqual(runner.calls, [["apt-get", "install"]])
+
+    def test_which_signature_is_shared(self):
+        """Doubles that override which() take the same (name, path=None)."""
+        import inspect
+
+        expected = ["self", "name", "path"]
+        for cls in (Runner, DryRunRunner):
+            with self.subTest(cls=cls.__name__):
+                parameters = inspect.signature(cls.which).parameters
+                self.assertEqual(list(parameters), expected)
+                self.assertIsNone(parameters["path"].default)
 
 
 if __name__ == "__main__":

@@ -128,7 +128,8 @@
       "dest": "{config}/terminator",
       "kind": "symlink",
       "source": "config/terminator",
-      "description": "directory link, as upstream: an earlier upstream-style install already has exactly this link"
+      "condition": "linux",
+      "description": "directory link, as upstream: an earlier upstream-style install already has exactly this link; Terminator is a Linux terminal"
     },
     {
       "id": "pudb",
@@ -177,13 +178,16 @@
       "id": "gtkrc",
       "dest": "{home}/.gtkrc-2.0",
       "kind": "symlink",
-      "source": "gtkrc-2.0"
+      "source": "gtkrc-2.0",
+      "condition": "linux"
     },
     {
       "id": "xmodmap",
       "dest": "{home}/.Xmodmap",
       "kind": "symlink",
-      "source": "Xmodmap"
+      "source": "Xmodmap",
+      "condition": "linux",
+      "description": "Linux keycodes; XQuartz on macOS would apply them to unrelated keys"
     },
     {
       "id": "bin-dotfiles",

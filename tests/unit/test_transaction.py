@@ -475,6 +475,126 @@ class InstallTests(HomeCase):
         self.assertEqual([d.id for d in without], ["a", "r"])
         self.assertEqual(tx.skipped_by_condition(resolved, systemd_user=False), ["w", "c"])
 
+    def platform_resolved(self) -> list[ResolvedEntry]:
+        return [
+            ResolvedEntry("all", self.home / ".all", "symlink", self.tmp, "/x/all", None, "always"),
+            ResolvedEntry("lin", self.home / ".lin", "symlink", self.tmp, "/x/lin", None, "linux"),
+            ResolvedEntry("mac", self.home / ".mac", "symlink", self.tmp, "/x/mac", None, "darwin"),
+            ResolvedEntry("svc", self.home / ".svc", "link", None, "/x/svc", None, "systemd-user"),
+        ]
+
+    def test_entries_follow_the_condition_facts(self):
+        resolved = self.platform_resolved()
+        linux = {"always": True, "linux": True, "darwin": False, "systemd-user": True}
+        darwin = {"always": True, "linux": False, "darwin": True, "systemd-user": False}
+
+        def ids(facts):
+            return [d.id for d in tx.entries_from_manifest(resolved, self.target,
+                                                           conditions=facts)]
+        self.assertEqual(ids(linux), ["all", "lin", "svc"])
+        self.assertEqual(ids(dict(linux, **{"systemd-user": False})), ["all", "lin"])
+        self.assertEqual(ids(darwin), ["all", "mac"])
+        self.assertEqual(tx.skipped_by_condition(resolved, conditions=linux), ["mac"])
+        self.assertEqual(tx.skipped_by_condition(resolved, conditions=darwin), ["lin", "svc"])
+        # Explicit facts win over the systemd_user keyword.
+        self.assertEqual([d.id for d in tx.entries_from_manifest(
+            resolved, self.target, systemd_user=True, conditions=darwin)], ["all", "mac"])
+        # A condition the facts do not name is false; 'always' needs no fact.
+        self.assertEqual(ids({}), ["all"])
+        self.assertEqual(tx.skipped_by_condition(resolved, conditions={}), ["lin", "mac", "svc"])
+
+    def test_default_conditions_come_from_sys_platform(self):
+        self.assertEqual(tx.default_conditions(system="linux"),
+                         {"always": True, "linux": True, "darwin": False, "systemd-user": True})
+        self.assertEqual(tx.default_conditions(system="darwin", systemd_user=False),
+                         {"always": True, "linux": False, "darwin": True, "systemd-user": False})
+        # systemd-user stays the caller's word, as before conditions existed.
+        for system in ("linux", "darwin"):
+            for systemd in (True, False):
+                self.assertIs(tx.default_conditions(systemd_user=systemd,
+                                                    system=system)["systemd-user"], systemd)
+        self.assertEqual(tx.default_conditions(system="freebsd14", systemd_user=False),
+                         {"always": True, "linux": False, "darwin": False,
+                          "systemd-user": False})
+        resolved = self.platform_resolved()
+        # Legacy callers (no conditions): the host platform decides.
+        with mock.patch.object(tx, "sys", mock.Mock(platform="linux")):
+            self.assertEqual([d.id for d in tx.entries_from_manifest(resolved, self.target)],
+                             ["all", "lin", "svc"])
+            self.assertEqual(tx.skipped_by_condition(resolved, systemd_user=False),
+                             ["mac", "svc"])
+        with mock.patch.object(tx, "sys", mock.Mock(platform="darwin")):
+            self.assertEqual([d.id for d in tx.entries_from_manifest(
+                resolved, self.target, systemd_user=False)], ["all", "mac"])
+            self.assertEqual(tx.skipped_by_condition(resolved, systemd_user=False),
+                             ["lin", "svc"])
+            self.assertEqual(tx.skipped_by_condition(resolved), ["lin"])
+
+    def test_repository_manifest_partition_by_platform(self):
+        """No Linux-only entry lands on macOS and no macOS-only one on Linux;
+        on Linux the systemd entries follow systemd-user exactly as before."""
+
+        import dataclasses as dc
+
+        from installer import manifest as manifest_mod
+
+        loaded = manifest_mod.load_manifest(REPO_ROOT / "manifests" / "managed-paths.json")
+        # Submodule sources may not be checked out here; their entries are
+        # unconditional and change nothing about the partition.
+        present = tuple(e for e in loaded.entries
+                        if e.source is None or os.path.lexists(REPO_ROOT / e.source))
+        resolved = manifest_mod.resolve(dc.replace(loaded, entries=present), self.target,
+                                        REPO_ROOT)
+        conditions = {e.id: e.condition for e in resolved}
+        systemd_ids = {e.id for e in resolved if e.condition == "systemd-user"}
+        self.assertEqual(len(systemd_ids), 7)
+        self.assertEqual({i for i in systemd_ids if not i.startswith("systemd-")}, set())
+
+        def desired(system, systemd):
+            # As install.condition_facts builds them: no systemd user
+            # manager is ever found on macOS.
+            facts = tx.default_conditions(systemd_user=systemd, system=system)
+            return {d.id for d in tx.entries_from_manifest(resolved, self.target,
+                                                           conditions=facts)}
+
+        on_linux, on_mac = desired("linux", True), desired("darwin", False)
+        self.assertEqual({i for i in on_mac if conditions[i] in ("linux", "systemd-user")},
+                         set())
+        self.assertEqual({i for i in on_linux if conditions[i] == "darwin"}, set())
+        self.assertTrue({"gtkrc", "xmodmap", "terminator"} <= on_linux)
+        self.assertFalse({"gtkrc", "xmodmap", "terminator"} & on_mac)
+        self.assertTrue({"bin-pbcopy", "bin-pbpaste", "zshrc", "gitconfig"} <= on_mac)
+        self.assertTrue(systemd_ids <= on_linux)
+        self.assertEqual(desired("linux", False), on_linux - systemd_ids)
+        # Linux with the default facts is exactly the pre-condition behaviour:
+        # every entry except the systemd ones when systemd is missing.
+        self.assertEqual(on_linux, set(conditions))
+
+    def test_launch_agent_plists_are_managed_file_by_file(self):
+        """macOS LaunchAgents (installer-rendered entries) go into the shared
+        ~/Library/LaunchAgents one file at a time; that directory and
+        ~/Library are never replaced, under any spelling."""
+
+        agents = self.home / "Library" / "LaunchAgents"
+        agents.mkdir(parents=True)
+        other = agents / "com.example.other.plist"
+        other.write_bytes(b"<plist/>\n")
+        plist = agents / "com.github.leekyungmoon.dotfiles.tmux.plist"
+        entry = DesiredEntry("launchd-tmux", plist, "file", content=b"<plist>tmux</plist>\n",
+                             mode=0o644)
+        self.assertEqual(run_apply(self.target, [entry]).changed, ["launchd-tmux"])
+        self.assertEqual(plist.read_bytes(), b"<plist>tmux</plist>\n")
+        self.assertEqual(stat.S_IMODE(os.lstat(plist).st_mode), 0o644)
+        for dest in (agents, self.home / "Library", self.home / "library" / "launchagents",
+                     self.home / "Library" / "Preferences",
+                     self.home / "Library" / "Application Support"):
+            with self.subTest(dest=dest):
+                with self.assertRaises(TransactionError):
+                    run_apply(self.target, [entry, DesiredEntry("x", dest, "absent")])
+        tx.restore(self.target, which="baseline")
+        self.assertFalse(os.path.lexists(plist))
+        self.assertEqual(other.read_bytes(), b"<plist/>\n")
+
     def test_load_status(self):
         self.assertFalse(tx.load_status(self.target)["installed"])
         desired = self.populate()
@@ -1064,7 +1184,8 @@ class CopiedFileDriftTests(HomeCase):
         self.assertEqual(unit.read_bytes(), b"a\nedited\n")
 
     def test_every_manifest_copy_keeps_program_edits(self):
-        """gitconfig, terminator, pudb and the systemd copies, end to end."""
+        """gitconfig, pudb and the systemd copies, end to end (every copy whose
+        condition holds for a legacy caller on this host)."""
 
         import dataclasses as dc
 
@@ -1076,7 +1197,12 @@ class CopiedFileDriftTests(HomeCase):
         subset = dc.replace(loaded, entries=copies)
         resolved = manifest_mod.resolve(subset, self.target, REPO_ROOT)
         desired = tx.entries_from_manifest(resolved, self.target)
-        self.assertEqual(len(desired), len(copies))
+        # Every copy that applies to this host: all of them today, as no copy
+        # is Linux- or macOS-only and a legacy caller keeps systemd-user.
+        facts = tx.default_conditions()
+        applicable = [e for e in copies if e.condition == "always" or facts[e.condition]]
+        self.assertGreaterEqual(len(applicable), 2)
+        self.assertEqual([d.id for d in desired], [e.id for e in applicable])
         first = run_apply(self.target, desired)
         self.assertEqual(sorted(first.changed), sorted(d.id for d in desired))
         edited = {}

@@ -12,6 +12,17 @@ regular file for configs that their programs rewrite. The transaction writes
 a copy on its first install and whenever it still equals what was installed
 last time; a copy the user or a program changed since is kept and reported
 unless the install is forced (see ``installer.transaction``).
+
+Conditions: an entry is installed only where its ``condition`` holds:
+``always``, ``linux`` / ``darwin`` (the platform), or ``systemd-user`` (a
+Linux machine with systemd user managers). The installer decides which hold
+(``install.condition_facts``); this module only validates the names.
+
+Destinations are also compared caselessly (case folding plus Unicode
+normalization), as macOS compares names on its default case-insensitive
+APFS: two entries that would name one file there, or an entry that would
+take over a protected root under another spelling, are rejected on every
+platform, so a manifest that passes on Linux also holds on macOS.
 """
 
 from __future__ import annotations
@@ -21,13 +32,14 @@ import hashlib
 import json
 import os
 import re
+import unicodedata
 from pathlib import Path
 
 from .platform import APP_NAME, Target, _is_within, _resolve_existing_prefix
 
 SCHEMA = 1
 KINDS = ("symlink", "link", "copy", "remove")
-CONDITIONS = ("always", "systemd-user")
+CONDITIONS = ("always", "systemd-user", "linux", "darwin")
 COMPAT_ID = "dotfiles-compat"
 COMPAT_DEST = "{home}/.dotfiles"
 
@@ -61,7 +73,29 @@ _BROAD_TOKENS = {
     "{config}/systemd/user",
     "{config}/autostart",
     "{data}/applications",
+    # macOS: other applications' agents, data and preferences live here; a
+    # LaunchAgent plist is managed file by file, never the whole directory.
+    "{home}/Library",
+    "{home}/Library/LaunchAgents",
+    "{home}/Library/Application Support",
+    "{home}/Library/Preferences",
 }
+
+
+def caseless_key(text: str) -> str:
+    """``text`` as a case- and normalization-insensitive filesystem (macOS's
+    default APFS) compares it: Unicode canonical caseless matching
+    (NFD, then case folding), kept in NFC. Two names with the same key are
+    one file there, although Linux keeps them apart."""
+
+    return unicodedata.normalize("NFC", unicodedata.normalize("NFD", text).casefold())
+
+
+def _caseless(path: Path) -> Path:
+    return Path(caseless_key(str(path)))
+
+
+_BROAD_KEYS = frozenset(caseless_key(token) for token in _BROAD_TOKENS)
 
 
 class ManifestError(Exception):
@@ -159,7 +193,8 @@ def _parse_entry(raw: object, index: int) -> ManifestEntry:
     if kind not in KINDS:
         raise ManifestError(f"{where}: unknown kind {kind!r}; expected {KINDS}")
     dest = _check_token_path(raw.get("dest"), f"{where}.dest")
-    if dest in _BROAD_TOKENS:
+    # Caselessly: '{home}/library' is ~/Library on macOS.
+    if caseless_key(dest) in _BROAD_KEYS:
         raise ManifestError(f"{where}: dest {dest!r} is a broad shared root")
     condition = raw.get("condition", "always")
     if condition not in CONDITIONS:
@@ -217,14 +252,21 @@ def parse_manifest(data: bytes) -> Manifest:
         raise ManifestError("manifest entries must be a non-empty list")
     entries = tuple(_parse_entry(raw, i) for i, raw in enumerate(raw_entries))
     seen_ids: set[str] = set()
-    seen_dests: set[str] = set()
+    seen_dests: dict[str, str] = {}  # caseless key -> dest as written
     for entry in entries:
         if entry.id in seen_ids:
             raise ManifestError(f"duplicate entry id {entry.id!r}")
-        if entry.dest in seen_dests:
-            raise ManifestError(f"duplicate dest {entry.dest!r}")
+        key = caseless_key(entry.dest)
+        if key in seen_dests:
+            if seen_dests[key] == entry.dest:
+                raise ManifestError(f"duplicate dest {entry.dest!r}")
+            raise ManifestError(
+                f"dests {seen_dests[key]!r} and {entry.dest!r} differ only in case "
+                "or Unicode normalization; a case-insensitive filesystem (macOS) "
+                "treats them as one path"
+            )
         seen_ids.add(entry.id)
-        seen_dests.add(entry.dest)
+        seen_dests[key] = entry.dest
     return Manifest(SCHEMA, entries, hashlib.sha256(data).hexdigest())
 
 
@@ -271,6 +313,10 @@ def protected_roots(target: Target) -> list[Path]:
         config / "systemd" / "user",
         config / "autostart",
         data / "applications",
+        home / "Library",
+        home / "Library" / "LaunchAgents",
+        home / "Library" / "Application Support",
+        home / "Library" / "Preferences",
     ]
 
 
@@ -294,6 +340,11 @@ def check_dest_placement(
     in their own error type. ``allow_repo_root`` admits exactly
     ``target.repo_root`` (the checkout promotion) and nothing else inside the
     installer-owned trees.
+
+    The checks that forbid a place (protected roots, installer-owned trees)
+    also match caselessly, because on macOS ``~/library`` *is* ``~/Library``;
+    the checks that require a place (inside the home) stay exact, so case
+    folding can only ever reject more.
     """
 
     if not dest.is_absolute():
@@ -302,13 +353,16 @@ def check_dest_placement(
         raise ValueError(f"{dest} is not strictly inside {target.home}")
     if ".." in dest.parts:
         raise ValueError(f"{dest} contains traversal")
+    folded = _caseless(dest)
     for root in protected_roots(target):
-        if dest == root or _is_within(root, dest):
+        folded_root = _caseless(root)
+        if folded == folded_root or _is_within(folded_root, folded):
             raise ValueError(f"{dest} would replace the broad root {root}")
     promoting_repo = allow_repo_root and dest == target.repo_root
     if not promoting_repo:
         for root in installer_roots(target):
-            if _is_within(dest, root) or _is_within(root, dest):
+            folded_root = _caseless(root)
+            if _is_within(folded, folded_root) or _is_within(folded_root, folded):
                 raise ValueError(f"{dest} overlaps installer-owned {root}")
     resolved_home = _resolve_existing_prefix(target.home)
     resolved_parent = _resolve_existing_prefix(dest.parent)
@@ -322,8 +376,9 @@ def check_dest_placement(
     forbidden = [_resolve_existing_prefix(r) for r in installer_roots(target)]
     if os.path.lexists(target.compat_link):
         forbidden.append(_resolve_existing_prefix(target.compat_link))
+    folded_parent = _caseless(resolved_parent)
     for root in forbidden:
-        if _is_within(resolved_parent, root):
+        if _is_within(folded_parent, _caseless(root)):
             raise ValueError(
                 f"{dest} is reached through a symlinked parent into {root}"
             )
@@ -392,22 +447,34 @@ def resolve(manifest: Manifest, target: Target, repo_root: Path) -> list[Resolve
             )
         )
 
+    folded = [_caseless(entry.dest) for entry in resolved]
     for i, first in enumerate(resolved):
-        for second in resolved[i + 1 :]:
+        for j in range(i + 1, len(resolved)):
+            second = resolved[j]
             if _overlaps(first.dest, second.dest):
                 raise ManifestError(
                     f"entries {first.id!r} and {second.id!r} have overlapping "
                     f"destinations {first.dest} and {second.dest}"
+                )
+            # Different tokens can spell one path ({config}/x, {home}/.config/x),
+            # so the caseless comparison runs on the expanded paths too.
+            if _overlaps(folded[i], folded[j]):
+                raise ManifestError(
+                    f"entries {first.id!r} and {second.id!r} have overlapping "
+                    f"destinations {first.dest} and {second.dest} on a "
+                    "case-insensitive filesystem (macOS)"
                 )
     return resolved
 
 
 __all__ = [
     "COMPAT_ID",
+    "CONDITIONS",
     "Manifest",
     "ManifestEntry",
     "ManifestError",
     "ResolvedEntry",
+    "caseless_key",
     "check_dest_placement",
     "expand",
     "installer_roots",

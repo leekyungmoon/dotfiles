@@ -31,6 +31,7 @@ PROC_FIXTURE = REPO_ROOT / "tests" / "fixtures" / "input-remapper" / "proc-bus-i
 MANIFEST = gui.load_manifest()
 NOBLE = Platform("ubuntu", "24.04", "amd64")
 JAMMY = Platform("ubuntu", "22.04", "amd64")
+TAHOE = Platform("macos", "26", "arm64", "darwin")
 
 
 def fixed_path(schema: str) -> str:
@@ -73,7 +74,7 @@ class FakeDesktop:
         self.before_first_read = None
 
     # Runner API ----------------------------------------------------------
-    def which(self, name: str):
+    def which(self, name: str, path: str | None = None):
         return f"/usr/bin/{name}" if name in self.binaries else None
 
     def run(self, argv, *, timeout, check=True, env=None, input=None, cwd=None, read_only=False):
@@ -556,6 +557,63 @@ class UserValueBackupTests(GuiTestCase):
         self.assertNotIn("saved_user_values", result["details"])
         self.assertEqual(result["reasons"], [])
         self.assertEqual(self.backup_sets("reapply"), [])
+
+
+class MacosTests(GuiTestCase):
+    """macOS has neither GNOME nor input-remapper: every entry point skips
+    before touching the desktop, the state directory or os-release."""
+
+    platform = TAHOE
+
+    def assert_not_applicable(self, result, phase="gui"):
+        self.assertEqual(result, {"phase": phase, "status": "SKIPPED",
+                                  "reasons": ["not-applicable-on-macos"], "details": {}})
+        self.assertEqual(self.desk.calls, [])
+        self.assertFalse((self.target.state_root / "gui").exists())
+
+    def test_apply_autostart_and_restore_are_not_applicable(self):
+        with mock.patch.object(gui, "detect_platform",
+                               side_effect=AssertionError("platform detected again")):
+            self.assert_not_applicable(self.apply(components=None))
+            self.assert_not_applicable(
+                self.apply(env=dict(SESSION_ENV, PERSONAL_DOTFILES_GUI_AUTOSTART="1")))
+            self.assert_not_applicable(self.autostart())
+            self.assert_not_applicable(self.restore(), phase="gui-restore")
+            self.assert_not_applicable(self.restore("gnext0000000000000"), phase="gui-restore")
+
+    def test_without_a_platform_the_kernel_name_decides(self):
+        # No os-release (and no macOS probes) just to learn it is a Mac.
+        with mock.patch.object(gui, "detect_platform",
+                               side_effect=AssertionError("os-release read")), \
+                mock.patch.object(gui, "current_system", return_value="darwin"):
+            self.assert_not_applicable(gui.apply_or_defer(self.target, self.desk,
+                                                          dict(SESSION_ENV)))
+            self.assert_not_applicable(gui.run_autostart(self.target, self.desk,
+                                                         dict(SESSION_ENV)))
+            self.assert_not_applicable(gui.restore_gui(self.target, self.desk,
+                                                       dict(SESSION_ENV)), phase="gui-restore")
+
+    def test_dry_run_on_macos_is_still_not_applicable(self):
+        self.desk.recorded = []
+        self.assert_not_applicable(self.apply())
+
+    @unittest.skipUnless(sys.platform == "darwin", "needs a real macOS kernel name")
+    def test_real_kernel_name_on_macos(self):
+        with mock.patch.object(gui, "detect_platform",
+                               side_effect=AssertionError("platform detected on macOS")):
+            self.assert_not_applicable(gui.apply_or_defer(self.target, self.desk,
+                                                          dict(SESSION_ENV)))
+            self.assert_not_applicable(gui.restore_gui(self.target, self.desk,
+                                                       dict(SESSION_ENV)), phase="gui-restore")
+
+    def test_a_given_linux_platform_is_never_detected_again(self):
+        self.platform = NOBLE
+        with mock.patch.object(gui, "detect_platform",
+                               side_effect=AssertionError("platform detected again")), \
+                mock.patch.object(gui, "current_system", return_value="darwin"):
+            # The caller's platform wins over the kernel name.
+            self.assertEqual(self.apply()["status"], "PASS")
+            self.assertEqual(self.restore()["status"], "PASS")
 
 
 class AutostartTests(GuiTestCase):
