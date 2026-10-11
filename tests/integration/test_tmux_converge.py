@@ -15,8 +15,10 @@ scratch with a temporary HOME/XDG tree. :class:`IsolatedRunner` refuses any
 tmux call of the code under test that could reach another server. The
 plugins' ``systemctl`` and continuum's ``ps -u`` view are fakes on PATH, so no
 user manager and no other tmux server is touched or counted. The pinned
-plugins (manifests/tmux-plugins.json) are cloned from GitHub once per class;
-the tests skip when that is impossible.
+plugins (manifests/tmux-plugins.json) are cloned from GitHub once per class,
+and upstream's tmux.conf is read from this repository's history (UPSTREAM_REV,
+which a shallow clone lacks); the tests skip when that is impossible, or fail
+with TMUX_TEST_REQUIRE_PLUGINS=1, as CI sets it.
 
 Hooked shells source the repository's zsh/zsh.d/dotfiles-reload.zsh (the
 working tree's) when it implements the shell-hook contract; until then they
@@ -179,9 +181,21 @@ class IsolatedRunner(Runner):
 _PLUGINS: dict = {}
 
 
+def _plugins_unavailable() -> Exception:
+    """Why the server classes cannot run, as a SkipTest; as a failure under
+    TMUX_TEST_REQUIRE_PLUGINS=1 (CI), so that a shallow checkout without
+    UPSTREAM_REV, or a clone that failed, cannot leave a run green in which
+    no server test ran."""
+    reason = _PLUGINS["skip"]
+    if os.environ.get("TMUX_TEST_REQUIRE_PLUGINS") == "1":
+        return AssertionError(f"{reason} (TMUX_TEST_REQUIRE_PLUGINS=1: a failure, "
+                              "not a skip)")
+    return unittest.SkipTest(reason)
+
+
 def _pinned_plugins() -> tuple[Path, str]:
     if "skip" in _PLUGINS:
-        raise unittest.SkipTest(_PLUGINS["skip"])
+        raise _plugins_unavailable()
     if "dir" in _PLUGINS:
         return _PLUGINS["dir"], _PLUGINS["upstream"]
     holder = tempfile.TemporaryDirectory(prefix="pdfcv-plugins-")
@@ -196,7 +210,7 @@ def _pinned_plugins() -> tuple[Path, str]:
     except subprocess.CalledProcessError as exc:
         holder.cleanup()
         _PLUGINS["skip"] = f"upstream tmux.conf {UPSTREAM_REV} unavailable: {exc}"
-        raise unittest.SkipTest(_PLUGINS["skip"])
+        raise _plugins_unavailable()
     plugins = phases.load_tmux_plugins(REPO_ROOT)
     for plugin in plugins:
         dest = plugin_dir / plugin["name"]
@@ -210,7 +224,7 @@ def _pinned_plugins() -> tuple[Path, str]:
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
             holder.cleanup()
             _PLUGINS["skip"] = f"cannot clone pinned {plugin['name']}: {exc}"
-            raise unittest.SkipTest(_PLUGINS["skip"])
+            raise _plugins_unavailable()
     _PLUGINS.update(holder=holder, dir=plugin_dir, upstream=upstream)
     return plugin_dir, upstream
 
@@ -1060,6 +1074,69 @@ class RuntimeOptionsTests(unittest.TestCase):
             hooks={})
         self.assertEqual(lines, ["set-option -gu @plugin"])
         self.assertLessEqual(set(state) - {"@plugin"}, phases.RUNTIME_USER_OPTIONS)
+
+
+class PinnedPluginsTests(unittest.TestCase):
+    """Without upstream's tmux.conf or a pinned plugin, every class that runs
+    servers skips; under TMUX_TEST_REQUIRE_PLUGINS=1 every one fails instead
+    (CI: its checkout has the whole history, so a skip there is a defect)."""
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp(prefix="pdfcv"))
+        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
+        # A checkout without UPSTREAM_REV, as a depth-1 clone is: one commit.
+        repo = self.root / "repo"
+        (repo / "tmux").mkdir(parents=True)
+        (repo / "tmux" / "tmux.conf").write_text("set -g history-limit 50000\n")
+        env = {"PATH": "/usr/bin:/bin", "HOME": str(self.root),
+               "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1",
+               "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.invalid",
+               "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.invalid"}
+        for args in (["init", "-q"], ["add", "tmux"], ["commit", "-q", "-m", "one"]):
+            subprocess.run(["git", "-C", str(repo), *args], env=env, check=True,
+                           capture_output=True)
+        self.head = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"], env=env,
+                                   check=True, capture_output=True, text=True).stdout.strip()
+        # The servers' own fetch, remembered for the classes still to run,
+        # comes back afterwards.
+        for patcher in (mock.patch.dict(_PLUGINS, clear=True),
+                        mock.patch.object(sys.modules[__name__], "REPO_ROOT", repo)):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def fetch(self, require) -> list[Exception]:
+        """What two classes in turn get (the second one the remembered
+        answer) with TMUX_TEST_REQUIRE_PLUGINS=``require`` (None: unset)."""
+        _PLUGINS.clear()
+        raised = []
+        with mock.patch.dict(os.environ):
+            os.environ.pop("TMUX_TEST_REQUIRE_PLUGINS", None)
+            if require is not None:
+                os.environ["TMUX_TEST_REQUIRE_PLUGINS"] = require
+            for _ in range(2):
+                # Exception: a SkipTest here is an answer, not this test's skip.
+                with self.assertRaises(Exception) as caught:
+                    _pinned_plugins()
+                raised.append(caught.exception)
+        return raised
+
+    def check(self, reason: str):
+        for require, expected in ((None, unittest.SkipTest), ("0", unittest.SkipTest),
+                                  ("1", AssertionError)):
+            with self.subTest(require=require):
+                for exc in self.fetch(require):
+                    self.assertIs(type(exc), expected, exc)
+                    self.assertIn(reason, str(exc))
+
+    def test_a_checkout_without_the_upstream_revision(self):
+        self.check(f"upstream tmux.conf {UPSTREAM_REV} unavailable")
+
+    def test_a_plugin_that_cannot_be_cloned(self):
+        # Upstream's tmux.conf is there this time; the plugin's clone fails.
+        missing = {"name": "tpm", "url": str(self.root / "missing.git"), "commit": self.head}
+        with mock.patch.object(sys.modules[__name__], "UPSTREAM_REV", self.head), \
+                mock.patch.object(phases, "load_tmux_plugins", return_value=[missing]):
+            self.check("cannot clone pinned tpm")
 
 
 # --- macOS: the pane processes through installer/darwin_proc.py ------------------

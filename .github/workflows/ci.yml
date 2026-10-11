@@ -207,6 +207,9 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          # The whole history: test_tmux_converge.py reads upstream's
+          # tmux.conf from an old commit (its UPSTREAM_REV).
+          fetch-depth: 0
           submodules: recursive
           persist-credentials: false
 
@@ -217,6 +220,10 @@ jobs:
           tmux -V
 
       - name: Integration tests, one file at a time
+        env:
+          # Without upstream's tmux.conf or a pinned plugin,
+          # test_tmux_converge.py's server tests fail instead of skipping.
+          TMUX_TEST_REQUIRE_PLUGINS: "1"
         run: |
           status=0
           for test in tests/integration/test_*.py; do
@@ -339,6 +346,9 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          # The whole history, for test_tmux_converge.py (as in
+          # integration-linux).
+          fetch-depth: 0
           submodules: recursive
           persist-credentials: false
 
@@ -417,15 +427,25 @@ jobs:
           run /bin/zsh tests/test-fasd-preexec.zsh
           exit "$status"
 
-      - name: Integration subset (bootstrap simulation, LaunchAgent scripts, tmux-resurrect)
+      - name: Integration subset (bootstrap simulation, LaunchAgent scripts, tmux-resurrect, tmux converge)
         env:
           # Short tmux socket paths (macOS allows 103 bytes).
           TMUX_LAUNCHD_TEST_SOCKET_DIR: /tmp
+          # As in integration-linux.
+          TMUX_TEST_REQUIRE_PLUGINS: "1"
         run: |
+          # Homebrew's tmux, installed above, for every tmux test here; named
+          # so that test_tmux_converge.py fails rather than skips without it.
+          TMUX_TEST_BINARY=$(brew --prefix)/bin/tmux
+          export TMUX_TEST_BINARY
           status=0
+          # test_tmux_converge.py checks the converge's pane decisions
+          # (respawn an idle zsh, keep a busy or hooked one) against the real
+          # libproc, here and nowhere else.
           for test in tests/integration/test_etc_install_darwin.py \
               tests/integration/test_tmux_launchd_scripts.py \
-              tests/integration/test_tmux_resurrect_integration.py; do
+              tests/integration/test_tmux_resurrect_integration.py \
+              tests/integration/test_tmux_converge.py; do
             echo "::group::$test"
             if ! "$PY" -B -m unittest -v "$test"; then
               echo "::error file=$test::failed on $CELL"
