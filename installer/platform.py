@@ -11,6 +11,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import os
+import plistlib
 import pwd
 import re
 import subprocess
@@ -18,6 +19,21 @@ from pathlib import Path
 
 SUPPORTED_RELEASES = ("22.04", "24.04")
 SUPPORTED_ARCHITECTURES = ("amd64", "arm64")
+
+# macOS: the majors Homebrew supports at Tier 1 on Apple silicon (bottles for
+# every formula in manifests/packages-macos.json). Intel Macs stop at 26 and
+# Homebrew has Intel at Tier 3 (no new bottles, formulae may build from
+# source), so amd64 is accepted on its last releases as best effort only.
+# Like the Ubuntu list, anything else is refused before any change; etc/install
+# keeps the same lists (tests/unit/test_platform.py compares them).
+SUPPORTED_MACOS_RELEASES = ("15", "26", "27")
+SUPPORTED_MACOS_ARCHITECTURES = ("arm64", "amd64")
+MACOS_INTEL_RELEASES = ("15", "26")
+MACOS_RELEASE_NAMES = {"15": "Sequoia", "26": "Tahoe", "27": "27"}
+
+# Homebrew's default prefix per architecture; HOMEBREW_PREFIX overrides it.
+HOMEBREW_PREFIXES = {"arm64": "/opt/homebrew", "amd64": "/usr/local"}
+MACOS_VERSION_PLIST = Path("/System/Library/CoreServices/SystemVersion.plist")
 
 # dpkg architecture -> canonical name. Anything else is unsupported rather than
 # guessed; a wrong guess would download the wrong binary artifacts.
@@ -40,14 +56,56 @@ class Platform:
     distribution: str
     release: str
     architecture: str
+    # "linux" or "darwin". On macOS distribution is "macos" and release is the
+    # major version ("15", "26", ...).
+    system: str = "linux"
+
+    @property
+    def is_darwin(self) -> bool:
+        return self.system == "darwin"
+
+    @property
+    def is_linux(self) -> bool:
+        return self.system == "linux"
+
+    @property
+    def artifact_key(self) -> str:
+        """Key of this platform's entry in manifests/tools.json artifacts:
+        the bare dpkg architecture on Linux (unchanged), ``darwin-<arch>`` on
+        macOS."""
+
+        if self.is_linux:
+            return self.architecture
+        return f"{self.system}-{self.architecture}"
+
+    @property
+    def best_effort(self) -> bool:
+        """Accepted, but outside what Homebrew still supports at Tier 1."""
+
+        return self.is_darwin and self.architecture != "arm64"
 
     @property
     def is_supported(self) -> bool:
+        if self.is_darwin:
+            releases = (SUPPORTED_MACOS_RELEASES if self.architecture == "arm64"
+                        else MACOS_INTEL_RELEASES)
+            return (
+                self.distribution == "macos"
+                and self.architecture in SUPPORTED_MACOS_ARCHITECTURES
+                and self.release in releases
+            )
         return (
             self.distribution == "ubuntu"
             and self.release in SUPPORTED_RELEASES
             and self.architecture in SUPPORTED_ARCHITECTURES
         )
+
+    def describe(self) -> str:
+        if self.is_darwin:
+            name = MACOS_RELEASE_NAMES.get(self.release, self.release)
+            label = f"macos {self.release} {name}" if name != self.release else f"macos {self.release}"
+            return f"{label} ({self.architecture})"
+        return f"{self.distribution} {self.release} ({self.architecture})"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -138,7 +196,19 @@ def detect_architecture() -> str:
     return normalize_architecture(completed.stdout)
 
 
+def current_system() -> str:
+    """``darwin`` on macOS, ``linux`` on Linux (lower-cased uname otherwise)."""
+
+    return os.uname().sysname.strip().lower()
+
+
 def detect_platform(os_release_path: Path | None = None) -> Platform:
+    """The running platform. An explicit ``os_release_path`` always means a
+    Linux os-release file to parse (tests); without one, macOS is detected
+    from the kernel name."""
+
+    if os_release_path is None and current_system() == "darwin":
+        return detect_macos()
     path = os_release_path or Path("/etc/os-release")
     try:
         text = path.read_text(encoding="utf-8")
@@ -148,7 +218,119 @@ def detect_platform(os_release_path: Path | None = None) -> Platform:
     return Platform(distribution, release, detect_architecture())
 
 
+# --- macOS --------------------------------------------------------------------
+
+def parse_macos_version(version: str) -> str:
+    """Major release from a ProductVersion such as ``15.5`` or ``26.0.1``."""
+
+    match = re.match(r"^\s*([0-9]+)(?:\.[0-9]+)*\s*$", version or "")
+    if match is None:
+        raise PlatformError(f"cannot parse the macOS version {version!r}")
+    return match.group(1)
+
+
+def _sysctl_value(name: str) -> str | None:
+    """``sysctl -n <name>``; None when the name does not exist (e.g.
+    hw.optional.arm64 on Intel) or sysctl cannot run."""
+
+    try:
+        completed = subprocess.run(
+            ["/usr/sbin/sysctl", "-n", name],
+            capture_output=True, text=True, timeout=10, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if completed.returncode != 0:
+        return None
+    return completed.stdout.strip()
+
+
+def _macos_product_version(version_plist: Path) -> str:
+    """ProductVersion from SystemVersion.plist (the real version even when
+    SYSTEM_VERSION_COMPAT=1 makes sw_vers report 10.16), else sw_vers."""
+
+    try:
+        with open(version_plist, "rb") as handle:
+            value = plistlib.load(handle).get("ProductVersion")
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    except (OSError, ValueError, plistlib.InvalidFileException):
+        pass
+    try:
+        completed = subprocess.run(
+            ["/usr/bin/sw_vers", "-productVersion"],
+            capture_output=True, text=True, timeout=10, check=True,
+            env={**os.environ, "SYSTEM_VERSION_COMPAT": "0"},
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise PlatformError(f"cannot read the macOS version: {exc}") from exc
+    return completed.stdout.strip()
+
+
+def detect_macos(*, version_plist: Path | None = None, sysctl=_sysctl_value,
+                 machine: str | None = None) -> Platform:
+    """Platform("macos", <major>, <arch>, "darwin").
+
+    A process translated by Rosetta 2 reports x86_64 on Apple silicon; it is
+    refused instead of guessed, because the Homebrew prefix, the pinned
+    darwin artifacts and every LaunchAgent PATH depend on the native
+    architecture.
+    """
+
+    version = _macos_product_version(version_plist or MACOS_VERSION_PLIST)
+    release = parse_macos_version(version)
+    if sysctl("sysctl.proc_translated") == "1":
+        raise PlatformError(
+            "this shell runs under Rosetta 2 (x86_64 emulation) on an Apple "
+            "silicon Mac; open a native terminal (arch -arm64 /bin/zsh -l) and "
+            "rerun"
+        )
+    architecture = normalize_architecture(machine or os.uname().machine)
+    return Platform("macos", release, architecture, "darwin")
+
+
+def homebrew_prefix(platform: Platform, env: dict[str, str] | None = None) -> Path | None:
+    """Homebrew's prefix for ``platform`` (None off macOS): an absolute
+    ``HOMEBREW_PREFIX`` from the environment, else the architecture's
+    default (/opt/homebrew on Apple silicon, /usr/local on Intel)."""
+
+    if not platform.is_darwin:
+        return None
+    env = os.environ if env is None else env
+    declared = (env.get("HOMEBREW_PREFIX") or "").strip()
+    if declared.startswith("/"):
+        return Path(declared.rstrip("/") or "/")
+    return Path(HOMEBREW_PREFIXES.get(platform.architecture, "/opt/homebrew"))
+
+
+def _macos_supported_text() -> str:
+    arm = ", ".join(f"{r} ({MACOS_RELEASE_NAMES[r]})" if MACOS_RELEASE_NAMES[r] != r else r
+                    for r in SUPPORTED_MACOS_RELEASES)
+    intel = ", ".join(MACOS_INTEL_RELEASES)
+    return f"{arm} on Apple silicon; {intel} on Intel (best effort)"
+
+
+def require_supported_macos(platform: Platform) -> None:
+    if platform.distribution != "macos":
+        raise PlatformError(f"unsupported Darwin distribution {platform.distribution!r}")
+    if platform.architecture not in SUPPORTED_MACOS_ARCHITECTURES:
+        raise PlatformError(
+            f"unsupported architecture {platform.architecture!r}; "
+            f"supported macOS: {_macos_supported_text()}"
+        )
+    releases = (SUPPORTED_MACOS_RELEASES if platform.architecture == "arm64"
+                else MACOS_INTEL_RELEASES)
+    if platform.release not in releases:
+        raise PlatformError(
+            f"unsupported macOS release {platform.release!r} on "
+            f"{platform.architecture}; supported: {_macos_supported_text()}"
+        )
+
+
 def require_supported_platform(platform: Platform) -> None:
+    if platform.is_darwin:
+        require_supported_macos(platform)
+        return
     if platform.distribution != "ubuntu":
         raise PlatformError(
             f"unsupported distribution {platform.distribution!r}; "

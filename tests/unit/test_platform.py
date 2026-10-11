@@ -91,6 +91,129 @@ class SupportedPlatformTests(unittest.TestCase):
         with self.assertRaises(plat.PlatformError):
             plat.detect_platform(Path("/nonexistent/os-release"))
 
+    def test_linux_platforms_keep_their_shape(self):
+        platform = plat.Platform("ubuntu", "24.04", "arm64")
+        self.assertEqual(platform.system, "linux")
+        self.assertTrue(platform.is_linux)
+        self.assertFalse(platform.is_darwin)
+        self.assertFalse(platform.best_effort)
+        self.assertEqual(platform.artifact_key, "arm64")
+        self.assertEqual(platform.describe(), "ubuntu 24.04 (arm64)")
+        self.assertIsNone(plat.homebrew_prefix(platform, {}))
+
+
+def _version_plist(directory: Path, version: str) -> Path:
+    import plistlib
+
+    path = directory / "SystemVersion.plist"
+    path.write_bytes(plistlib.dumps({"ProductName": "macOS",
+                                     "ProductVersion": version}))
+    return path
+
+
+class MacosPlatformTests(unittest.TestCase):
+    def test_supported_matrix(self):
+        cases = [(r, "arm64") for r in ("15", "26", "27")]
+        cases += [(r, "amd64") for r in ("15", "26")]
+        for release, arch in cases:
+            platform = plat.Platform("macos", release, arch, "darwin")
+            with self.subTest(release=release, arch=arch):
+                self.assertTrue(platform.is_supported)
+                plat.require_supported_platform(platform)
+                self.assertEqual(platform.best_effort, arch == "amd64")
+
+    def test_rejections(self):
+        cases = [
+            plat.Platform("macos", "14", "arm64", "darwin"),
+            plat.Platform("macos", "13", "amd64", "darwin"),
+            plat.Platform("macos", "28", "arm64", "darwin"),
+            plat.Platform("macos", "27", "amd64", "darwin"),
+            plat.Platform("darwin", "26", "arm64", "darwin"),
+        ]
+        for platform in cases:
+            with self.subTest(platform=platform):
+                self.assertFalse(platform.is_supported)
+                with self.assertRaises(plat.PlatformError) as caught:
+                    plat.require_supported_platform(platform)
+                self.assertNotIn("Ubuntu", str(caught.exception))
+
+    def test_rejection_message_names_the_supported_set(self):
+        with self.assertRaises(plat.PlatformError) as caught:
+            plat.require_supported_platform(plat.Platform("macos", "14", "arm64", "darwin"))
+        message = str(caught.exception)
+        self.assertIn("'14'", message)
+        self.assertIn("15 (Sequoia), 26 (Tahoe), 27 on Apple silicon", message)
+        self.assertIn("15, 26 on Intel (best effort)", message)
+
+    def test_ubuntu_messages_are_unchanged(self):
+        with self.assertRaises(plat.PlatformError) as caught:
+            plat.require_supported_platform(plat.Platform("ubuntu", "26.04", "amd64"))
+        self.assertEqual(str(caught.exception),
+                         "unsupported Ubuntu release '26.04'; supported: 22.04, 24.04")
+
+    def test_artifact_key_and_description(self):
+        platform = plat.Platform("macos", "26", "arm64", "darwin")
+        self.assertEqual(platform.artifact_key, "darwin-arm64")
+        self.assertEqual(platform.describe(), "macos 26 Tahoe (arm64)")
+        self.assertEqual(plat.Platform("macos", "27", "arm64", "darwin").describe(),
+                         "macos 27 (arm64)")
+        self.assertEqual(plat.Platform("macos", "15", "amd64", "darwin").artifact_key,
+                         "darwin-amd64")
+
+    def test_parse_macos_version(self):
+        for raw, major in (("15.5", "15"), ("26.0.1", "26"), (" 27 \n", "27"),
+                           ("26.5.2", "26")):
+            with self.subTest(raw=raw):
+                self.assertEqual(plat.parse_macos_version(raw), major)
+        for raw in ("", "10.16-beta", "macOS 15", "15."):
+            with self.subTest(raw=raw), self.assertRaises(plat.PlatformError):
+                plat.parse_macos_version(raw)
+
+    def test_detect_macos_reads_the_version_plist(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            plist = _version_plist(Path(tmp), "26.5.2")
+            detected = plat.detect_macos(version_plist=plist,
+                                         sysctl=lambda name: "0", machine="arm64")
+        self.assertEqual(detected, plat.Platform("macos", "26", "arm64", "darwin"))
+
+    def test_detect_macos_intel(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            plist = _version_plist(Path(tmp), "15.6")
+            detected = plat.detect_macos(version_plist=plist,
+                                         sysctl=lambda name: None, machine="x86_64")
+        self.assertEqual(detected, plat.Platform("macos", "15", "amd64", "darwin"))
+        self.assertTrue(detected.best_effort)
+
+    def test_detect_macos_refuses_rosetta(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            plist = _version_plist(Path(tmp), "26.1")
+            with self.assertRaises(plat.PlatformError) as caught:
+                plat.detect_macos(
+                    version_plist=plist, machine="x86_64",
+                    sysctl=lambda name: "1" if name == "sysctl.proc_translated" else None)
+        self.assertIn("Rosetta", str(caught.exception))
+        self.assertIn("arch -arm64", str(caught.exception))
+
+    def test_homebrew_prefix(self):
+        arm = plat.Platform("macos", "26", "arm64", "darwin")
+        intel = plat.Platform("macos", "15", "amd64", "darwin")
+        self.assertEqual(plat.homebrew_prefix(arm, {}), Path("/opt/homebrew"))
+        self.assertEqual(plat.homebrew_prefix(intel, {}), Path("/usr/local"))
+        self.assertEqual(plat.homebrew_prefix(arm, {"HOMEBREW_PREFIX": "/x/brew/"}),
+                         Path("/x/brew"))
+        # A relative or empty value is not a prefix.
+        self.assertEqual(plat.homebrew_prefix(arm, {"HOMEBREW_PREFIX": "brew"}),
+                         Path("/opt/homebrew"))
+        self.assertEqual(plat.homebrew_prefix(arm, {"HOMEBREW_PREFIX": " "}),
+                         Path("/opt/homebrew"))
+
+    def test_explicit_os_release_path_is_always_linux(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "os-release"
+            path.write_text("ID=ubuntu\nVERSION_ID=24.04\n", encoding="utf-8")
+            detected = plat.detect_platform(path)
+        self.assertEqual(detected.system, "linux")
+
 
 class ResolveTargetTests(unittest.TestCase):
     def setUp(self):
