@@ -1776,6 +1776,75 @@
           ]
         }
       ]
+    },
+    {
+      "id": "tmux-launchd-agent-runs",
+      "entrypoint": "macOS LaunchAgents com.github.leekyungmoon.dotfiles.tmux (tmux/tmux-launchd-start, when loaded: GUI login, install/repair) and com.github.leekyungmoon.dotfiles.tmux-resurrect-autosave (tmux/resurrect-autosave, every 60 s)",
+      "before": "none (new on macOS; on Linux tmux.service and tmux-resurrect-autosave.timer log to the systemd journal)",
+      "after": "launchd appends both programs' stdout and stderr to ${XDG_STATE_HOME:-~/.local/state}/personal-dotfiles/launchd/<label>.log (plist StandardOutPath/StandardErrorPath; directory 0700, created by the installer); past 1 MiB a run renames it to <label>.log.1 (one older generation) and continues in a new <label>.log; resurrect-autosave holds resurrect-save's stderr for one run in a mktemp file under ${TMPDIR:-/tmp}, removed on exit; tmux-launchd-start starts `tmux new-session -d -s __continuum_startup` in ~ and records the server options @tmux-restore-status, resurrect-autosave @tmux-autosave-skip-reported (memory only)",
+      "status": "outside-checkout",
+      "evidence": "tests/integration/test_tmux_launchd_scripts.py: log rotation for both programs under dash and bash 3.2, the temporary file removed, private tmux servers only; nothing is written under the checkout",
+      "checks": [
+        {
+          "file": "tmux/tmux-launchd-start",
+          "require": [
+            "PERSONAL_DOTFILES_LAUNCHD_LOG",
+            "mv -f \"\\$log\" \"\\$log\\.1\"",
+            "cd \"\\$HOME\" \\|\\| exit 1",
+            "@tmux-restore-status"
+          ]
+        },
+        {
+          "file": "tmux/resurrect-autosave",
+          "require": [
+            "PERSONAL_DOTFILES_LAUNCHD_LOG",
+            "mv -f \"\\$log\" \"\\$log\\.1\"",
+            "mktemp \"\\$\\{TMPDIR:-/tmp\\}/resurrect-autosave\\.XXXXXX\"",
+            "trap 'rm -f \\\"\\$errors\\\"' EXIT",
+            "@tmux-autosave-skip-reported"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "tmux-resurrect-save-lock",
+      "entrypoint": "tmux/resurrect-save: prefix + C-s, tmux-resurrect-autosave.service and tmux.service's ExecStop (Linux), tmux/resurrect-autosave (macOS agent)",
+      "before": "`flock -n 9 || exit 0` on <@resurrect-dir>/operation.lock: where flock(1) is missing (macOS) every save exited 0 without saving",
+      "after": "operation.lock in @resurrect-dir (${XDG_DATA_HOME:-~/.local/share}/tmux/resurrect, 0700; the file 0600 under umask 077) is locked on fd 9 with flock(1) when present (Linux, unchanged), else /usr/bin/lockf -s -t 0 9 (macOS 15 and later), else python3 fcntl.flock; busy still exits 0, no lock tool or a lock error exits 1 with a message; a save stopped by TERM/INT/HUP puts `last` back; on macOS COPYFILE_DISABLE=1 keeps AppleDouble entries out of pane_contents.tar.gz",
+      "status": "outside-checkout",
+      "evidence": "tests/integration/test_tmux_launchd_scripts.py ResurrectSaveLocking: each lock path holds the lock while save.sh runs, busy is a quiet exit 0, missing tools and lockf errors fail loudly, a stop during save.sh keeps the previous snapshot (bash and bash 3.2); tests/integration/test_tmux_resurrect_integration.py unchanged on Linux",
+      "checks": [
+        {
+          "file": "tmux/resurrect-save",
+          "require": [
+            "exec 9>\"\\$state_dir/operation\\.lock\"",
+            "flock -n 9",
+            "lockf -s -t 0 9",
+            "fcntl\\.flock\\(9, fcntl\\.LOCK_EX \\| fcntl\\.LOCK_NB\\)",
+            "export COPYFILE_DISABLE=1",
+            "trap 'restore_previous_last"
+          ],
+          "forbid": [
+            "(?m)^flock -n 9 \\|\\| exit 0$"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "tmux-continuum-boot-macos",
+      "entrypoint": "tmux-continuum's handle_tmux_automatic_start.sh at every plugin load (TPM), driven by resurrect.conf's @continuum-boot",
+      "before": "Linux: a no-op `systemctl --user enable|disable tmux.service` chosen by resurrect.conf's if-shell; macOS: 'off' by accident (no systemd unit)",
+      "after": "Linux unchanged; macOS: @continuum-boot is always 'off' (explicit Darwin line), so continuum's osx_disable.sh deletes ~/Library/LaunchAgents/Tmux.Start.plist (continuum's own terminal launcher, never one of ours) and never runs launchctl",
+      "status": "outside-checkout",
+      "evidence": "tests/integration/test_tmux_launchd_scripts.py ContinuumOnMacOS (fake uname): only Tmux.Start.plist is removed, both agent plists keep their bytes and mtime, no launchctl call; BootLines pins the Linux line",
+      "checks": [
+        {
+          "file": "tmux/resurrect.conf",
+          "require": [
+            "if-shell 'test \"\\$\\(uname -s\\)\" = Darwin' \"set -g @continuum-boot 'off'\\\""
+          ]
+        }
+      ]
     }
   ]
 }

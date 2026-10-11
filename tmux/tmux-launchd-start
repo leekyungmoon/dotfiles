@@ -1,0 +1,226 @@
+#!/bin/sh
+# Start tmux at macOS login (the counterpart of tmux.service and
+# tmux-service-start on Linux).  The LaunchAgent
+# com.github.leekyungmoon.dotfiles.tmux runs this once when it is loaded
+# (RunAtLoad): at each GUI login, and when install or repair loads it.
+#
+# A running server is left untouched (a terminal started tmux first).
+# Otherwise this starts the detached login server,
+# `tmux new-session -d -s __continuum_startup`, in $HOME; loading the config
+# makes tmux-continuum restore the last tmux-resurrect snapshot into it.
+# Nothing else reports how that went on macOS (continuum decides silently and
+# upstream restore.sh always exits 0), so this script watches the server's
+# @tmux-restore-complete (tmux/resurrect-save sets "restoring" and then "on"
+# around every restore), records the outcome in the server option
+# @tmux-restore-status and logs it with recovery steps.
+#
+# tmux is always run by its absolute path.  continuum skips the restore when
+# `ps -u <uid> -o "command pid"` lists more than one line starting with
+# "tmux" besides the server, and the client starting the server stays alive
+# while the config (TPM and every plugin) loads.  Started as "tmux", that
+# client would count, and any one other tmux client at that moment would make
+# continuum skip.  macOS ps cuts a command column that is not the last one to
+# 16 characters, so "/opt/homebrew/bin/tmux ..." never starts with "tmux".
+#
+# Exit status: 0 when the snapshot was restored, when there was nothing to
+# restore (no snapshot, or the ~/tmux_no_auto_restore halt file) and when a
+# server was already running; 3 when a snapshot exists but was not restored;
+# 1 when tmux is missing; otherwise the status of the failed new-session.
+#
+# Its output goes to the agent's log, $PERSONAL_DOTFILES_LAUNCHD_LOG, which
+# this script keeps near 1 MiB.  Test seams (the agent never sets them):
+# TMUX_LAUNCHD_TMUX (absolute path of tmux), TMUX_LAUNCHD_START_WAIT and
+# TMUX_LAUNCHD_FINISH_WAIT (seconds to wait for the restore to begin, default
+# @continuum-restore-max-delay + 15, and to finish, default 180).
+
+set -u
+
+me=tmux-launchd-start
+
+say() {
+  printf '%s %s: %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$me" "$*" >&2
+}
+
+# launchd opens the log for this run's stdout and stderr before starting it.
+# Past 1 MiB the file becomes <log>.1, and this run's output moves to a new
+# file (unless it goes elsewhere, e.g. to a terminal).
+rotate_log() {
+  log=${PERSONAL_DOTFILES_LAUNCHD_LOG:-}
+  case $log in
+    /*) ;;
+    *) return 0 ;;
+  esac
+  [ -f "$log" ] && [ ! -L "$log" ] || return 0
+  size=$(wc -c < "$log" 2>/dev/null | tr -d ' \t') || return 0
+  case $size in
+    '' | *[!0-9]*) return 0 ;;
+  esac
+  [ "$size" -gt 1048576 ] || return 0
+  mv -f "$log" "$log.1" || return 0
+  if [ /dev/stdout -ef "$log.1" ]; then
+    exec >>"$log"
+  fi
+  if [ /dev/stderr -ef "$log.1" ]; then
+    exec 2>>"$log"
+  fi
+}
+
+# A whole number of seconds from a seam, else the default.
+seconds() {
+  case ${1:-} in
+    '' | *[!0-9]* | ?????*) printf '%s\n' "$2" ;;
+    *) printf '%s\n' "$1" ;;
+  esac
+}
+
+case ${HOME:-} in
+  /*) ;;
+  *) say "HOME is not an absolute path: ${HOME:-}"; exit 1 ;;
+esac
+cd "$HOME" || exit 1
+rotate_log
+
+if [ -n "${TMUX_LAUNCHD_TMUX:-}" ]; then
+  tmux_bin=$TMUX_LAUNCHD_TMUX
+  case $tmux_bin in
+    /*) ;;
+    *) tmux_bin= ;;
+  esac
+  if [ -z "$tmux_bin" ] || [ ! -x "$tmux_bin" ]; then
+    say "TMUX_LAUNCHD_TMUX is not an absolute path to tmux: $TMUX_LAUNCHD_TMUX"
+    exit 1
+  fi
+else
+  tmux_bin=$(command -v tmux 2>/dev/null) || tmux_bin=
+  case $tmux_bin in
+    /*) ;;
+    *) tmux_bin= ;;
+  esac
+  if [ -z "$tmux_bin" ]; then
+    say "tmux not found on PATH; run: brew install tmux && dotfiles repair"
+    exit 1
+  fi
+fi
+start_wait=${TMUX_LAUNCHD_START_WAIT:-}
+finish_wait=$(seconds "${TMUX_LAUNCHD_FINISH_WAIT:-}" 180)
+
+# What the server and every pane must not inherit: another server's address,
+# launchd's job identity, this script's own settings.
+unset TMUX TMUX_PANE XPC_SERVICE_NAME XPC_FLAGS PERSONAL_DOTFILES_LAUNCHD_LOG \
+  TMUX_LAUNCHD_TMUX TMUX_LAUNCHD_START_WAIT TMUX_LAUNCHD_FINISH_WAIT
+# Programs in panes other than zsh (which sets its own) need a UTF-8 locale.
+case ${LC_ALL:-${LC_CTYPE:-${LANG:-}}} in
+  *[Uu][Tt][Ff]-8* | *[Uu][Tt][Ff]8*) ;;
+  *) LANG=en_US.UTF-8; export LANG ;;
+esac
+
+if "$tmux_bin" has-session 2>/dev/null; then
+  say "a tmux server is already running; left untouched"
+  exit 0
+fi
+
+status=0
+"$tmux_bin" new-session -d -s __continuum_startup || status=$?
+if [ "$status" -ne 0 ]; then
+  say "tmux new-session failed (exit status $status); nothing was restored"
+  exit "$status"
+fi
+
+option() {
+  "$tmux_bin" show-option -gqv "$1" 2>/dev/null
+}
+
+# Record the outcome in the server and the log.
+report() {
+  "$tmux_bin" set-option -gq @tmux-restore-status "$1" 2>/dev/null || :
+  say "$2"
+}
+
+# The snapshot continuum restores: "last" in @resurrect-dir (set by the
+# config), as tmux/resurrect-save finds it.
+dir=$(option @resurrect-dir)
+case $dir in
+  \~/*) dir=$HOME/${dir#\~/} ;;
+  \$HOME/*) dir=$HOME/${dir#\$HOME/} ;;
+  '')
+    dir=${XDG_DATA_HOME:-}
+    case $dir in
+      /*) ;;
+      *) dir=$HOME/.local/share ;;
+    esac
+    dir=$dir/tmux/resurrect
+    ;;
+esac
+if [ ! -f "$dir/last" ]; then
+  report "no snapshot" "started tmux; there is no snapshot to restore yet ($dir/last)"
+  exit 0
+fi
+
+steps="To restore it now press prefix + C-r in tmux.  Until this server restores,
+automatic saves are skipped and keep the snapshot; to keep the current sessions
+instead and save them from now on run: tmux set-option -g @tmux-restore-complete on"
+
+if [ -e "$HOME/tmux_no_auto_restore" ]; then
+  report "not restored: ~/tmux_no_auto_restore exists" \
+    "started tmux without restoring the snapshot: ~/tmux_no_auto_restore turns the automatic restore off; remove it to restore at the next start.
+$steps"
+  exit 0
+fi
+if [ -z "$(option @resurrect-restore-script-path)" ]; then
+  report "not restored: tmux-resurrect is not loaded" \
+    "started tmux, but tmux-resurrect did not load, so the snapshot was not restored; run: dotfiles repair.
+$steps"
+  exit 3
+fi
+if [ "$(option @continuum-restore)" != on ]; then
+  report "not restored: @continuum-restore is off" \
+    "started tmux, but this config does not restore automatically (@continuum-restore is not on), so the snapshot was not restored.
+$steps"
+  exit 3
+fi
+
+# The restore state, or "gone" once the server no longer answers (the waits
+# below end then instead of running out).
+restore_state() {
+  "$tmux_bin" show-option -gqv @tmux-restore-complete 2>/dev/null || echo gone
+}
+
+# continuum restores only into a server younger than its max delay; its
+# restore job sleeps 1 s and the pre-restore hook then marks "restoring".
+max_delay=$(seconds "$(option @continuum-restore-max-delay)" 10)
+start_wait=$(seconds "$start_wait" $((max_delay + 15)))
+state=$(restore_state)
+deadline=$(($(date +%s) + start_wait))
+while [ "$state" != restoring ] && [ "$state" != on ] && [ "$state" != gone ] &&
+  [ "$(date +%s)" -lt "$deadline" ]; do
+  sleep 1
+  state=$(restore_state)
+done
+if [ "$state" = restoring ]; then
+  deadline=$(($(date +%s) + finish_wait))
+  while [ "$state" = restoring ] && [ "$(date +%s)" -lt "$deadline" ]; do
+    sleep 1
+    state=$(restore_state)
+  done
+fi
+
+case $state in
+  on)
+    report "restored $(date '+%Y-%m-%d %H:%M:%S')" "started tmux and restored the last snapshot"
+    exit 0
+    ;;
+  gone)
+    say "the tmux server exited before the snapshot was restored; start tmux to try again"
+    ;;
+  restoring)
+    report "not restored: still restoring after ${finish_wait}s" \
+      "started tmux, but restoring the snapshot did not finish within ${finish_wait} s.
+$steps"
+    ;;
+  *)
+    report "not restored: continuum did not start it within ${start_wait}s" \
+      "started tmux, but tmux-continuum did not restore the snapshot within ${start_wait} s (it skips the restore when it sees another tmux process at startup).
+$steps"
+    ;;
+esac
+exit 3

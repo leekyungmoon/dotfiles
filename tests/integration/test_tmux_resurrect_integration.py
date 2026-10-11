@@ -94,9 +94,12 @@ class PinnedPlugins(unittest.TestCase):
     def setUpClass(cls) -> None:
         tmux = os.environ.get("TMUX_TEST_BINARY") or shutil.which("tmux")
         missing = [
-            name for name in ("git", "bash", "flock", "python3", "ps")
+            name for name in ("git", "bash", "python3", "ps")
             if shutil.which(name) is None
         ]
+        # resurrect-save locks with flock(1), else lockf(1) (macOS), else python3.
+        if not any(shutil.which(name) for name in ("flock", "lockf", "python3")):
+            missing.append("flock|lockf|python3")
         if tmux is None or missing:
             raise unittest.SkipTest(f"missing tools: tmux={tmux} {missing}")
         cls.tmux_binary = tmux
@@ -627,6 +630,14 @@ class LoginRestoreEndToEnd(PinnedPlugins):
 
     def continuum_jobs(self):
         script = str(self.data / "tmux/plugins/tmux-continuum")
+        if sys.platform == "darwin":
+            # No /proc there; ps prints a last command column whole.
+            listing = subprocess.run(
+                ["ps", "-A", "-ww", "-o", "pid=", "-o", "command="],
+                capture_output=True, text=True,
+            ).stdout
+            return [line.split(None, 1)[0] for line in listing.splitlines()
+                    if script in line and "continuum_restore" in line]
         jobs = []
         for entry in os.listdir("/proc"):
             if entry.isdigit():

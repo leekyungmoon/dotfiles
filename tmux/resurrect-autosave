@@ -1,0 +1,165 @@
+#!/bin/sh
+# Save the tmux environment every minute on macOS, attached client or not:
+# the LaunchAgent com.github.leekyungmoon.dotfiles.tmux-resurrect-autosave
+# runs this every 60 s (StartInterval).  It is the counterpart of
+# tmux-resurrect-autosave.timer and .service on Linux, and supplies what that
+# unit gets from systemd and launchd does not have:
+#   ExecCondition      no tmux server, nothing to save: exit 0;
+#   TimeoutStartSec    a save still running after 50 s (an unresponsive
+#                      server) is stopped, since launchd skips every later
+#                      interval while the job runs;
+#   SuccessExitStatus  75, "this server has not restored the last snapshot
+#                      yet" (see resurrect-save), counts as success, and its
+#                      explanation is logged once per server instead of every
+#                      minute.
+# Locking, verification and the skip itself are resurrect-save's, which lives
+# next to this script.
+#
+# Its output goes to the agent's log, $PERSONAL_DOTFILES_LAUNCHD_LOG, which
+# this script keeps near 1 MiB.  Test seam (the agent never sets it):
+# TMUX_AUTOSAVE_TIMEOUT, seconds before a save is stopped (default 50).
+
+set -u
+
+me=resurrect-autosave
+
+say() {
+  printf '%s %s: %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$me" "$*" >&2
+}
+
+# launchd opens the log for this run's stdout and stderr before starting it.
+# Past 1 MiB the file becomes <log>.1, and this run's output moves to a new
+# file (unless it goes elsewhere, e.g. to a terminal).
+rotate_log() {
+  log=${PERSONAL_DOTFILES_LAUNCHD_LOG:-}
+  case $log in
+    /*) ;;
+    *) return 0 ;;
+  esac
+  [ -f "$log" ] && [ ! -L "$log" ] || return 0
+  size=$(wc -c < "$log" 2>/dev/null | tr -d ' \t') || return 0
+  case $size in
+    '' | *[!0-9]*) return 0 ;;
+  esac
+  [ "$size" -gt 1048576 ] || return 0
+  mv -f "$log" "$log.1" || return 0
+  if [ /dev/stdout -ef "$log.1" ]; then
+    exec >>"$log"
+  fi
+  if [ /dev/stderr -ef "$log.1" ]; then
+    exec 2>>"$log"
+  fi
+}
+
+# Send signal $1 to process $2 and all of its descendants (resurrect-save,
+# save.sh, a tmux client waiting on an unresponsive server).
+signal_tree() {
+  pids=$(ps -A -o pid= -o ppid= 2>/dev/null | awk -v root="$2" '
+    { children[$2] = children[$2] " " $1 }
+    END {
+      queue = root
+      while (queue != "" && n++ < 10000) {
+        count = split(queue, current, " ")
+        queue = ""
+        for (i = 1; i <= count; i++) {
+          out = out " " current[i]
+          queue = queue children[current[i]]
+        }
+      }
+      print out
+    }')
+  # shellcheck disable=SC2086 # a list of pids
+  kill "-$1" ${pids:-$2} 2>/dev/null || :
+}
+
+# Stops the save when it outlives the limit; ended by the main script (TERM)
+# once the save is over.
+watchdog() {
+  trap 'exit 0' TERM
+  waited=0
+  while [ "$waited" -lt "$limit" ]; do
+    sleep 1
+    waited=$((waited + 1))
+  done
+  say "resurrect-save still running after ${limit} s; stopping it"
+  signal_tree TERM "$1"
+  waited=0
+  while [ "$waited" -lt 5 ] && kill -0 "$1" 2>/dev/null; do
+    sleep 1
+    waited=$((waited + 1))
+  done
+  signal_tree KILL "$1"
+}
+
+rotate_log
+limit=${TMUX_AUTOSAVE_TIMEOUT:-}
+case $limit in
+  '' | *[!0-9]* | 0 | ????*) limit=50 ;;
+esac
+# The default server, as the Linux unit's UnsetEnvironment=TMUX TMUX_PANE.
+unset TMUX TMUX_PANE PERSONAL_DOTFILES_LAUNCHD_LOG TMUX_AUTOSAVE_TIMEOUT
+
+tmux_bin=$(command -v tmux 2>/dev/null) || tmux_bin=
+if [ -z "$tmux_bin" ]; then
+  say "tmux not found on PATH; run: brew install tmux && dotfiles repair"
+  exit 1
+fi
+"$tmux_bin" has-session 2>/dev/null || exit 0
+
+save=$(dirname -- "$0")/resurrect-save
+if [ ! -x "$save" ]; then
+  say "cannot run $save; nothing saved"
+  exit 1
+fi
+# resurrect-save's messages wait here until its status is known: the skip
+# (75) is logged only once per server.
+errors=$(mktemp "${TMPDIR:-/tmp}/resurrect-autosave.XXXXXX") || {
+  say "cannot create a temporary file; nothing saved"
+  exit 1
+}
+save_pid=
+watchdog_pid=
+trap 'rm -f "$errors"' EXIT
+# Stopped (launchctl bootout, logout): stop the save too, so that
+# resurrect-save puts "last" back before this job ends, and keep what it said.
+trap 'say "stopped; stopping the running save"
+if [ -n "$save_pid" ]; then
+  signal_tree TERM "$save_pid"
+  wait "$save_pid" 2>/dev/null
+fi
+if [ -n "$watchdog_pid" ]; then kill "$watchdog_pid" 2>/dev/null; fi
+cat "$errors" >&2
+exit 1' TERM INT HUP
+
+"$save" 2>"$errors" &
+save_pid=$!
+watchdog "$save_pid" &
+watchdog_pid=$!
+status=0
+wait "$save_pid" || status=$?
+save_pid=
+kill "$watchdog_pid" 2>/dev/null
+wait "$watchdog_pid" 2>/dev/null
+watchdog_pid=
+
+if [ "$status" -eq 75 ]; then
+  # Report the skip once per server; @tmux-autosave-skip-reported holds the
+  # start time of the server it was reported for.
+  started=$("$tmux_bin" display-message -p '#{start_time}' 2>/dev/null) || started=
+  reported=$("$tmux_bin" show-option -gqv @tmux-autosave-skip-reported 2>/dev/null) ||
+    reported=
+  if [ -z "$started" ] || [ "$reported" != "$started" ]; then
+    say "saves are skipped until this tmux server restores the last snapshot (logged once per server):"
+    cat "$errors" >&2
+    if [ -n "$started" ]; then
+      "$tmux_bin" set-option -gq @tmux-autosave-skip-reported "$started" \
+        2>/dev/null || :
+    fi
+  fi
+  exit 0
+fi
+if [ "$status" -ne 0 ]; then
+  say "resurrect-save failed (exit status $status):"
+fi
+cat "$errors" >&2
+exit "$status"

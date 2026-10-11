@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
 # Run the upstream tmux-resurrect save, serialized across the prefix + C-s
-# binding, tmux-resurrect-autosave.timer and tmux.service's stop hook.
+# binding, tmux-resurrect-autosave.timer and tmux.service's stop hook (on
+# macOS: the LaunchAgent running tmux/resurrect-autosave every minute).
 # A save counts only when the post-save AI hook reports success; otherwise the
 # previous "last" snapshot is kept.
 #
 # A save also waits until this tmux server has restored "last": a fresh
 # server (after a crash or re-login) holds only the login session until the
 # restore ran, and saving it would repoint "last" at a nearly empty snapshot.
-# The skip exits with status 75, which tmux-resurrect-autosave.service counts
-# as success.
+# The skip exits with status 75, which tmux-resurrect-autosave.service (and
+# tmux/resurrect-autosave) counts as success.
 #
 # `resurrect-save --pre-restore` / `--post-restore` are the restore hooks
 # (resurrect.conf); they bracket every restore, automatic or prefix + C-r.
@@ -16,6 +17,14 @@ set -euo pipefail
 umask 077
 # Keep the caller's PATH first (same tmux as the server); add usual fallbacks.
 export PATH="${PATH:+$PATH:}$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin"
+if [[ $(uname -s) == Darwin ]]; then
+    # launchd's default PATH has no Homebrew: Apple silicon keeps it in
+    # /opt/homebrew (an Intel Mac's /usr/local is already listed above).
+    export PATH="$PATH:/opt/homebrew/bin:/opt/homebrew/sbin"
+    # macOS tar (bsdtar) would store extended attributes as AppleDouble "._*"
+    # entries in pane_contents.tar.gz.
+    export COPYFILE_DISABLE=1
+fi
 
 SKIPPED=75
 BOOTSTRAP=__continuum_startup
@@ -71,6 +80,71 @@ restore_settled() {
     return 1
 }
 
+# Take the save lock on fd 9 (the open operation.lock) without waiting:
+# returns 0 when held, 75 when another save holds it, 1 (after saying why)
+# when no lock can be taken.  Every helper takes flock(2) on the open file
+# description fd 9 refers to, so the lock outlives the helper and is released
+# only when this script and every child that inherited fd 9 have exited.
+#   flock -n 9         util-linux (Linux); any failure counts as busy, as
+#                      `flock -n 9 || exit 0` always did.
+#   lockf -s -t 0 9    macOS 15 and later (FreeBSD's descriptor mode):
+#                      0 held, 75 busy, 64 when this lockf has no descriptor
+#                      mode (macOS 14 and older), anything else an error.
+#   python3            fcntl.flock(9, LOCK_EX | LOCK_NB) otherwise.
+# A tool that is missing, or a stand-in that exits 127 (command not found),
+# is skipped.  Without any of them the save fails loudly: a silent exit 0
+# would report a save that never happened.
+lock_operation_fd() {
+    local status output lock=$state_dir/operation.lock
+    if command -v flock >/dev/null 2>&1; then
+        status=0
+        flock -n 9 || status=$?
+        case $status in
+            0) return 0 ;;
+            127) ;;
+            *) return 75 ;;
+        esac
+    fi
+    if command -v lockf >/dev/null 2>&1; then
+        status=0
+        output=$(lockf -s -t 0 9 2>&1) || status=$?
+        case $status in
+            0 | 75) return "$status" ;;
+            64 | 127) ;;
+            *)
+                printf 'tmux-resurrect: cannot lock %s (lockf exit status %s): %s\n' \
+                    "$lock" "$status" "$output" >&2
+                return 1
+                ;;
+        esac
+    fi
+    if command -v python3 >/dev/null 2>&1; then
+        status=0
+        python3 -I -c '
+import fcntl, sys
+try:
+    fcntl.flock(9, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except BlockingIOError:
+    sys.exit(75)
+except OSError as error:
+    sys.stderr.write("tmux-resurrect: flock on fd 9: %s\n" % error)
+    sys.exit(1)
+' || status=$?
+        case $status in
+            0 | 75) return "$status" ;;
+            127) ;;
+            *)
+                printf 'tmux-resurrect: cannot lock %s (python3 exit status %s)\n' \
+                    "$lock" "$status" >&2
+                return 1
+                ;;
+        esac
+    fi
+    printf 'tmux-resurrect: cannot lock %s: no flock, lockf or python3 found; nothing saved.\n' \
+        "$lock" >&2
+    return 1
+}
+
 case ${1:-} in
     --pre-restore) pre_restore; exit 0 ;;
     --post-restore) post_restore; exit 0 ;;
@@ -114,12 +188,23 @@ if [[ $state_dir == *'$HOSTNAME'* ]]; then
     state_dir=${state_dir//'$HOSTNAME'/"$(hostname)"}
 fi
 state_dir=${state_dir//'~'/"$HOME"}
-[[ $state_dir == /* ]]
+# (Spelled out: bash 3.2, macOS's /bin/bash, does not stop at a failing [[ ]]
+# under set -e, and a relative directory would put snapshots in the cwd.)
+[[ $state_dir == /* ]] || {
+    printf 'tmux-resurrect: @resurrect-dir is not an absolute path: %s\n' "$state_dir" >&2
+    exit 1
+}
 mkdir -p -- "$state_dir"
 chmod 700 -- "$state_dir"
 
 exec 9>"$state_dir/operation.lock"
-flock -n 9 || exit 0
+lock_status=0
+lock_operation_fd || lock_status=$?
+case $lock_status in
+    0) ;;
+    75) exit 0 ;;  # another save is running now
+    *) exit 1 ;;
+esac
 
 previous=$(readlink -- "$state_dir/last" || true)
 previous_path=$previous
@@ -139,21 +224,34 @@ TMUX_RESURRECT_HOOK_OK=$(mktemp "$state_dir/.hook-ok.XXXXXXXX")
 export TMUX_RESURRECT_HOOK_OK
 trap 'rm -f -- "$TMUX_RESURRECT_HOOK_OK"' EXIT
 
-save_status=0
-"$save_script" quiet || save_status=$?
-
-# Upstream does not propagate hook errors; require a fresh successful hook.
-if [[ $save_status -ne 0 || ! -s $TMUX_RESURRECT_HOOK_OK ]]; then
+restore_previous_last() {
     if [[ -n $previous ]]; then
         ln -sfn -- "$previous" "$state_dir/last"
     else
         rm -f -- "$state_dir/last"
     fi
+}
+# save.sh repoints "last" before the checks below.  A stop meanwhile (logout,
+# launchctl bootout, the autosave watchdog, systemd stopping the service)
+# must not leave it on an unverified snapshot.  bash runs this trap once the
+# running save.sh has exited; a signal to the whole process group ends
+# save.sh too.
+trap 'restore_previous_last
+printf "%s\n" "tmux-resurrect: save interrupted; previous snapshot preserved." >&2
+exit 1' TERM INT HUP
+
+save_status=0
+"$save_script" quiet || save_status=$?
+
+# Upstream does not propagate hook errors; require a fresh successful hook.
+if [[ $save_status -ne 0 || ! -s $TMUX_RESURRECT_HOOK_OK ]]; then
+    restore_previous_last
     printf '%s\n' 'tmux-resurrect save or AI metadata hook failed; previous snapshot preserved.' >&2
     exit 1
 fi
 current=$(readlink -- "$state_dir/last")
 test -s "$state_dir/$current"
+trap - TERM INT HUP
 # This server's state is now what "last" holds, so later saves may follow.
 tmux set-option -g "$RESTORE_STATE_OPTION" on
 tmux set-option -g @continuum-save-last-timestamp "$(date +%s)"

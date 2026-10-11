@@ -35,6 +35,15 @@ import tempfile
 import time
 import unittest
 
+
+def setUpModule():
+    # tmux-service-start is the Linux login path (systemd user units, X11 and
+    # Wayland session variables, xauth, GNU tools).  macOS starts tmux with
+    # tmux/tmux-launchd-start: tests/integration/test_tmux_launchd_scripts.py.
+    if not sys.platform.startswith("linux"):
+        raise unittest.SkipTest("tmux-service-start and its systemd units are Linux-only")
+
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = REPO_ROOT / "tmux/tmux-service-start"
 TMUX_CONF = SCRIPT.parent / "tmux.conf"

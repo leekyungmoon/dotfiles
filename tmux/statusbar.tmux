@@ -85,7 +85,17 @@ main() {
   # [right status] CPU Usage
   status_right+="#($cwd/statusbar.tmux component-cpu -S $session_name)"
   # [right status] Memory Usage
-  status_right+="#($cwd/statusbar.tmux component-ram -S $session_name)"
+  # macOS: the installed memory (hw.memsize, bytes) never changes while the
+  # machine runs, so it is read once here and handed to every refresh of the
+  # job through its environment.
+  local ram_env="" mem_bytes=""
+  if [[ $(uname -s) == Darwin ]]; then
+    mem_bytes="$(sysctl -n hw.memsize 2>/dev/null || true)"
+    if [[ $mem_bytes =~ ^[0-9]+$ ]]; then
+      ram_env="STATUSBAR_MEM_BYTES=$mem_bytes "
+    fi
+  fi
+  status_right+="#(${ram_env}$cwd/statusbar.tmux component-ram -S $session_name)"
   # [right status] GPU Usage
   if [ -d /sys/module/nvidia ] && command -v gpustat &> /dev/null; then
     status_right+="#($cwd/statusbar.tmux component-gpu -S $session_name)"
@@ -167,7 +177,8 @@ component-cpu() {
   local colors=(${reds[1]} ${reds[2]} ${reds[3]} ${reds[4]} ${reds[7]})  # not linear
 
   cpu-usage | while IFS= read -r cpu_percentage; do
-    local bgcolor="${colors[$(( ${cpu_percentage%.*} / 20 ))]:-${colors[-1]}}"
+    # (the last color by length: bash 3.2, macOS's /bin/bash, has no [-1])
+    local bgcolor="${colors[$(( ${cpu_percentage%.*} / 20 ))]:-${colors[${#colors[@]}-1]}}"
     local colorfmt="bg=$bgcolor,fg=white"
 
     printf "#[bg=#1c1c1c,fg=$bgcolor,nobold,nounderscore,noitalics]"
@@ -212,7 +223,14 @@ component-ram() {
       if ! command -v vm_stat 2>&1 > /dev/null; then return 1; fi
       mem_used=$(vm_stat | grep ' active\|wired ' | sed 's/[^0-9]//g' | paste -sd ' ' - | \
           awk -v pagesize=$(pagesize) '{ printf "%.2f\n", ($1 + $2) * pagesize / 1024^3 }')
-      mem_total=$(system_profiler SPHardwareDataType | grep "Memory:" | awk '{ print $2 }')
+      # Total from hw.memsize, as main() read it (STATUSBAR_MEM_BYTES), not
+      # from `system_profiler SPHardwareDataType`, which takes about a second
+      # of CPU on every refresh.
+      local mem_bytes="${STATUSBAR_MEM_BYTES:-}"
+      if ! [[ $mem_bytes =~ ^[0-9]+$ ]]; then
+        mem_bytes=$(sysctl -n hw.memsize)
+      fi
+      mem_total=$(awk -v bytes="$mem_bytes" 'BEGIN { printf "%.2f\n", bytes / 1024^3 }')
       mem_percentage=$(echo "$mem_used $mem_total" | awk '{ printf "%.0f", 100 * $1 / $2 }')
     ;;
     *) return 1;;
