@@ -26,6 +26,7 @@ import os
 import os.path
 import pwd
 import shlex
+import shutil
 import stat
 import tempfile
 
@@ -81,6 +82,98 @@ def _python():
     return sys.executable or 'python3'
 
 
+def _darwin_host():
+    '''Whether this runs on macOS (tests patch it).'''
+    return sys.platform == 'darwin'
+
+
+# --- the python that runs install.py --------------------------------------------
+#
+# install.py needs python 3.10 or newer. On macOS the python3 on PATH may be
+# the Command Line Tools' /usr/bin/python3, which is 3.9 (bin/dotfiles itself
+# still runs under it), and etc/install keeps no record of the python it
+# chose. So a command that runs git or install.py first re-executes itself
+# under a python3 that is new enough: Homebrew's, in the prefix etc/install
+# uses (an absolute $HOMEBREW_PREFIX, else /opt/homebrew on arm64 and
+# /usr/local on x86_64, by uname -m), else the newest python3.N (3.10 or
+# newer) on PATH. Without one it stops before changing anything. On Ubuntu
+# python3 is new enough: nothing changes there.
+
+MIN_PYTHON = (3, 10)
+# What etc/install's _python_ok runs: exit 0 for 3.10 or newer.
+PYTHON_CHECK = 'import sys; sys.exit(sys.version_info < (3, 10))'
+# replaced by the tests
+_execv = os.execv
+
+
+def _python_version():
+    return tuple(sys.version_info[:2])
+
+
+def _homebrew_prefix():
+    '''Homebrew's prefix, by etc/install's rule; None for another machine.'''
+    prefix = os.environ.get('HOMEBREW_PREFIX', '')
+    if prefix.startswith('/'):
+        while prefix.endswith('/') and prefix != '/':
+            prefix = prefix[:-1]
+        return prefix
+    return {'arm64': '/opt/homebrew', 'x86_64': '/usr/local'}.get(os.uname()[4])
+
+
+def _python_ok(python):
+    '''Whether ``python`` runs and is 3.10 or newer.'''
+    try:
+        return subprocess.call([python, '-c', PYTHON_CHECK], stdin=subprocess.DEVNULL,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                               timeout=60) == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def _newer_python():
+    '''A python3 of 3.10 or newer, other than this one, or None.'''
+    candidates = []
+    prefix = _homebrew_prefix()
+    if prefix:
+        candidates.append(os.path.join(prefix, 'bin', 'python3'))
+    for minor in range(29, 9, -1):  # python3.29 ... python3.10, newest first
+        found = shutil.which('python3.%d' % minor)
+        if found:
+            candidates.append(found)
+    this = os.path.realpath(sys.executable) if sys.executable else None
+    for candidate in candidates:
+        if not (os.path.isfile(candidate) and os.access(candidate, os.X_OK)):
+            continue
+        if os.path.realpath(candidate) == this:
+            continue  # never re-execute the same python
+        if _python_ok(candidate):
+            return candidate
+    return None
+
+
+def _require_python():
+    '''Return when this python can run install.py; else re-execute this
+    command under one that can (same arguments, same process), or exit 2.'''
+    if _python_version() >= MIN_PYTHON:
+        return
+    python = _newer_python()
+    problem = 'no newer one was found'
+    if python is not None:
+        sys.stdout.flush()
+        sys.stderr.flush()
+        try:
+            _execv(python, [python, '-B', os.path.abspath(__file__)] + sys.argv[1:])
+        except OSError as exc:
+            problem = 'running {} failed ({})'.format(python, exc)
+    remedy = ("run 'brew install python3'" if _darwin_host()
+              else 'install python3 3.10 or newer')
+    print(RED('dotfiles needs python 3.10 or newer to run install.py, but this is '
+              'python {} ({}) and {}; {}, then rerun. Nothing was changed.'.format(
+                  '.'.join(map(str, _python_version())), sys.executable or 'python3',
+                  problem, remedy)))
+    sys.exit(2)
+
+
 def _installer(*args):
     '''Delegate to ~/.dotfiles/install.py (bytecode off: nothing lands in the checkout).'''
     dotfiles_dir = _dotfiles_dir()
@@ -98,8 +191,10 @@ def _unknown(argv):
 @add_argument('--fast', action='store_true', help='Skip all slow updates (zsh/vim plugins)')
 @add_argument('--skip-zplug', action='store_true', help='Skip updating zsh plugins (antidote)')
 @add_argument('--skip-vimplug', action='store_true', help='Skip updating vim plugins (lazy.nvim)')
-@add_argument('--no-packages', action='store_true', help='Skip apt packages and pinned tools')
-@add_argument('--no-gui', action='store_true', help='Skip desktop (GNOME) settings')
+@add_argument('--no-packages', action='store_true',
+              help='Skip system packages (apt or Homebrew) and pinned tools')
+@add_argument('--no-gui', action='store_true',
+              help='Skip desktop (GNOME) settings (Linux; macOS has none)')
 @add_argument('--no-shell-change', action='store_true', help='Do not run chsh')
 def update(fast=False,
            skip_zplug=False,
@@ -248,6 +343,15 @@ def update(fast=False,
 # runs on top of the parent, which waits for it: run as part of a longer
 # command line ('dotfiles update && make') or from a sourced script, the rest
 # runs once that shell exits.
+#
+# macOS has no /proc. There the same facts about the parent come from
+# libproc and sysctl, through installer/darwin_proc.py of this checkout (as
+# for tmux/resurrect-ai-session.py): its argv, its name and executable, the
+# files of its descriptors 0 and 1 and whether one of its descriptors is the
+# shell-hook file (by path, or by device and inode). A descriptor table that
+# cannot be read, a removed file without a name (macOS gives none the Linux
+# " (deleted)" mark, so it might be the hook) or a backend that does not work
+# on this Mac all count against the exec, as above.
 
 _SHELL_NAMES = ('zsh', 'bash')
 HOOK_FILE_SUFFIX = '/personal-dotfiles/shell-hook'
@@ -298,6 +402,8 @@ def _is_hooked(pid, hook_file=None):
         hook_id = (st_hook.st_dev, st_hook.st_ino)
     except OSError:
         hook_id = None
+    if _darwin_host():
+        return _darwin_is_hooked(pid, hook_file, hook_id)
     fd_dir = '/proc/%d/fd' % pid
     try:
         names = os.listdir(fd_dir)
@@ -361,6 +467,8 @@ def interactive_invocation(argv):
 
 
 def _cmdline(pid):
+    if _darwin_host():
+        return _darwin_cmdline(pid)
     with open('/proc/%d/cmdline' % pid, 'rb') as f:
         data = f.read()
     if not data:
@@ -370,6 +478,8 @@ def _cmdline(pid):
 
 def _shell_process(pid):
     '''pid runs zsh or bash, by its comm and by its executable.'''
+    if _darwin_host():
+        return _darwin_shell_process(pid)
     with open('/proc/%d/comm' % pid) as f:
         comm = f.read().strip()
     exe = os.readlink('/proc/%d/exe' % pid)
@@ -379,6 +489,8 @@ def _shell_process(pid):
 
 
 def _same_terminal(pid, tty):
+    if _darwin_host():
+        return _darwin_same_terminal(pid, tty)
     for fd in (0, 1):
         try:
             if os.path.realpath(os.readlink('/proc/%d/fd/%d' % (pid, fd))) != tty:
@@ -386,6 +498,105 @@ def _same_terminal(pid, tty):
         except OSError:
             return False
     return True
+
+
+# macOS: the same checks through installer/darwin_proc.py (see above).
+
+_LIBPROC = []  # [the module, or None when it cannot be used], once known
+
+
+def _import_darwin_proc():
+    '''installer/darwin_proc.py of this checkout: two levels above this file,
+    whichever link ran it. Bytecode off (the checkout is installer-owned
+    source) and the checkout first on sys.path for the import, so that
+    another package named installer (pypa's, in site-packages) never
+    stands in.'''
+    sys.dont_write_bytecode = True
+    root = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+    added = root not in sys.path
+    if added:
+        sys.path.insert(0, root)
+    try:
+        from installer import darwin_proc
+    finally:
+        if added:
+            sys.path.remove(root)
+    return darwin_proc
+
+
+def _darwin_proc():
+    '''installer/darwin_proc.py when it can inspect processes on this Mac,
+    else None.'''
+    if not _LIBPROC:
+        try:
+            module = _import_darwin_proc()
+            _LIBPROC.append(module if module.available() else None)
+        except Exception:  # a checkout without it, or a broken one
+            _LIBPROC.append(None)
+    return _LIBPROC[0]
+
+
+def _darwin_ask(name, *args):
+    '''darwin_proc.<name>(*args), or None: cannot tell (its calls are
+    written never to raise; one that does all the same counts the same).'''
+    backend = _darwin_proc()
+    if backend is None:
+        return None
+    try:
+        return getattr(backend, name)(*args)
+    except Exception:
+        return None
+
+
+def _darwin_cmdline(pid):
+    argv = _darwin_ask('argv', pid)
+    if argv is None:
+        raise OSError('cannot read the argv of process %d' % pid)
+    # Exact, empty arguments included: drop the trailing ones, as the /proc
+    # reader does, so that both give the same argv.
+    while argv and not argv[-1]:
+        argv = argv[:-1]
+    return argv
+
+
+def _darwin_shell_process(pid):
+    info = _darwin_ask('bsd_info', pid)
+    exe = _darwin_ask('exe', pid)
+    if info is None or not exe:
+        raise OSError('cannot inspect process %d' % pid)
+    return info.comm in _SHELL_NAMES and os.path.basename(exe) in _SHELL_NAMES
+
+
+def _darwin_same_terminal(pid, tty):
+    entries = _darwin_ask('open_vnodes', pid)
+    if entries is None:
+        return False
+    paths = dict((entry.fd, entry.path) for entry in entries)
+    for fd in (0, 1):
+        path = paths.get(fd)
+        if not path or os.path.realpath(path) != tty:
+            return False
+    return True
+
+
+def _darwin_is_hooked(pid, hook_file, hook_id):
+    '''_is_hooked on macOS: a descriptor whose path is the hook file (or any
+    .../personal-dotfiles/shell-hook), or which is that file by device and
+    inode. True as well when the table cannot be read, and for a removed
+    file without a name: it might be the hook.'''
+    entries = _darwin_ask('open_vnodes', pid)
+    if entries is None:
+        return True
+    if hook_id is not None:  # libproc reports the 32-bit device number
+        hook_id = (hook_id[0] & 0xFFFFFFFF, hook_id[1])
+    for entry in entries:
+        if entry.path and (entry.path == hook_file or entry.path.endswith(HOOK_FILE_SUFFIX)):
+            return True
+        if hook_id is not None and (entry.dev, entry.ino) == hook_id:
+            return True
+        if entry.nlink == 0 and not entry.path:
+            return True
+    return False
 
 
 def _login_shell(uid):
@@ -461,11 +672,11 @@ def _available_packages():
 def install_local(target, force=False, argv=()):
     '''
     Install pinned tools from manifests/tools.json into ~/.local (without sudo).
-    Available only in Linux.
+    Available on Linux and macOS.
     '''
 
-    if not sys.platform.startswith('linux'):
-        print("Error: only available on linux systems.")
+    if not (sys.platform.startswith('linux') or _darwin_host()):
+        print("Error: only available on Linux and macOS.")
         sys.exit(1)
 
     if not isinstance(target, (list, tuple)):
@@ -527,8 +738,10 @@ def restore(baseline=False, run=None, force=False, ids=None, argv=()):
 
 @add_argument('--skip-zplug', action='store_true', help='Skip updating zsh plugins')
 @add_argument('--skip-vimplug', action='store_true', help='Skip updating vim plugins')
-@add_argument('--no-packages', action='store_true', help='Skip apt packages and pinned tools')
-@add_argument('--no-gui', action='store_true', help='Skip desktop (GNOME) settings')
+@add_argument('--no-packages', action='store_true',
+              help='Skip system packages (apt or Homebrew) and pinned tools')
+@add_argument('--no-gui', action='store_true',
+              help='Skip desktop (GNOME) settings (Linux; macOS has none)')
 @add_argument('--no-shell-change', action='store_true', help='Do not run chsh')
 def repair(skip_zplug=False, skip_vimplug=False, no_packages=False, no_gui=False,
            no_shell_change=False, argv=()):
@@ -545,11 +758,27 @@ def repair(skip_zplug=False, skip_vimplug=False, no_packages=False, no_gui=False
     return _installer(*args)
 
 
-@add_argument('--autostart', action='store_true', help='Bounded login-time retry mode (used by the autostart entry)')
-def gui_apply(autostart=False, argv=()):
-    '''Apply pending GNOME settings now (install.py gui-apply).'''
+@add_argument('words', nargs='*', metavar='ARG',
+              help='status (the default), enable or disable, then tmux and/or '
+                   'autosave (default: both)')
+def services(words=(), argv=()):
+    '''Show, enable or disable tmux at login and its 1-minute autosave (install.py services).'''
 
     if _unknown(argv):
+        return 2
+    return _installer('services', *words)
+
+
+@add_argument('--autostart', action='store_true', help='Bounded login-time retry mode (used by the autostart entry)')
+def gui_apply(autostart=False, argv=()):
+    '''Apply pending GNOME settings now (Linux only; install.py gui-apply).'''
+
+    if _unknown(argv):
+        return 2
+    if _darwin_host():
+        print(YELLOW('gui-apply is not applicable on macOS: it applies GNOME settings '
+                     'and input-remapper presets, which a Mac does not have. Nothing '
+                     'was changed.'))
         return 2
     return _installer('gui-apply', *(['--autostart'] if autostart else []))
 
@@ -562,6 +791,7 @@ def main():
         'status': status,
         'restore': restore,
         'repair': repair,
+        'services': services,
         'gui-apply': gui_apply,
     }
     for fn in COMMANDS.values():
@@ -591,6 +821,10 @@ def main():
         sys.exit(1)
     if unknown:
         kwargs['argv'] = unknown
+    # Every command but github runs git or install.py: under a python that
+    # install.py accepts, before any of that (see _require_python).
+    if command != 'github':
+        _require_python()
     refresh = command in ('update', 'repair')
     before = _read_generation() if refresh else None
     ret = COMMANDS[command](**kwargs)

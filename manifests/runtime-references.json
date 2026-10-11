@@ -15,7 +15,7 @@
     "nvim_python_host": "python3 on PATH (/usr/bin/python3 with apt python3-pynvim), unless $PYTHON3_HOST_PROG is set; no virtualenv is created",
     "staging": "${XDG_DATA_HOME:-$HOME/.local/share}/personal-dotfiles/staging (scratch clones only)",
     "generation": "${XDG_STATE_HOME:-$HOME/.local/state}/personal-dotfiles/generation (one line '<generation>', derived by install.py from the checkout's content and written atomically at the end of the post actions of every successful install, repair or update; read with zsh builtins, never written, by zsh/zsh.d/dotfiles-reload.zsh at every primary prompt and at Enter on it)",
-    "shell_hook": "${XDG_STATE_HOME:-$HOME/.local/state}/personal-dotfiles/shell-hook (empty, static, 0600, in the 0700 personal-dotfiles directory; created when missing and then held open read-only and close-on-exec by every interactive zsh that loaded zsh/zsh.d/dotfiles-reload.zsh, never written; a symlinked or foreign-owned directory or file, or a directory writable by others, is refused). A process holding an open descriptor on it (Linux: a /proc/<pid>/fd link to it; macOS: a descriptor libproc reports on that file) is a hooked shell that reloads itself: bin/dotfiles and installer/phases.py never exec over or respawn it. Across its own reload the shell passes a descriptor on it to the zsh it execs (_PD_RELOAD_HOOKFD); the new zsh closes that one once it holds its own, and only when it is that file (Linux: its /proc/<pid>/fd link; macOS: fstat, the same device and inode)",
+    "shell_hook": "${XDG_STATE_HOME:-$HOME/.local/state}/personal-dotfiles/shell-hook (empty, static, 0600, in the 0700 personal-dotfiles directory; created when missing and then held open read-only and close-on-exec by every interactive zsh that loaded zsh/zsh.d/dotfiles-reload.zsh, never written; a symlinked or foreign-owned directory or file, or a directory writable by others, is refused). A process holding an open descriptor on it is a hooked shell that reloads itself: bin/dotfiles and installer/phases.py never exec over or respawn it. They find that descriptor on Linux as a /proc/<pid>/fd link naming the file or any .../personal-dotfiles/shell-hook (also ' (deleted)'), or one on the same inode (installer/phases.py compares the inode only for a name ending in /shell-hook); on macOS among the descriptors libproc lists (installer/darwin_proc.py open_vnodes), by the same path rule or by the file's device and inode. A descriptor table that cannot be read, and on macOS a removed file the kernel gives no name (it has no ' (deleted)' mark there), count as hooked. Across its own reload the shell passes a descriptor on it to the zsh it execs (_PD_RELOAD_HOOKFD); the new zsh closes that one once it holds its own, and only when it is that file (Linux: its /proc/<pid>/fd link; macOS: fstat, the same device and inode)",
     "reload_handover": "$XDG_RUNTIME_DIR/personal-dotfiles (0700) when XDG_RUNTIME_DIR is a directory owned by the user that nobody else can use (in memory, not on disk; never on macOS, where an XDG_RUNTIME_DIR a user exports is no in-memory directory), else, on macOS, ${TMPDIR%/}/personal-dotfiles (0700) when $TMPDIR is a directory owned by the user that nobody else can use (the per-user /var/folders/.../T/ the system makes: on disk, outside $HOME), else ${XDG_STATE_HOME:-$HOME/.local/state}/personal-dotfiles: .handover.<pid> (the records a reloading zsh hands to the zsh it execs, 0600, O_EXCL, unlinked as soon as it is reopened for reading; the new zsh reads the descriptor only when it is that file: by its /proc/<pid>/fd link on Linux, by fstat on macOS, a regular file of the user's, unlinked, 0600) and .hist.<pid> (that shell's history list, 0600, removed by the new shell once zsh has read it; a session that keeps no history, HISTFILE unset or SAVEHIST=0, writes it only in the XDG_RUNTIME_DIR place, so never on macOS). Both exist only while one shell reloads itself; leftovers of a shell that died meanwhile are removed at the next zsh startup (a pid lives while /proc/<pid> exists, on macOS while 'kill -0' succeeds)"
   },
   "scan": {
@@ -1372,6 +1372,21 @@
       ]
     },
     {
+      "id": "macos-terminal-shell-sessions",
+      "entrypoint": "macOS Terminal.app: /etc/zshrc_Apple_Terminal, loaded by the /etc/zshrc that zsh/zshrc sources (per-window shell sessions, saved from a zshexit hook)",
+      "before": "a history and a session file per Terminal window under ~/.zsh_sessions, beside the one ~/.zsh_history",
+      "after": "zsh/zshenv exports SHELL_SESSIONS_DISABLE=1 on macOS (Apple's documented switch), so nothing is written under ~/.zsh_sessions and the history stays in the one ~/.zsh_history (the reload hand-over relies on it); the window's working directory (OSC 7) still works. Nothing under the checkout either way",
+      "status": "inert",
+      "checks": [
+        {
+          "file": "zsh/zshenv",
+          "require": [
+            "export SHELL_SESSIONS_DISABLE=1"
+          ]
+        }
+      ]
+    },
+    {
       "id": "p10k-caches",
       "entrypoint": "powerlevel10k instant prompt and gitstatus",
       "before": "${XDG_CACHE_HOME:-~/.cache}/p10k-instant-prompt-*.zsh and ${XDG_CACHE_HOME:-~/.cache}/gitstatus/",
@@ -1593,14 +1608,15 @@
       "id": "dotfiles-update",
       "entrypoint": "bin/dotfiles update [--fast|--skip-zplug|--skip-vimplug]",
       "before": "cd ~/.dotfiles; git fetch origin; git stash push; git merge --ff-only; python3 install.py; git stash pop (applied whatever stash was newest)",
-      "after": "upstream-style, in place in ~/.dotfiles (kept by decision): git fetch origin; tracked edits are stashed and the entry this run created is identified by the stash reflog; git merge --ff-only; git submodule update --init --recursive; python3 -B install.py; that entry is re-applied by commit id and dropped. If it conflicts, a checkout that was clean is reset to the updated commit, the entry stays in the stash, recovery steps are printed and the exit status is 3",
+      "after": "upstream-style, in place in ~/.dotfiles (kept by decision): git fetch origin; tracked edits are stashed and the entry this run created is identified by the stash reflog; git merge --ff-only; git submodule update --init --recursive; <python> -B install.py, <python> being the one running bin/dotfiles, 3.10 or newer (on macOS it first re-executes itself under Homebrew's python3 when it runs under the Command Line Tools' 3.9); that entry is re-applied by commit id and dropped. If it conflicts, a checkout that was clean is reset to the updated commit, the entry stays in the stash, recovery steps are printed and the exit status is 3",
       "status": "in-checkout-accepted",
       "checks": [
         {
           "file": "bin/dotfiles",
           "require": [
             "git merge --ff-only",
-            "git stash apply --index -q \"\\$stash\""
+            "git stash apply --index -q \"\\$stash\"",
+            "_execv\\(python, \\[python, '-B', os\\.path\\.abspath\\(__file__\\)\\] \\+ sys\\.argv\\[1:\\]\\)"
           ],
           "forbid": [
             "git stash pop"
@@ -1634,6 +1650,22 @@
           "file": "bin/dotfiles",
           "require": [
             "args = \\['repair'\\]"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "dotfiles-services",
+      "entrypoint": "bin/dotfiles services [status|enable|disable] [tmux|autosave ...]",
+      "before": "did not exist upstream",
+      "after": "delegates to `install.py services` with cwd = the checkout and returns its exit status: on macOS that shows, unloads and disables, or enables and loads the two tmux LaunchAgents with launchctl (see writers.launchd-agents); on Linux it only prints the systemctl --user commands. bin/dotfiles itself writes nothing",
+      "status": "redirected",
+      "checks": [
+        {
+          "file": "bin/dotfiles",
+          "require": [
+            "return _installer\\('services', \\*words\\)",
+            "'services': services,"
           ]
         }
       ]
@@ -1757,9 +1789,9 @@
     },
     {
       "id": "python-bytecode-checkout",
-      "entrypoint": "python imports of modules inside the checkout: bin/dotfiles and etc/install -> install.py -> installer/*.py; tmux/resurrect-ai-session.py -> installer/darwin_proc.py (macOS only); tests importing tools/, tmux/resurrect-ai-session.py, desktop/input-remapper/; install.py's macOS post actions run tmux/resurrect-ai-session.py --self-test as a script (the same no-bytecode path as the hook; its test files live in a TemporaryDirectory under TMPDIR and are removed)",
+      "entrypoint": "python imports of modules inside the checkout: bin/dotfiles and etc/install -> install.py -> installer/*.py; tmux/resurrect-ai-session.py and bin/dotfiles -> installer/darwin_proc.py (macOS only); tests importing tools/, tmux/resurrect-ai-session.py, desktop/input-remapper/; install.py's macOS post actions run tmux/resurrect-ai-session.py --self-test as a script (the same no-bytecode path as the hook; its test files live in a TemporaryDirectory under TMPDIR and are removed)",
       "before": "__pycache__/ under installer/, tools/, tmux/, desktop/, tests/ of the checkout (gitignored, but writes into installer-owned source)",
-      "after": "install.py sets sys.dont_write_bytecode before importing installer/ and bin/dotfiles runs it with -B; zsh/ and tmux.conf start no python from the checkout; resurrect.conf runs resurrect-ai-session.py as a script (a __main__ script writes no bytecode), and on macOS that script sets sys.dont_write_bytecode before it imports installer/darwin_proc.py from its own checkout (Linux never imports it). Test runners must use python -B / PYTHONDONTWRITEBYTECODE=1",
+      "after": "install.py sets sys.dont_write_bytecode before importing installer/ and bin/dotfiles runs it with -B (and re-executes itself with -B under a newer python when its own is older than 3.10); zsh/ and tmux.conf start no python from the checkout; resurrect.conf runs resurrect-ai-session.py as a script (a __main__ script writes no bytecode), and on macOS that script, and bin/dotfiles when it inspects the shell that ran it, set sys.dont_write_bytecode before they import installer/darwin_proc.py from their own checkout (Linux never imports it). Test runners must use python -B / PYTHONDONTWRITEBYTECODE=1",
       "status": "redirected",
       "evidence": "static: markers below. Dev-time test runs without -B still create __pycache__ (seen for tests/unit, tmux/, tools/, installer/ during the parallel lane work)",
       "checks": [
@@ -1773,7 +1805,8 @@
           "file": "bin/dotfiles",
           "require": [
             "sys\\.dont_write_bytecode = True",
-            "'-B'"
+            "'-B'",
+            "(?s)def _import_darwin_proc\\(\\):.*?sys\\.dont_write_bytecode = True\\n.*?from installer import darwin_proc"
           ]
         },
         {
@@ -1800,7 +1833,7 @@
       "id": "tmux-launchd-agent-runs",
       "entrypoint": "macOS LaunchAgents com.github.leekyungmoon.dotfiles.tmux (tmux/tmux-launchd-start, when loaded: GUI login, install/repair) and com.github.leekyungmoon.dotfiles.tmux-resurrect-autosave (tmux/resurrect-autosave, every 60 s)",
       "before": "none (new on macOS; on Linux tmux.service and tmux-resurrect-autosave.timer log to the systemd journal)",
-      "after": "launchd appends both programs' stdout and stderr to ${XDG_STATE_HOME:-~/.local/state}/personal-dotfiles/launchd/<label>.log (plist StandardOutPath/StandardErrorPath; directory 0700, created by the installer); past 1 MiB a run renames it to <label>.log.1 (one older generation) and continues in a new <label>.log; resurrect-autosave holds resurrect-save's stderr for one run in a mktemp file under ${TMPDIR:-/tmp}, removed on exit; tmux-launchd-start starts `tmux new-session -d -s __continuum_startup` in ~ and records the server options @tmux-restore-status, resurrect-autosave @tmux-autosave-skip-reported (memory only)",
+      "after": "launchd appends both programs' stdout and stderr to ${XDG_STATE_HOME:-~/.local/state}/personal-dotfiles/launchd/<label>.log (plist StandardOutPath/StandardErrorPath; directory 0700, created by the installer); past 1 MiB a run renames it to <label>.log.1 (one older generation) and continues in a new <label>.log; resurrect-autosave holds resurrect-save's stderr for one run in a mktemp file under ${TMPDIR:-/tmp}, removed on exit; tmux-launchd-start starts `tmux new-session -d -s __continuum_startup` in ~; when tmux-continuum skipped the login restore and that session is still untouched, it runs @resurrect-restore-script-path itself (TMUX naming that server), the restore continuum would have run (see writers.tmux-resurrect-dir); it records the server option @tmux-restore-status, resurrect-autosave @tmux-autosave-skip-reported (memory only; an install or repair that converges the running server keeps both, installer/phases.py RUNTIME_USER_OPTIONS)",
       "status": "outside-checkout",
       "evidence": "tests/integration/test_tmux_launchd_scripts.py: log rotation for both programs under dash and bash 3.2, the temporary file removed, private tmux servers only; nothing is written under the checkout",
       "checks": [
@@ -1810,7 +1843,8 @@
             "PERSONAL_DOTFILES_LAUNCHD_LOG",
             "mv -f \"\\$log\" \"\\$log\\.1\"",
             "cd \"\\$HOME\" \\|\\| exit 1",
-            "@tmux-restore-status"
+            "@tmux-restore-status",
+            "TMUX=\\$server,-1 \"\\$script\""
           ]
         },
         {
@@ -1821,6 +1855,13 @@
             "mktemp \"\\$\\{TMPDIR:-/tmp\\}/resurrect-autosave\\.XXXXXX\"",
             "trap 'rm -f \\\"\\$errors\\\"' EXIT",
             "@tmux-autosave-skip-reported"
+          ]
+        },
+        {
+          "file": "installer/phases.py",
+          "require": [
+            "RUNTIME_USER_OPTIONS = frozenset\\(\\{[^}]*\"@tmux-restore-status\"",
+            "RUNTIME_USER_OPTIONS = frozenset\\(\\{[^}]*\"@tmux-autosave-skip-reported\""
           ]
         }
       ]
@@ -1867,7 +1908,7 @@
     },
     {
       "id": "launchd-agents",
-      "entrypoint": "install.py install / repair on macOS (installer/launchd.py; the post actions in installer/phases.py), install.py services enable|disable and restore",
+      "entrypoint": "install.py install / repair on macOS (installer/launchd.py; the post actions in installer/phases.py), install.py services enable|disable (also as bin/dotfiles services) and restore",
       "before": "none (new on macOS; on Linux tmux.service and tmux-resurrect-autosave.timer are systemd user units)",
       "after": "the transaction writes ~/Library/LaunchAgents/com.github.leekyungmoon.dotfiles.tmux.plist and ~/Library/LaunchAgents/com.github.leekyungmoon.dotfiles.tmux-resurrect-autosave.plist (rendered per home with absolute paths, mode 0644, entry ids launchd-tmux and launchd-tmux-resurrect-autosave; backed up, drift-checked and restored like every managed path); the macOS post actions create ${XDG_STATE_HOME:-~/.local/state}/personal-dotfiles/launchd (0700) for the agents' logs and load both into gui/<uid> with launchctl bootstrap (after launchctl bootout when the transaction rewrote a plist, never when nothing changed); services disable runs launchctl bootout and launchctl disable (persistent until services enable runs launchctl enable and bootstrap); restore unloads an agent whose plist it removed. Nothing is written under the checkout",
       "status": "outside-checkout",

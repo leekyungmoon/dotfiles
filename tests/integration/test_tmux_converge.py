@@ -24,15 +24,31 @@ source HOOK_STUB, which holds the fd exactly as the contract says (read-only,
 close-on-exec, via zsh/system sysopen). HOOK_SOURCE says which one ran;
 PD_TEST_HOOK_SOURCE=stub or module forces one.
 
-TMUX_TEST_BINARY selects the tmux to test (default /usr/bin/tmux).
+TMUX_TEST_BINARY selects the tmux to test (default /usr/bin/tmux; on macOS
+Homebrew's).
+
+macOS has no /proc: there installer/phases.py inspects the pane processes
+through installer/darwin_proc.py (libproc and sysctl), and so does this
+test's own bookkeeping. The same decisions are checked on Linux too: by
+scripted fake backends (ScriptedLibprocTests), and with the real
+darwin_proc over LinuxLibSystem from tests/unit/test_darwin_proc.py, which
+answers libproc's calls from /proc in macOS's layouts and conventions
+(SimulatedLibprocProcessTests, SimulatedMacosConvergeTests). On a Mac,
+DarwinLibprocProcessTests and the converge tests run against the real
+libproc.
 """
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
+import pty
 import re
+import select
+import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -46,11 +62,24 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 import install  # noqa: E402
+from installer import darwin_proc  # noqa: E402
 from installer import phases  # noqa: E402
 from installer.platform import Target  # noqa: E402
 from installer.runner import Runner  # noqa: E402
 
-TMUX = os.environ.get("TMUX_TEST_BINARY") or shutil.which("tmux", path="/usr/bin:/bin")
+DARWIN = sys.platform == "darwin"
+LINUX_PROC = sys.platform.startswith("linux") and os.path.isdir("/proc/self/fd")
+# LinuxLibSystem and use_library: libproc's calls answered from Linux's
+# /proc, so phases.py's macOS code runs on Linux with the real darwin_proc.
+_HELPERS = importlib.util.spec_from_file_location(
+    "darwin_proc_test_helpers",
+    REPO_ROOT / "tests" / "unit" / "test_darwin_proc.py")
+DARWIN_PROC_TESTS = importlib.util.module_from_spec(_HELPERS)
+_HELPERS.loader.exec_module(DARWIN_PROC_TESTS)
+
+# Homebrew's tmux on macOS (the system has none).
+_TMUX_PATH = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin" if DARWIN else "/usr/bin:/bin"
+TMUX = os.environ.get("TMUX_TEST_BINARY") or shutil.which("tmux", path=_TMUX_PATH)
 ZSH = shutil.which("zsh", path="/usr/bin:/bin")
 UPSTREAM_REV = "097d88d8"  # wookayin/dotfiles' tmux.conf before this repository
 ZSH_SETTINGS = REPO_ROOT / "zsh" / "zsh.d" / "zsh_custom_settings.zsh"
@@ -130,59 +159,114 @@ class IsolatedRunner(Runner):
                 raise AssertionError(f"tmux call without an isolated env: {argv}")
             tmpdir = env.get("TMUX_TMPDIR", "")
             private = tmpdir.startswith(self.root + "/")
+            # The defaults server's own mkdtemp directory, in one of the roots
+            # phases._short_socket_dir tries (/tmp when TMPDIR is too long
+            # for a socket path).
+            roots = {tempfile.gettempdir(), "/tmp", env.get("XDG_RUNTIME_DIR") or "/tmp"}
             probe = (os.path.basename(tmpdir).startswith("pdfs-") and "-L" in argv
-                     and os.path.isdir(tmpdir) and tmpdir.startswith(tempfile.gettempdir()))
+                     and os.path.isdir(tmpdir) and os.path.dirname(tmpdir) in roots)
             if not (private or probe) or "-S" in argv:
                 raise AssertionError(f"tmux call outside the test servers: {argv} {tmpdir}")
         return super().run(argv, timeout=timeout, check=check, env=env, input=input,
                            cwd=cwd, read_only=read_only)
 
-    def which(self, name):
-        return TMUX if name == "tmux" else shutil.which(name)
+    def which(self, name, path=None):
+        return TMUX if name == "tmux" else shutil.which(name, path=path)
+
+
+# The pinned plugins and upstream's tmux.conf, fetched once for every class
+# here that runs servers (a SkipTest says why they cannot be).
+_PLUGINS: dict = {}
+
+
+def _pinned_plugins() -> tuple[Path, str]:
+    if "skip" in _PLUGINS:
+        raise unittest.SkipTest(_PLUGINS["skip"])
+    if "dir" in _PLUGINS:
+        return _PLUGINS["dir"], _PLUGINS["upstream"]
+    holder = tempfile.TemporaryDirectory(prefix="pdfcv-plugins-")
+    plugin_dir = Path(holder.name)
+    git_env = {"PATH": "/usr/bin:/bin", "HOME": holder.name,
+               "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1",
+               "GIT_TERMINAL_PROMPT": "0"}
+    try:
+        upstream = subprocess.run(
+            ["git", "-C", str(REPO_ROOT), "show", f"{UPSTREAM_REV}:tmux/tmux.conf"],
+            env=git_env, check=True, capture_output=True, text=True).stdout
+    except subprocess.CalledProcessError as exc:
+        holder.cleanup()
+        _PLUGINS["skip"] = f"upstream tmux.conf {UPSTREAM_REV} unavailable: {exc}"
+        raise unittest.SkipTest(_PLUGINS["skip"])
+    plugins = phases.load_tmux_plugins(REPO_ROOT)
+    for plugin in plugins:
+        dest = plugin_dir / plugin["name"]
+        try:
+            subprocess.run(["git", "clone", "--quiet", "--no-checkout", plugin["url"],
+                            str(dest)], env=git_env, check=True, capture_output=True,
+                           timeout=180)
+            subprocess.run(["git", "-C", str(dest), "checkout", "--quiet", "--detach",
+                            plugin["commit"]], env=git_env, check=True,
+                           capture_output=True, timeout=60)
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+            holder.cleanup()
+            _PLUGINS["skip"] = f"cannot clone pinned {plugin['name']}: {exc}"
+            raise unittest.SkipTest(_PLUGINS["skip"])
+    _PLUGINS.update(holder=holder, dir=plugin_dir, upstream=upstream)
+    return plugin_dir, upstream
+
+
+def tearDownModule():
+    holder = _PLUGINS.pop("holder", None)
+    if holder is not None:
+        holder.cleanup()
+    _PLUGINS.clear()
+
+
+# What this test reads about a process itself (not the code under test):
+# /proc on Linux, as it always did; installer/darwin_proc.py on macOS.
+
+def process_children(pid: int) -> list[int]:
+    if DARWIN:
+        return sorted(darwin_proc.children(pid) or [])
+    out = []
+    for entry in os.listdir("/proc"):
+        stat = phases._proc_stat(int(entry)) if entry.isdigit() else None
+        if stat is not None and stat[1] == pid:
+            out.append(int(entry))
+    return out
+
+
+def process_exists(pid: int) -> bool:
+    if DARWIN:
+        return darwin_proc.bsd_info(pid) is not None
+    return os.path.exists(f"/proc/{pid}")
+
+
+def process_cwd(pid: int) -> str | None:
+    if DARWIN:
+        return darwin_proc.cwd(pid)
+    return os.readlink(f"/proc/{pid}/cwd")
 
 
 @unittest.skipUnless(TMUX and ZSH and BASH, "tmux, zsh and bash are required")
 class ConvergeRunningTmuxTests(unittest.TestCase):
     plugin_dir: Path
     upstream_conf: str
+    # Whether phases.py reads the pane processes through libproc (macOS,
+    # or SimulatedMacosConvergeTests), not /proc.
+    libproc = DARWIN
 
     @classmethod
     def setUpClass(cls):
-        cls._class_tmp = tempfile.TemporaryDirectory(prefix="pdfcv-plugins-")
-        cls.plugin_dir = Path(cls._class_tmp.name)
-        git_env = {"PATH": "/usr/bin:/bin", "HOME": cls._class_tmp.name,
-                   "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1",
-                   "GIT_TERMINAL_PROMPT": "0"}
-        try:
-            cls.upstream_conf = subprocess.run(
-                ["git", "-C", str(REPO_ROOT), "show", f"{UPSTREAM_REV}:tmux/tmux.conf"],
-                env=git_env, check=True, capture_output=True, text=True).stdout
-        except subprocess.CalledProcessError as exc:
-            cls._class_tmp.cleanup()
-            raise unittest.SkipTest(f"upstream tmux.conf {UPSTREAM_REV} unavailable: {exc}")
-        plugins = phases.load_tmux_plugins(REPO_ROOT)
-        for plugin in plugins:
-            dest = cls.plugin_dir / plugin["name"]
-            try:
-                subprocess.run(["git", "clone", "--quiet", "--no-checkout", plugin["url"],
-                                str(dest)], env=git_env, check=True, capture_output=True,
-                               timeout=180)
-                subprocess.run(["git", "-C", str(dest), "checkout", "--quiet", "--detach",
-                                plugin["commit"]], env=git_env, check=True,
-                               capture_output=True, timeout=60)
-            except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
-                cls._class_tmp.cleanup()
-                raise unittest.SkipTest(f"cannot clone pinned {plugin['name']}: {exc}")
-
-    @classmethod
-    def tearDownClass(cls):
-        cls._class_tmp.cleanup()
+        cls.plugin_dir, cls.upstream_conf = _pinned_plugins()
 
     # -- fixture -----------------------------------------------------------------
 
     def setUp(self):
-        # Short paths: a unix socket path must fit in 107 bytes.
-        self.root = Path(tempfile.mkdtemp(prefix="pdfcv", dir="/tmp"))
+        # Short paths: a unix socket path must fit in 107 bytes. Resolved:
+        # tmux records the resolved path of every config it loads, and /tmp
+        # is /private/tmp on macOS.
+        self.root = Path(os.path.realpath(tempfile.mkdtemp(prefix="pdfcv", dir="/tmp")))
         self.sockets: list[Path] = []
         self.home = self.root / "h"
         self.data = self.root / "d"
@@ -355,12 +439,7 @@ class ConvergeRunningTmuxTests(unittest.TestCase):
                          socket=socket).splitlines()
 
     def children(self, pid: int) -> list[int]:
-        out = []
-        for entry in os.listdir("/proc"):
-            stat = phases._proc_stat(int(entry)) if entry.isdigit() else None
-            if stat is not None and stat[1] == pid:
-                out.append(int(entry))
-        return out
+        return process_children(pid)
 
     def config_state(self, socket=None) -> dict:
         """What 'configured exactly like a fresh server' compares.
@@ -569,9 +648,9 @@ class ConvergeRunningTmuxTests(unittest.TestCase):
         # The respawned shell: a new process, same directory, the new setup.
         new_pid = self.wait_hooked(panes["upstream_idle"])
         self.assertNotEqual(new_pid, old_pid)
-        self.assertFalse(os.path.exists(f"/proc/{old_pid}"))
+        self.assertFalse(process_exists(old_pid))
         self.assertEqual(self.shells()[new_pid], TD)
-        self.assertEqual(os.readlink(f"/proc/{new_pid}/cwd"), str(self.work / "alpha"))
+        self.assertEqual(process_cwd(new_pid), str(self.work / "alpha"))
         self.assertEqual(self.pane(panes["upstream_idle"], "#{pane_current_path}"),
                          str(self.work / "alpha"))
         # The td alias works in the new shell (typed, not only defined).
@@ -796,11 +875,20 @@ class ConvergeRunningTmuxTests(unittest.TestCase):
         shutil.rmtree(self.hook_path.parent)
         self.install_new_setup()
         self.write_generation(self.generation)  # recreates the state directory
-        self.assertTrue(self.hooked(reader_pid))
+        # Linux names the removed file "... (deleted)": still the hook. macOS
+        # marks it in no way and may give it no name at all; then it cannot
+        # be told from any other removed file (None, "hook-unknown"). Either
+        # way the shell is left alone.
+        removed = self.hooked(reader_pid)
+        if self.libproc:
+            self.assertIsNot(removed, False)
+        else:
+            self.assertTrue(removed)
         self.assertTrue(self.hooked(other_pid))
         reasons, details = self.converge()
         self.assertEqual((reasons, details["outcome"]), ([], "converged"))
-        self.assertEqual((details["kept"], details["restarted"]), ({"hooked": 2}, []))
+        kept = {"hooked": 2} if removed else {"hook-unknown": 1, "hooked": 1}
+        self.assertEqual((details["kept"], details["restarted"]), (kept, []))
         self.assertEqual((self.pane_pid(reader), self.pane_pid(other)),
                          (reader_pid, other_pid))
         for pane in (reader, other):
@@ -837,8 +925,11 @@ class ConvergeRunningTmuxTests(unittest.TestCase):
             "    {'reasons': reasons, 'details': details, 'ppid': os.getppid(),\n"
             "     'tmux': 'TMUX' in os.environ}))\n"
             f"os.replace({str(out) + '.tmp'!r}, {str(out)!r})\n")
+        # The test's own python on macOS: python3 on PATH there may be the
+        # Command Line Tools' 3.9, or only a stub that offers to install them.
+        python = shlex.quote(sys.executable) if DARWIN else "python3"
         self.tmux("send-keys", "-t", installer_pane,
-                  f"PYTHONDONTWRITEBYTECODE=1 python3 -B {script}", "Enter")
+                  f"PYTHONDONTWRITEBYTECODE=1 {python} -B {script}", "Enter")
         result = json.loads(self.wait_until(lambda: out.exists() and out.read_text(),
                                             "the converge inside the pane", timeout=120))
         self.assertTrue(result["tmux"])  # it ran inside the server's pane
@@ -948,6 +1039,653 @@ class TmuxDefaultsTests(unittest.TestCase):
             with self.subTest(text=text):
                 quoted = phases.tmux_quote(text)
                 self.assertTrue(quoted[0] in "'\"" and quoted[-1] == quoted[0])
+
+
+class RuntimeOptionsTests(unittest.TestCase):
+    """What a converge keeps of a server's own state (the rest of the
+    reset is checked against live servers above)."""
+
+    def test_runtime_state_survives_the_reset(self):
+        defaults = phases.TmuxDefaults(keys=[], notes=[], options={"-g": {}}, hooks={})
+        state = {"@tmux-restore-complete": "on",
+                 "@continuum-save-last-timestamp": "1234567890",
+                 # macOS: tmux/tmux-launchd-start's login-restore outcome and
+                 # tmux/resurrect-autosave's once-per-server skip report.
+                 "@tmux-restore-status": "'restored 2026-10-12 08:00:00'",
+                 "@tmux-autosave-skip-reported": "1760252400",
+                 "@plugin": "tmux-plugins/tpm"}
+        lines = phases._reset_lines(
+            defaults, keys=[],
+            options={"-g": {name: (f"{name} {value}",) for name, value in state.items()}},
+            hooks={})
+        self.assertEqual(lines, ["set-option -gu @plugin"])
+        self.assertLessEqual(set(state) - {"@plugin"}, phases.RUNTIME_USER_OPTIONS)
+
+
+# --- macOS: the pane processes through installer/darwin_proc.py ------------------
+
+@unittest.skipUnless(LINUX_PROC, "LinuxLibSystem answers from Linux's /proc")
+class SimulatedMacosConvergeTests(ConvergeRunningTmuxTests):
+    """The converge tests whose decisions come from the pane processes, with
+    phases.py on its macOS path: the real installer/darwin_proc.py over
+    LinuxLibSystem instead of /proc. The same panes must get the same
+    decisions. The one difference is a hook file removed while a shell holds
+    it: LinuxLibSystem gives it no name (as macOS may), so that shell is
+    "hook-unknown" rather than "hooked", and is left alone all the same."""
+
+    libproc = True
+
+    def setUp(self):
+        super().setUp()
+        self.library = CountingLibSystem()
+        DARWIN_PROC_TESTS.use_library(self, self.library)
+        # Only the process backend is macOS's: the servers here are Linux's
+        # tmux, which reads /etc/tmux.conf (macOS's Homebrew tmux reads its own).
+        for name, value in (("_darwin_host", lambda: True),
+                            ("system_tmux_conf", lambda env=None: Path("/etc/tmux.conf"))):
+            patcher = mock.patch.object(phases, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def converge(self, *args, **kwargs):
+        before = self.library.calls
+        reasons, details = super().converge(*args, **kwargs)
+        if details.get("restarted") or details.get("kept"):
+            # Every pane decision came from libproc.
+            self.assertGreater(self.library.calls, before)
+        return reasons, details
+
+    # Nothing in these depends on how processes are inspected (and the last
+    # one converges from a python of its own, without the macOS path).
+    test_continuum_does_not_restore_into_the_converged_server = None
+    test_the_wait_is_what_prevents_the_duplicate_restore = None
+    test_inherited_tmux_variable_never_redirects_the_converge = None
+    test_server_running_a_config_outside_this_home_is_left_alone = None
+    test_no_running_server_is_a_no_op = None
+    test_broken_new_config_is_reported_not_fatal = None
+    test_error_reported_only_on_stderr_is_a_load_error = None
+    test_the_pane_running_the_installer_is_never_restarted = None
+
+
+def vnode(fd: int, path: str = "", *, dev: int = 0x7FFFFFF0, ino: int = 0,
+          nlink: int = 1):
+    """One descriptor as darwin_proc.open_vnodes describes it."""
+    return darwin_proc.VnodeFd(fd=fd, path=path, dev=dev, ino=ino or 1000 + fd,
+                               nlink=nlink, mode=0o100600, size=0, cloexec=False,
+                               uid=os.getuid(), openflags=darwin_proc.FREAD)
+
+
+class FakeLibproc:
+    """A scripted installer/darwin_proc.py. Each table answers by pid; as
+    for the real module, a pid it does not describe gets None (children: an
+    empty list), and ``raising`` names calls that raise instead."""
+
+    def __init__(self):
+        self.infos: dict[int, object] = {}
+        self.kids: dict[int, list[int] | None] = {}
+        self.argvs: dict[int, list[str] | None] = {}
+        self.files: dict[int, list | None] = {}
+        self.exes: dict[int, str | None] = {}
+        self.dirs: dict[int, str | None] = {}
+        self.raising: set[str] = set()
+        self.after: dict[str, object] = {}  # call name -> run after answering
+        self.calls: list[tuple[str, int]] = []
+
+    def _answer(self, name, table, pid, default=None):
+        self.calls.append((name, pid))
+        if name in self.raising:
+            raise RuntimeError(f"{name} failed")
+        value = table.get(pid, default)
+        value = list(value) if isinstance(value, list) else value
+        if name in self.after:
+            self.after[name]()
+        return value
+
+    def bsd_info(self, pid):
+        return self._answer("bsd_info", self.infos, pid)
+
+    def children(self, pid):
+        return self._answer("children", self.kids, pid, [])
+
+    def argv(self, pid):
+        return self._answer("argv", self.argvs, pid)
+
+    def open_vnodes(self, pid):
+        return self._answer("open_vnodes", self.files, pid)
+
+    def exe(self, pid):
+        return self._answer("exe", self.exes, pid)
+
+    def cwd(self, pid):
+        return self._answer("cwd", self.dirs, pid)
+
+    def idle_zsh(self, pid: int, tty: str, cwd: str, *, extra=()):
+        """A login zsh at its prompt on ``tty``: what may be respawned."""
+        self.infos[pid] = darwin_proc.BsdInfo(
+            pid=pid, ppid=1, uid=os.getuid(), pgid=pid, tdev=0x10000004, tpgid=pid,
+            comm="zsh", name="zsh", status=darwin_proc.SSLEEP, start=1.0)
+        self.kids[pid] = []
+        self.argvs[pid] = ["-zsh"]
+        self.files[pid] = [vnode(0, tty), vnode(1, tty), vnode(2, tty), *extra]
+        self.exes[pid] = "/bin/zsh"
+        self.dirs[pid] = cwd
+
+
+class ScriptedTmuxRunner:
+    """Answers the converge's tmux calls for one running server, without any
+    tmux: what it loaded (#{config_files}) and when it started."""
+
+    def __init__(self, config_files: str, start_time: int):
+        self.config_files = config_files
+        self.start_time = start_time
+        self.calls: list[list[str]] = []
+
+    def which(self, name, path=None):
+        return "/usr/bin/tmux" if name == "tmux" else None
+
+    def run(self, argv, *, timeout, check=True, env=None, input=None, cwd=None,
+            read_only=False):
+        argv = [str(a) for a in argv]
+        self.calls.append(argv)
+        args = argv[1:]
+        if args[:1] == ["-L"]:  # the throwaway defaults server
+            args = args[2:]
+        out = ""
+        if args[:2] == ["display-message", "-p"] and "#{config_files}" in args[2]:
+            out = f"4321\t{self.start_time}\t3.4\t{self.config_files}\n"
+        elif args == ["-V"]:
+            out = "tmux 3.4\n"
+        elif args == ["list-keys"]:
+            out = "bind-key -T prefix d detach-client\n"
+        return subprocess.CompletedProcess(argv, 0, out.encode(), b"")
+
+
+class ScriptedLibprocTests(unittest.TestCase):
+    """phases.py's checks on macOS, against a scripted darwin_proc: every
+    answer it cannot get counts against a respawn."""
+
+    PID = 2 ** 22 + 4242  # above Linux's pid_max: /proc never answers for it
+    TTY = "/dev/ttys004"
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory(prefix="pdfcv-fake-")
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(os.path.realpath(self._tmp.name))
+        self.cwd = self.root / "work dir"
+        self.cwd.mkdir()
+        self.hook = self.root / "state" / "personal-dotfiles" / "shell-hook"
+        self.hook.parent.mkdir(parents=True)
+        self.hook.touch(mode=0o600)
+        self.fake = FakeLibproc()
+        self.fake.idle_zsh(self.PID, self.TTY, str(self.cwd))
+        self.backend = self.fake
+        for name, value in (("_darwin_host", lambda: True),
+                            ("_libproc", lambda: self.backend)):
+            patcher = mock.patch.object(phases, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def check(self):
+        return phases.shell_restart_check(self.PID, self.TTY, hook_path=self.hook)
+
+    def test_idle_unhooked_zsh_may_be_respawned(self):
+        self.assertEqual(self.check(), (str(self.cwd), "restart"))
+        self.assertEqual(phases._proc_stat(self.PID), ("zsh", 1, self.PID, self.PID))
+        self.assertEqual(phases._exe_name(self.PID), "zsh")
+        self.assertIsNone(phases._proc_stat_fields(self.PID))  # no /proc here
+
+    def test_every_check_has_its_reason(self):
+        info = self.fake.infos[self.PID]
+        tty = self.TTY
+        cases = {
+            "not-zsh": [("infos", info._replace(comm="bash")), ("exes", "/bin/bash"),
+                        ("exes", None), ("exes", "/opt/homebrew/bin/fish")],
+            "busy": [("infos", info._replace(pgid=1)), ("infos", info._replace(tpgid=0)),
+                     ("kids", [self.PID + 1]), ("kids", None)],
+            "script": [("argvs", ["zsh", "-c", "read x"]), ("argvs", ["-zsh", "", "-l"]),
+                       ("argvs", ["zsh", "script.zsh"]), ("argvs", None), ("argvs", [])],
+            "redirected": [("files", [vnode(0, tty), vnode(1, tty), vnode(2, "/tmp/log")]),
+                           ("files", [vnode(0, tty), vnode(1, tty)]),
+                           ("files", [vnode(0, tty), vnode(1, tty), vnode(2, "")]),
+                           ("files", None)],
+            "no-directory": [("dirs", None), ("dirs", str(self.root / "removed"))],
+            "gone": [("infos", None)],
+        }
+        for why, changes in cases.items():
+            for table, value in changes:
+                with self.subTest(why=why, table=table, value=value):
+                    original = getattr(self.fake, table).get(self.PID)
+                    getattr(self.fake, table)[self.PID] = value
+                    try:
+                        self.assertEqual(self.check(), (None, why))
+                    finally:
+                        getattr(self.fake, table)[self.PID] = original
+        # Trailing empty arguments are dropped, as the /proc reader drops
+        # them; one in the middle is an operand.
+        self.fake.argvs[self.PID] = ["-zsh", "-l", "", ""]
+        self.assertEqual(phases._cmdline(self.PID), ["-zsh", "-l"])
+        self.assertEqual(self.check(), (str(self.cwd), "restart"))
+
+    def test_gone_by_the_last_look(self):
+        # Gone between the first look and the directory: "gone", not
+        # "no-directory".
+        self.fake.after["cwd"] = lambda: self.fake.infos.pop(self.PID)
+        self.fake.dirs[self.PID] = None
+        self.assertEqual(self.check(), (None, "gone"))
+
+    def test_hooked_shells(self):
+        st = os.stat(self.hook)
+        other = self.root / "elsewhere" / "personal-dotfiles" / "shell-hook"
+        hooked = {
+            "the hook file": vnode(9, str(self.hook)),
+            "its resolved name": vnode(9, os.path.realpath(self.hook)),
+            "another state directory's": vnode(9, str(other)),
+            "a removed hook that keeps its name": vnode(9, str(self.hook), nlink=0),
+            "the same file under another name": vnode(9, "/Volumes/x/hook",
+                                                      dev=st.st_dev & 0xFFFFFFFF,
+                                                      ino=st.st_ino),
+        }
+        tty = self.TTY
+        for name, entry in hooked.items():
+            with self.subTest(name):
+                self.fake.files[self.PID] = [vnode(0, tty), vnode(1, tty), vnode(2, tty),
+                                             entry]
+                self.assertIs(phases.shell_hooked(self.PID, self.hook), True)
+                self.assertEqual(self.check(), (None, "hooked"))
+        not_hooked = {
+            "a file merely named shell-hook": vnode(9, str(self.root / "shell-hook")),
+            "a removed file with a name": vnode(9, "/tmp/zshXXXX", nlink=0),
+            "a directory": vnode(9, str(self.root)),
+        }
+        for name, entry in not_hooked.items():
+            with self.subTest(name):
+                self.fake.files[self.PID] = [vnode(0, tty), vnode(1, tty), vnode(2, tty),
+                                             entry]
+                self.assertIs(phases.shell_hooked(self.PID, self.hook), False)
+                self.assertEqual(self.check(), (str(self.cwd), "restart"))
+
+    def test_hook_unknown(self):
+        tty = self.TTY
+        nameless = vnode(9, "", nlink=0)  # removed, and macOS gave it no name
+        self.fake.files[self.PID] = [vnode(0, tty), vnode(1, tty), vnode(2, tty), nameless]
+        self.assertIsNone(phases.shell_hooked(self.PID, self.hook))
+        self.assertEqual(self.check(), (None, "hook-unknown"))
+        # ... unless another descriptor is the hook.
+        self.fake.files[self.PID].append(vnode(10, str(self.hook)))
+        self.assertIs(phases.shell_hooked(self.PID, self.hook), True)
+        # A table that cannot be read, a process gone meanwhile.
+        self.fake.files[self.PID] = None
+        self.assertIsNone(phases.shell_hooked(self.PID, self.hook))
+        self.fake.files[self.PID] = [vnode(0, tty)]
+        self.fake.after["open_vnodes"] = lambda: self.fake.infos.pop(self.PID)
+        self.assertIsNone(phases.shell_hooked(self.PID, self.hook))
+
+    def test_hook_device_is_compared_as_libproc_reports_it(self):
+        # libproc gives the unsigned 32-bit device number.
+        st = os.stat(self.hook)
+        wide = os.stat_result((st.st_mode, st.st_ino, (1 << 32) | 77, 1, 0, 0, 0, 0, 0, 0))
+        self.fake.files[self.PID] = [vnode(9, "/elsewhere/hook", dev=77, ino=st.st_ino)]
+        with mock.patch.object(phases.os, "stat", return_value=wide):
+            self.assertIs(phases.shell_hooked(self.PID, self.hook), True)
+
+    def test_whatever_cannot_be_told_keeps_the_shell(self):
+        for name in ("bsd_info", "children", "argv", "open_vnodes", "exe", "cwd"):
+            with self.subTest(name):
+                self.fake.raising = {name}
+                cwd, why = self.check()
+                self.assertIsNone(cwd)
+                self.assertNotEqual(why, "restart")
+        self.fake.raising = {"children"}
+        self.assertTrue(phases._has_children(self.PID))
+        self.fake.raising = set()
+        self.fake.kids[self.PID] = [self.PID]  # never its own child
+        self.assertFalse(phases._has_children(self.PID))
+        # Without a usable backend nothing is inspected at all.
+        self.backend = None
+        self.fake.calls.clear()
+        self.assertEqual(self.check(), (None, "inspect-unavailable"))
+        self.assertIsNone(phases._proc_stat(self.PID))
+        self.assertTrue(phases._has_children(self.PID))
+        self.assertIsNone(phases.shell_hooked(self.PID, self.hook))
+        self.assertEqual(self.fake.calls, [])
+
+    def test_pane_check_adds_what_tmux_knows(self):
+        fields = ["%1", str(self.PID), "0", "0", "0", "30", self.TTY, "zsh", "1", "0", "s"]
+        self.assertEqual(phases._pane_check(fields, self.hook), (str(self.cwd), "restart"))
+        login = list(fields)
+        login[7] = "-zsh"
+        self.assertEqual(phases._pane_check(login, self.hook), (str(self.cwd), "restart"))
+        for index, value in ((2, "1"), (3, "1"), (4, "1"), (1, "x"), (7, "vim")):
+            changed = list(fields)
+            changed[index] = value
+            self.assertEqual(phases._pane_check(changed, self.hook), (None, "busy"), index)
+
+    def test_linux_never_asks_libproc(self):
+        def refuse():
+            raise AssertionError("libproc asked on Linux")
+        if not LINUX_PROC:
+            self.skipTest("needs Linux's /proc")
+        with mock.patch.object(phases, "_darwin_host", return_value=False), \
+                mock.patch.object(phases, "_libproc", side_effect=refuse):
+            gone = 2 ** 22 + 7
+            self.assertEqual(phases.shell_restart_check(gone, self.TTY, hook_path=self.hook),
+                             (None, "gone"))
+            self.assertIsNone(phases.shell_hooked(gone, self.hook))
+            self.assertEqual(phases._proc_stat(os.getpid())[1], os.getppid())
+            self.assertIsNotNone(phases._proc_stat_fields(os.getpid()))
+            phases._has_children(os.getpid())
+            self.assertEqual(phases._cmdline(os.getpid())[0], Path(
+                "/proc/self/cmdline").read_bytes().split(b"\0")[0].decode())
+
+    def test_server_binary_is_the_servers_own_executable(self):
+        old = self.root / "Cellar" / "tmux" / "3.4" / "bin" / "tmux"
+        old.parent.mkdir(parents=True)
+        old.write_text("#!/bin/sh\necho 'tmux 3.4'\n")
+        old.chmod(0o755)
+        runner = Runner()
+        newer = self.root / "tmux-newer"
+        newer.write_text("#!/bin/sh\necho 'tmux 3.5a'\n")
+        newer.chmod(0o755)
+        self.fake.exes[4321] = str(old)
+        self.assertEqual(phases._server_binary(str(newer), runner, "3.4", "4321"),
+                         (str(old), None))
+        self.fake.exes[4321] = None  # an upgrade removed it
+        binary, note = phases._server_binary(str(newer), runner, "3.4", "4321")
+        self.assertEqual(binary, str(newer))
+        self.assertIn("its defaults were read from", note)
+        self.fake.calls.clear()
+        phases._server_binary(str(newer), runner, "3.4", "")
+        self.assertEqual(self.fake.calls, [])
+
+    def converge_target(self, home: Path) -> Target:
+        return Target(uid=os.getuid(), gid=os.getgid(), username="fixture", home=home,
+                      data_home=self.root / "d", state_home=self.root / "state",
+                      config_home=self.root / "c", cache_home=self.root / "k")
+
+    def test_converge_without_a_backend_respawns_nothing(self):
+        home = self.root / "home"
+        home.mkdir()
+        (home / ".tmux.conf").write_text("set -g status on\n")
+        runner = ScriptedTmuxRunner(str(home / ".tmux.conf"), int(time.time()) - 100)
+        self.backend = None
+        reasons, details = phases.converge_running_tmux(
+            self.converge_target(home), runner, {"PATH": "/usr/bin:/bin", "HOME": str(home)},
+            generation="g2", previous_generation="g1")
+        self.assertEqual((reasons, details["outcome"]), ([], "converged"))
+        self.assertEqual((details["respawn"], details["restarted"], details["kept"]),
+                         ("unavailable", [], {}))
+        self.assertTrue(details["respawn_problem"])
+        self.assertEqual(phases.converge_summary(details),
+                         "tmux: applied the new config; no shell was restarted (process "
+                         "inspection is unavailable on this Mac)")
+        self.assertTrue(any("source-file" in call for call in runner.calls))
+        self.assertFalse(any("list-panes" in call or "respawn-pane" in call
+                             for call in runner.calls))
+        # With a backend the panes are looked at (this server has none).
+        self.backend = self.fake
+        _, details = phases.converge_running_tmux(
+            self.converge_target(home), runner, {"PATH": "/usr/bin:/bin", "HOME": str(home)},
+            generation="g3", previous_generation="g2")
+        self.assertEqual(details["respawn"], "done")
+
+    def test_converge_follows_a_home_reached_through_a_symlink(self):
+        real = self.root / "volume" / "home"
+        real.mkdir(parents=True)
+        (real / ".tmux.conf").write_text("set -g status on\n")
+        link = self.root / "home-link"
+        link.symlink_to(real)
+        # tmux reports what it loaded resolved.
+        runner = ScriptedTmuxRunner(str(real / ".tmux.conf"), int(time.time()) - 100)
+        env = {"PATH": "/usr/bin:/bin", "HOME": str(link)}
+        _, details = phases.converge_running_tmux(
+            self.converge_target(link), runner, env, generation="g", previous_generation="g")
+        self.assertEqual(details["outcome"], "converged")
+        # Linux keeps its check as it was: another home's config.
+        with mock.patch.object(phases, "_darwin_host", return_value=False):
+            _, details = phases.converge_running_tmux(
+                self.converge_target(link), ScriptedTmuxRunner(
+                    str(real / ".tmux.conf"), int(time.time()) - 100),
+                env, generation="g", previous_generation="g")
+        self.assertEqual(details["outcome"], "running-server-uses-another-config")
+
+
+class PtyProcess:
+    """A program on its own pseudo-terminal: session leader and the
+    terminal's foreground process group, as a tmux pane's shell is. With
+    ``hold``, the child opens that file (inheritable) before it execs, as a
+    hooked zsh holds its mark; with ``stderr``, fd 2 goes to that file."""
+
+    def __init__(self, argv, env, *, cwd, hold=None, stderr=None):
+        self.pid, self.fd = pty.fork()
+        if self.pid == 0:
+            try:
+                os.chdir(cwd)
+                if hold is not None:
+                    os.set_inheritable(os.open(hold, os.O_RDONLY), True)
+                os.write(1, ("TTY=" + os.ttyname(0) + "\n").encode())
+                if stderr is not None:
+                    os.dup2(os.open(stderr, os.O_WRONLY | os.O_CREAT, 0o600), 2)
+                os.execve(argv[0], argv, env)
+            finally:
+                os._exit(127)
+        self.buf = b""
+        self.tty = self.read_until(rb"TTY=(\S+)\r?\n").group(1).decode()
+
+    def read_until(self, pattern, timeout=30):
+        deadline = time.monotonic() + timeout
+        while True:
+            match = re.search(pattern, self.buf)
+            if match:
+                self.buf = self.buf[match.end():]
+                return match
+            left = deadline - time.monotonic()
+            if left <= 0:
+                raise AssertionError(f"no {pattern!r} in {self.buf[-1500:]!r}")
+            ready, _, _ = select.select([self.fd], [], [], left)
+            if ready:
+                try:
+                    data = os.read(self.fd, 65536)
+                except OSError:
+                    data = b""
+                if not data:
+                    raise AssertionError(f"terminal closed; output {self.buf[-1500:]!r}")
+                self.buf += data
+
+    def send(self, text):
+        os.write(self.fd, text.encode())
+
+    def close(self):
+        for pid in [self.pid, *process_children(self.pid)]:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        try:
+            os.waitpid(self.pid, 0)
+        except ChildProcessError:
+            pass
+        os.close(self.fd)
+
+
+class CountingLibSystem(DARWIN_PROC_TESTS.LinuxLibSystem):
+    """LinuxLibSystem counting the libproc and sysctl calls made through it:
+    proof that an answer came from there and not from /proc."""
+
+    calls = 0
+
+    def proc_listpids(self, *args):
+        self.calls += 1
+        return super().proc_listpids(*args)
+
+    def proc_pidinfo(self, *args):
+        self.calls += 1
+        return super().proc_pidinfo(*args)
+
+    def proc_pidfdinfo(self, *args):
+        self.calls += 1
+        return super().proc_pidfdinfo(*args)
+
+    def proc_pidpath(self, *args):
+        self.calls += 1
+        return super().proc_pidpath(*args)
+
+    def sysctl(self, *args):
+        self.calls += 1
+        return super().sysctl(*args)
+
+
+class PaneProcessScenarios:
+    """phases.py's checks of a pane's process through libproc, on live
+    processes: a zsh on its own terminal, as tmux starts one."""
+
+    # Also compare every answer with the /proc code's (Linux only).
+    compare_with_proc = False
+    # A CountingLibSystem: every answer must have asked it.
+    library = None
+
+    def setUp(self):
+        super().setUp()
+        self._tmp = tempfile.TemporaryDirectory(prefix="pdfcv-proc-")
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(os.path.realpath(self._tmp.name))
+        self.home = self.root / "home"
+        self.home.mkdir()
+        (self.home / ".zshenv").write_text("unsetopt GLOBAL_RCS\n")
+        self.hook = self.root / "state" / "personal-dotfiles" / "shell-hook"
+        self.hook.parent.mkdir(parents=True, mode=0o700)
+        self.hook.touch(mode=0o600)
+        self.env = {"HOME": str(self.home), "ZDOTDIR": str(self.home), "TERM": "dumb",
+                    "PATH": "/usr/bin:/bin", "LANG": "C", "PS1": "@@P@@ "}
+
+    def answer(self, function, *args, **kwargs):
+        """``function``'s answer through libproc; when comparing, the /proc
+        code must give the same one for the same process."""
+        before = self.library.calls if self.library is not None else 0
+        with mock.patch.object(phases, "_darwin_host", return_value=True):
+            mine = function(*args, **kwargs)
+        if self.library is not None:
+            self.assertGreater(self.library.calls, before,
+                               f"{function.__name__} did not ask libproc")
+        if self.compare_with_proc:
+            with mock.patch.object(phases, "_darwin_host", return_value=False):
+                theirs = function(*args, **kwargs)
+            self.assertEqual(mine, theirs, function.__name__)
+        return mine
+
+    def zsh(self, *args, hold=None, stderr=None, ready=rb"@@P@@ "):
+        """A zsh on its own terminal, once it shows ``ready`` (its prompt)."""
+        shell = PtyProcess([ZSH, *args], self.env, cwd=self.home, hold=hold, stderr=stderr)
+        self.addCleanup(shell.close)
+        shell.read_until(ready)
+        return shell
+
+    def restart_check(self, shell):
+        return self.answer(phases.shell_restart_check, shell.pid, shell.tty,
+                           hook_path=self.hook)
+
+    @unittest.skipUnless(ZSH, "zsh is required")
+    def test_idle_zsh_on_its_terminal(self):
+        shell = self.zsh("-f", "-i")
+        self.assertEqual(self.restart_check(shell), (str(self.home), "restart"))
+        comm, _, pgrp, tpgid = self.answer(phases._proc_stat, shell.pid)
+        self.assertEqual((comm, pgrp, tpgid), ("zsh", shell.pid, shell.pid))
+        self.assertEqual(self.answer(phases._exe_name, shell.pid), "zsh")
+        self.assertIs(self.answer(phases._std_fds_on, shell.pid, shell.tty), True)
+        self.assertIs(self.answer(phases._std_fds_on, shell.pid, "/dev/null"), False)
+        self.assertIs(self.answer(phases.shell_hooked, shell.pid, self.hook), False)
+        self.assertEqual(self.answer(phases._cmdline, shell.pid), [ZSH, "-f", "-i"])
+
+    @unittest.skipUnless(ZSH, "zsh is required")
+    def test_hooked_zsh_is_left_alone(self):
+        shell = self.zsh("-f", "-i", hold=self.hook)
+        self.assertIs(self.answer(phases.shell_hooked, shell.pid, self.hook), True)
+        self.assertEqual(self.restart_check(shell), (None, "hooked"))
+        other = self.root / "elsewhere" / "personal-dotfiles" / "shell-hook"
+        self.assertIs(self.answer(phases.shell_hooked, shell.pid, other), True)
+
+    @unittest.skipUnless(ZSH, "zsh is required")
+    def test_removed_hook_is_never_taken_for_no_hook(self):
+        shell = self.zsh("-f", "-i", hold=self.hook)
+        self.hook.unlink()
+        with mock.patch.object(phases, "_darwin_host", return_value=True):
+            hooked = phases.shell_hooked(shell.pid, self.hook)
+            cwd, why = phases.shell_restart_check(shell.pid, shell.tty, hook_path=self.hook)
+        # The removed file: macOS may keep its name (the hook) or give it
+        # none (cannot tell); never "no hook".
+        self.assertIsNot(hooked, False)
+        self.assertEqual((cwd, why), (None, "hooked" if hooked else "hook-unknown"))
+
+    @unittest.skipUnless(ZSH, "zsh is required")
+    def test_busy_zsh(self):
+        shell = self.zsh("-f", "-i")
+        shell.send("sleep 300\n")
+        deadline = time.monotonic() + 30
+        while not process_children(shell.pid) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        self.assertTrue(self.answer(phases._has_children, shell.pid))
+        self.assertEqual(self.restart_check(shell), (None, "busy"))
+
+    @unittest.skipUnless(ZSH, "zsh is required")
+    def test_zsh_running_a_command_line(self):
+        shell = self.zsh("-f", "-c", "print -r -- @@READ@@; read x", ready=rb"@@READ@@")
+        self.assertEqual(self.restart_check(shell), (None, "script"))
+
+    @unittest.skipUnless(ZSH, "zsh is required")
+    def test_redirected_zsh(self):
+        # zsh draws its prompt on the terminal it opens itself, whatever
+        # fd 2 is.
+        shell = self.zsh("-f", "-i", stderr=self.root / "errors.log")
+        self.assertEqual(self.restart_check(shell), (None, "redirected"))
+
+    @unittest.skipUnless(BASH, "bash is required")
+    def test_bash_is_never_replaced(self):
+        shell = PtyProcess([BASH, "--norc", "--noprofile", "-i"], self.env, cwd=self.home)
+        self.addCleanup(shell.close)
+        shell.read_until(rb"@@P@@ ")
+        self.assertEqual(self.restart_check(shell), (None, "not-zsh"))
+
+    def test_gone_process(self):
+        child = subprocess.Popen([sys.executable, "-c", "pass"])
+        child.wait()
+        self.assertEqual(self.answer(phases.shell_restart_check, child.pid, "/dev/null",
+                                     hook_path=self.hook), (None, "gone"))
+        self.assertIsNone(self.answer(phases._proc_stat, child.pid))
+
+    def test_exact_argv_and_children(self):
+        code = "import sys; sys.stdout.write('ready\\n'); sys.stdout.flush(); sys.stdin.read()"
+        child = subprocess.Popen([sys.executable, "-c", code, "", "two words", "", ""],
+                                 stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+        self.addCleanup(lambda: (child.stdin.close(), child.wait(), child.stdout.close()))
+        self.assertEqual(child.stdout.readline(), b"ready\n")
+        # argv[0] is not compared: a framework python on macOS re-executes
+        # itself as Python.app, which replaces it. Trailing empty arguments
+        # are dropped, as the /proc reader drops them; the middle one stays.
+        self.assertEqual(self.answer(phases._cmdline, child.pid)[1:],
+                         ["-c", code, "", "two words"])
+        self.assertTrue(self.answer(phases._has_children, os.getpid()))
+        self.assertFalse(self.answer(phases._has_children, child.pid))
+
+
+@unittest.skipUnless(LINUX_PROC, "LinuxLibSystem answers from Linux's /proc")
+class SimulatedLibprocProcessTests(PaneProcessScenarios, unittest.TestCase):
+    """On Linux: the real installer/darwin_proc.py over LinuxLibSystem, and
+    every answer the same as the /proc code's (but for the removed hook)."""
+
+    compare_with_proc = True
+
+    def setUp(self):
+        self.library = CountingLibSystem()
+        DARWIN_PROC_TESTS.use_library(self, self.library)
+        super().setUp()
+
+
+@unittest.skipUnless(DARWIN, "needs macOS libproc")
+class DarwinLibprocProcessTests(PaneProcessScenarios, unittest.TestCase):
+    """The same scenarios against the real libproc and sysctl."""
+
+    def setUp(self):
+        self.assertTrue(darwin_proc.available(), darwin_proc.unavailable_reason())
+        super().setUp()
 
 
 if __name__ == "__main__":

@@ -368,9 +368,14 @@ def start_autosave_timer(target, runner, env) -> tuple[str, list[str], str]:
 # Global user options that hold a server's runtime state rather than its
 # configuration; converging keeps them. tmux/resurrect-save only lets a save
 # replace "last" on a server marked restored, and continuum records when it
-# last saved. A fresh server sets these at run time, not from the config.
+# last saved. On macOS tmux/tmux-launchd-start records how the login restore
+# went (@tmux-restore-status), and tmux/resurrect-autosave that it already
+# reported a skipped save for this server (@tmux-autosave-skip-reported).
+# A fresh server sets these at run time, not from the config.
 RUNTIME_USER_OPTIONS = frozenset({"@tmux-restore-complete",
-                                  "@continuum-save-last-timestamp"})
+                                  "@continuum-save-last-timestamp",
+                                  "@tmux-restore-status",
+                                  "@tmux-autosave-skip-reported"})
 # tmux-continuum (manifests/tmux-plugins.json) auto-restores only when it is
 # loaded into a server younger than @continuum-restore-max-delay seconds
 # (default 10; continuum.tmux just_started_tmux_server). Converging sources
@@ -632,9 +637,62 @@ def _config_lines(paths: list[Path]) -> list[str]:
     return lines
 
 
-def _proc_stat(pid: int) -> tuple[str, int, int, int] | None:
-    """``(comm, ppid, pgrp, tpgid)`` from /proc/<pid>/stat."""
+# --- the processes of the panes -------------------------------------------------
+#
+# What converge needs to know about a pane's process (its name, executable,
+# parent, process group, terminal, children, argv, open files and directory)
+# comes from /proc on Linux. macOS has no /proc: there (_darwin_host) each
+# function below asks installer/darwin_proc.py instead, which reads the same
+# facts from libproc and sysctl. What it cannot tell (its self-check failed,
+# the process is gone, a descriptor table cannot be read, a removed file has
+# no name) counts against a respawn, never for it.
 
+def _libproc():
+    """installer/darwin_proc.py when it can inspect processes on this Mac,
+    else None (why: :func:`libproc_problem`)."""
+
+    try:
+        from installer import darwin_proc
+
+        return darwin_proc if darwin_proc.available() else None
+    except Exception:  # an unknown macOS: as unavailable
+        return None
+
+
+def libproc_problem() -> str:
+    """Why installer/darwin_proc.py cannot inspect processes here."""
+
+    try:
+        from installer import darwin_proc
+
+        return darwin_proc.unavailable_reason() or "no reason given"
+    except Exception as exc:
+        return f"cannot load installer/darwin_proc.py: {exc}"
+
+
+def _libproc_ask(name: str, *args):
+    """``darwin_proc.<name>(*args)``: None when the backend cannot be used or
+    cannot tell. Its calls are written never to raise; should one raise all
+    the same (a macOS it does not know), that is "cannot tell" too."""
+
+    backend = _libproc()
+    if backend is None:
+        return None
+    try:
+        return getattr(backend, name)(*args)
+    except Exception:
+        return None
+
+
+def _proc_stat(pid: int) -> tuple[str, int, int, int] | None:
+    """``(comm, ppid, pgrp, tpgid)`` from /proc/<pid>/stat (macOS: libproc's
+    proc_bsdinfo, whose comm is also the executable's file name)."""
+
+    if _darwin_host():
+        info = _libproc_ask("bsd_info", pid)
+        if info is None:
+            return None
+        return info.comm, info.ppid, info.pgid, info.tpgid
     fields = _proc_stat_fields(pid)
     if fields is None:
         return None
@@ -646,8 +704,13 @@ def _proc_stat(pid: int) -> tuple[str, int, int, int] | None:
 
 
 def _proc_stat_fields(pid: int) -> tuple[str, list[str]] | None:
-    """``(comm, fields 3...)`` of /proc/<pid>/stat (``fields[0]`` is field 3)."""
+    """``(comm, fields 3...)`` of /proc/<pid>/stat (``fields[0]`` is field 3).
 
+    None on macOS, which has no /proc (:func:`_proc_stat` asks libproc).
+    """
+
+    if _darwin_host():
+        return None
     try:
         data = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8", errors="replace")
         return data[data.index("(") + 1:data.rindex(")")], data[data.rindex(")") + 2:].split()
@@ -656,6 +719,10 @@ def _proc_stat_fields(pid: int) -> tuple[str, list[str]] | None:
 
 
 def _has_children(pid: int) -> bool:
+    if _darwin_host():
+        children = _libproc_ask("children", pid)
+        # A process table that cannot be read: busy, never "no children".
+        return children is None or any(child != pid for child in children)
     for entry in os.listdir("/proc"):
         if entry.isdigit() and entry != str(pid):
             stat = _proc_stat(int(entry))
@@ -672,10 +739,11 @@ def _has_children(pid: int) -> bool:
 # (at Enter on its primary prompt, or before its next prompt) when the
 # generation changes, keeping its exported environment; nothing outside
 # ever restarts it. A process is hooked iff one of its /proc/<pid>/fd links
-# resolves to that file. There is no per-prompt state to go stale: the
-# descriptor lives exactly as long as the zsh process image (it closes on
-# 'exec bash' and on exit, and a reused pid never has it), and it does not
-# depend on /run/user/<uid> or a login session.
+# resolves to that file (macOS: one of the descriptors libproc lists for it
+# is that file, by its path or its device and inode). There is no per-prompt
+# state to go stale: the descriptor lives exactly as long as the zsh process
+# image (it closes on 'exec bash' and on exit, and a reused pid never has
+# it), and it does not depend on /run/user/<uid> or a login session.
 
 SHELL_HOOK_FILE = "shell-hook"
 # The last two components of a hook file wherever its state directory is
@@ -704,7 +772,8 @@ def shell_hooked(pid: int, hook_path: Path) -> bool | None:
     file was removed or replaced since: " (deleted)", or the same inode under
     another name) or any ``.../personal-dotfiles/shell-hook``. False: none
     is. None: cannot tell (the process is gone or its fds cannot be read),
-    which callers treat as hooked: nothing is restarted on a guess.
+    which callers treat as hooked: nothing is restarted on a guess. On macOS
+    see :func:`_libproc_hooked`.
     """
 
     names = _hook_names(hook_path)
@@ -713,6 +782,8 @@ def shell_hooked(pid: int, hook_path: Path) -> bool | None:
         identity = (st.st_dev, st.st_ino)
     except OSError:
         identity = None
+    if _darwin_host():
+        return _libproc_hooked(pid, names, identity)
     base = f"/proc/{pid}/fd"
     try:
         fds = os.listdir(base)
@@ -744,6 +815,37 @@ def shell_hooked(pid: int, hook_path: Path) -> bool | None:
     return False
 
 
+def _libproc_hooked(pid: int, names: set[str], identity) -> bool | None:
+    """:func:`shell_hooked` on macOS, from the descriptors libproc lists.
+
+    Each comes with the file's path as the kernel names it now, and its
+    device and inode. True: a descriptor whose path is one of ``names`` or
+    ends in .../personal-dotfiles/shell-hook, or which is the hook file
+    itself (its device and inode, whatever its name). macOS never marks a
+    removed file " (deleted)", and may give it no name at all: such a
+    descriptor (link count 0, empty path) may be a removed hook file, so
+    unless another one is the hook the answer is None, as it is when the
+    table cannot be read or the process exited meanwhile.
+    """
+
+    entries = _libproc_ask("open_vnodes", pid)
+    if entries is None:
+        return None
+    if identity is not None:  # libproc reports the 32-bit device number
+        identity = (identity[0] & 0xFFFFFFFF, identity[1])
+    nameless = False
+    for entry in entries:
+        if entry.path and (entry.path in names or entry.path.endswith(_HOOK_SUFFIX)):
+            return True
+        if identity is not None and (entry.dev, entry.ino) == identity:
+            return True
+        if entry.nlink == 0 and not entry.path:
+            nameless = True
+    if nameless or _libproc_ask("bsd_info", pid) is None:
+        return None
+    return False
+
+
 # --- which pane shells are respawned ---------------------------------------------
 
 # Options that make a shell run commands instead of reading the terminal.
@@ -752,6 +854,15 @@ _LONG_COMMAND_OPTIONS = ("--command", "--init-command")
 
 
 def _cmdline(pid: int) -> list[str] | None:
+    if _darwin_host():
+        argv = _libproc_ask("argv", pid)
+        if not argv:
+            return None
+        # libproc's argv is exact; the /proc reader below drops trailing
+        # empty arguments, so they are dropped here too (the same argv).
+        while argv and not argv[-1]:
+            argv = argv[:-1]
+        return argv
     try:
         data = Path(f"/proc/{pid}/cmdline").read_bytes()
     except OSError:
@@ -793,6 +904,12 @@ def interactive_invocation(argv: list[str]) -> bool:
 
 
 def _std_fds_on(pid: int, tty: str) -> bool:
+    if _darwin_host():
+        entries = _libproc_ask("open_vnodes", pid)
+        if entries is None:
+            return False
+        paths = {entry.fd: entry.path for entry in entries}
+        return all(paths.get(fd) == tty for fd in (0, 1, 2))
     try:
         return all(os.readlink(f"/proc/{pid}/fd/{fd}") == tty for fd in (0, 1, 2))
     except OSError:
@@ -800,6 +917,11 @@ def _std_fds_on(pid: int, tty: str) -> bool:
 
 
 def _exe_name(pid: int) -> str | None:
+    if _darwin_host():
+        # proc_pidpath. Without a path for the executable (one removed since,
+        # by a Homebrew upgrade, say) the answer is None: cannot tell.
+        exe = _libproc_ask("exe", pid)
+        return os.path.basename(exe) if exe else None
     try:
         exe = os.readlink(f"/proc/{pid}/exe")
     except OSError:
@@ -841,8 +963,14 @@ def shell_restart_check(pid: int, tty: str, *, hook_path: Path) -> tuple[str | N
     /proc/<pid>/environ. Respawning such a shell loses that. Every shell
     started with this repository's config is hooked, so this applies only
     to shells that predate it, and only when the generation changes.
+
+    On macOS libproc answers instead of /proc (see :func:`_libproc`), with
+    the same rules; without a usable backend no shell is respawned
+    ("inspect-unavailable").
     """
 
+    if _darwin_host() and _libproc() is None:
+        return None, "inspect-unavailable"
     stat = _proc_stat(pid)
     if stat is None:
         return None, "gone"
@@ -861,6 +989,8 @@ def shell_restart_check(pid: int, tty: str, *, hook_path: Path) -> tuple[str | N
         return None, "hook-unknown"
     if hooked:
         return None, "hooked"
+    if _darwin_host():
+        return _libproc_directory(pid)
     try:
         cwd = os.readlink(f"/proc/{pid}/cwd")
     except OSError:
@@ -868,6 +998,20 @@ def shell_restart_check(pid: int, tty: str, *, hook_path: Path) -> tuple[str | N
     if not os.path.isdir(cwd):  # a removed cwd reads "... (deleted)"
         return None, "no-directory"
     return cwd, "restart"
+
+
+def _libproc_directory(pid: int) -> tuple[str | None, str]:
+    """The last check of :func:`shell_restart_check` on macOS: the shell's
+    working directory, from libproc, still exists."""
+
+    cwd = _libproc_ask("cwd", pid)
+    if cwd is None:
+        # Gone, or a directory the kernel has no name for (removed).
+        return None, "gone" if _proc_stat(pid) is None else "no-directory"
+    if not os.path.isdir(cwd):
+        return None, "no-directory"
+    return cwd, "restart"
+
 
 def _respawn_argv(command: str, shell: str, path: str) -> list[str] | None:
     """How a new pane of this server would start, as respawn-pane arguments."""
@@ -951,11 +1095,11 @@ def respawn_idle_panes(tmux, runner, tenv, *, hook_path: Path
     per session that shows it (grouped sessions, linked windows); each pane
     counts once.
 
-    Everything is checked again, from tmux and /proc, right before the
-    pane's screen is scrolled into its history, and once more right before
-    respawn-pane; a pane that fails either check is left alone (after the
-    first one, it is not even scrolled). What remains is the moment between
-    the last check and respawn-pane -k itself.
+    Everything is checked again, from tmux and /proc (macOS: libproc),
+    right before the pane's screen is scrolled into its history, and once
+    more right before respawn-pane; a pane that fails either check is left
+    alone (after the first one, it is not even scrolled). What remains is
+    the moment between the last check and respawn-pane -k itself.
     """
 
     listed = runner.run([tmux, "list-panes", "-a", "-F", _PANE_FORMAT], timeout=30,
@@ -1046,10 +1190,15 @@ def _server_binary(tmux, runner, version: str, pid: str) -> tuple[str, str | Non
     wanted = f"tmux {version}"
     if version_of(tmux) == wanted:
         return tmux, None
-    try:
-        exe = os.readlink(f"/proc/{int(pid)}/exe")
-    except (OSError, ValueError):
-        exe = None
+    if _darwin_host():
+        # proc_pidpath: the server's own binary, such as the Homebrew Cellar
+        # path of the version it started from.
+        exe = _libproc_ask("exe", int(pid)) if pid.isdigit() else None
+    else:
+        try:
+            exe = os.readlink(f"/proc/{int(pid)}/exe")
+        except (OSError, ValueError):
+            exe = None
     if exe and os.access(exe, os.X_OK) and version_of(exe) == wanted:
         return exe, None
     return tmux, (f"the running server is {wanted} but {tmux} is "
@@ -1082,6 +1231,9 @@ def converge_summary(details: dict) -> str | None:
         return None
     if details.get("respawn") == "generation-unchanged":
         return "tmux: applied the new config"
+    if details.get("respawn") == "unavailable":
+        return ("tmux: applied the new config; no shell was restarted (process "
+                "inspection is unavailable on this Mac)")
     count = details.get("respawned_panes", 0)
     return (f"tmux: applied the new config; restarted {count} idle "
             f"shell{'' if count == 1 else 's'}")
@@ -1093,6 +1245,21 @@ def generation_changed(generation: str | None, previous: str | None) -> bool:
     install over another setup)."""
 
     return generation is not None and generation != previous
+
+
+def _loaded_from_resolved_home(target, loaded: list[str]) -> bool:
+    """macOS: whether the server loaded a config inside this home as tmux
+    resolves it. tmux records every file it loaded by its resolved path, so
+    a home reached through a symlink (any home under /tmp, which is
+    /private/tmp there) shows resolved. Always False on Linux, whose check
+    is the one in :func:`converge_running_tmux`."""
+
+    if not _darwin_host():
+        return False
+    real = os.path.realpath(target.home)
+    home = real.rstrip("/") + "/"
+    conf = os.path.join(real, ".tmux.conf")
+    return any(path == conf or path.startswith(home) for path in loaded)
 
 
 def converge_running_tmux(target, runner, env: dict[str, str] | None = None, *,
@@ -1122,7 +1289,9 @@ def converge_running_tmux(target, runner, env: dict[str, str] | None = None, *,
     Returns ``(reasons, details)``: ``reasons`` lists only problems;
     ``details["outcome"]`` is one of converged, no-running-server,
     running-server-uses-another-config, failed; ``details["respawn"]`` is
-    done or generation-unchanged; ``details["restarted"]`` names each
+    done or generation-unchanged (macOS also: unavailable, when no process
+    can be inspected, with the reason in ``details["respawn_problem"]``;
+    then no shell is touched); ``details["restarted"]`` names each
     respawned pane (session:window.pane) and its directory,
     ``details["kept"]`` counts the panes left as they are, by reason.
     """
@@ -1151,7 +1320,8 @@ def converge_running_tmux(target, runner, env: dict[str, str] | None = None, *,
     # running another user's or another home's config is left alone.
     home = str(target.home).rstrip("/") + "/"
     conf = str(target.home / ".tmux.conf")
-    if not any(path == conf or path.startswith(home) for path in loaded):
+    if not any(path == conf or path.startswith(home) for path in loaded) \
+            and not _loaded_from_resolved_home(target, loaded):
         details["outcome"] = "running-server-uses-another-config"
         return [], details
 
@@ -1179,6 +1349,15 @@ def converge_running_tmux(target, runner, env: dict[str, str] | None = None, *,
         # Nothing changed (or no generation was written): no shell has
         # anything new to load, so none is touched.
         details["respawn"] = "generation-unchanged"
+        details["restarted"] = []
+        details["kept"] = {}
+    elif _darwin_host() and _libproc() is None:
+        # macOS without a working process backend: no pane shell can be
+        # checked, so none is respawned. Not a failure (the config is in
+        # place, and every shell of this repository reloads itself); the
+        # summary line says it.
+        details["respawn"] = "unavailable"
+        details["respawn_problem"] = libproc_problem()
         details["restarted"] = []
         details["kept"] = {}
     else:

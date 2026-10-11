@@ -984,6 +984,7 @@ class ConvergeUnitTests(TempHome):
         fourth = self.holder(stray, cloexec=False)
         self.assertFalse(phases.shell_hooked(fourth.pid, path))
 
+    @LINUX_PROC
     def test_shell_hooked_cannot_tell(self):
         with mock.patch.object(phases.os, "listdir", side_effect=PermissionError("no")):
             self.assertIsNone(phases.shell_hooked(os.getpid(), self.hook_file()))
@@ -1021,6 +1022,7 @@ class ConvergeUnitTests(TempHome):
         self.assertEqual(phases.shell_restart_check(2 ** 22 + 7, "/dev/pts/0", **check),
                          (None, "gone"))
 
+    @LINUX_PROC
     def test_exe_name_of_an_upgraded_binary(self):
         with mock.patch.object(phases.os, "readlink", return_value="/usr/bin/zsh (deleted)"):
             self.assertEqual(phases._exe_name(1), "zsh")

@@ -14,10 +14,20 @@ inherited from the test or opened by the real zsh/zsh.d/dotfiles-reload.zsh.
 The end-to-end tests type ``dotfiles repair`` into real shells on a pty and
 check that the passwd login shell takes over the terminal only for an
 unhooked, interactive, foreground parent.
+
+macOS has no /proc: there bin/dotfiles (and installer/phases.py) read the
+parent through installer/darwin_proc.py, libproc and sysctl, and so does
+this test's own bookkeeping. On Linux the same refresh tests also run with
+bin/dotfiles on that path, over LinuxLibSystem from test_darwin_proc.py,
+which answers libproc's calls from /proc in macOS's layouts and conventions
+(SimulatedMacosRefreshTerminalTests), and against scripted backends
+(DarwinProbeTests). bin/dotfiles also runs install.py under a python 3.10
+or newer, re-executing itself when its own is older (PythonVersionTests).
 """
 
 from __future__ import annotations
 
+import ast
 import importlib.util
 import json
 import os
@@ -38,6 +48,19 @@ from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DOTFILES = REPO_ROOT / "bin" / "dotfiles"
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from installer import darwin_proc  # noqa: E402
+
+DARWIN = sys.platform == "darwin"
+LINUX_PROC = sys.platform.startswith("linux") and os.path.isdir("/proc/self/fd")
+# LinuxLibSystem and use_library: libproc's calls answered from Linux's
+# /proc, so bin/dotfiles' macOS code runs on Linux with the real darwin_proc.
+_HELPERS = importlib.util.spec_from_file_location(
+    "darwin_proc_test_helpers", Path(__file__).with_name("test_darwin_proc.py"))
+DARWIN_PROC_TESTS = importlib.util.module_from_spec(_HELPERS)
+_HELPERS.loader.exec_module(DARWIN_PROC_TESTS)
 
 FAKE_INSTALL = r'''
 import json, os, sys
@@ -152,10 +175,26 @@ class ArgumentTableTests(DotfilesCmdCase):
     def test_help_lists_upstream_and_delegating_commands(self):
         completed = self.dotfiles_cmd("--help")
         out = completed.stdout.decode()
-        for word in ("update", "github", "install", "status", "restore", "repair"):
+        for word in ("update", "github", "install", "status", "restore", "repair",
+                     "services"):
             self.assertIn(word, out)
         self.assertIn("@leekyungmoon's", out)
         self.assertNotIn("wookayin", out)
+
+    def test_help_texts_fit_linux_and_macos(self):
+        out = self.dotfiles_cmd("--help").stdout.decode()
+        self.assertIn("Available on Linux and macOS.", out)
+        self.assertIn("(Linux only; install.py gui-apply)", out)
+        self.assertNotIn("only in Linux", out)
+        for command in ("update", "repair"):
+            with self.subTest(command):
+                text = self.dotfiles_cmd(command, "--help").stdout.decode()
+                self.assertIn("Skip system packages (apt or Homebrew) and pinned tools",
+                              " ".join(text.split()))
+                self.assertNotIn("Skip apt packages", text)
+        text = " ".join(self.dotfiles_cmd("services", "--help").stdout.decode().split())
+        self.assertIn("status (the default), enable or disable, then tmux and/or "
+                      "autosave (default: both)", text)
 
     def test_no_arguments_prints_help_and_fails(self):
         completed = self.dotfiles_cmd()
@@ -228,6 +267,30 @@ class DelegationTests(DotfilesCmdCase):
         completed = self.dotfiles_cmd("status", "--bogus")
         self.assertEqual(completed.returncode, 2)
         self.assertEqual(self.calls(), [])
+
+    def test_services_passes_through_with_its_exit_status(self):
+        """'dotfiles services ...' is 'install.py services ...' (it checks the
+        words), from anywhere, with install.py's exit status."""
+        self.assertEqual(self.dotfiles_cmd("services").returncode, 0)
+        self.assertEqual(self.dotfiles_cmd("services", "disable", "tmux").returncode, 0)
+        self.assertEqual(self.dotfiles_cmd("services", "enable", "tmux",
+                                           "autosave").returncode, 0)
+        failed = self.dotfiles_cmd("services", "status", extra_env={"FAKE_INSTALL_RC": "1"})
+        self.assertEqual(failed.returncode, 1)
+        bad = self.dotfiles_cmd("services", "frobnicate", extra_env={"FAKE_INSTALL_RC": "2"})
+        self.assertEqual(bad.returncode, 2)
+        calls = self.calls()
+        self.assertEqual([c["argv"] for c in calls], [
+            ["services"], ["services", "disable", "tmux"],
+            ["services", "enable", "tmux", "autosave"], ["services", "status"],
+            ["services", "frobnicate"]])
+        self.assertTrue(all(c["no_bytecode"] for c in calls))
+        self.assertTrue(all(Path(c["cwd"]) == self.dotfiles for c in calls))
+        # An option it does not take: refused here, install.py never runs.
+        completed = self.dotfiles_cmd("services", "--json")
+        self.assertEqual(completed.returncode, 2)
+        self.assertIn(b"Unknown arguments: --json", completed.stdout)
+        self.assertEqual(len(self.calls()), len(calls))
 
     def test_github_opens_or_prints_the_url(self):
         record = self.root / "browser.log"
@@ -470,6 +533,64 @@ def load_dotfiles_module():
     return module
 
 
+# What this test reads about a process itself (not the code under test):
+# /proc on Linux, as it always did; installer/darwin_proc.py on macOS.
+
+def process_argv0(pid):
+    """argv[0] of pid, or None (not readable)."""
+    if DARWIN:
+        argv = darwin_proc.argv(pid)
+        return argv[0] if argv else None
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as handle:
+            return handle.read().split(b"\0")[0].decode(errors="surrogateescape")
+    except OSError:
+        return None
+
+
+def process_tty(pid):
+    """The resolved path of pid's stdin."""
+    if DARWIN:
+        paths = {entry.fd: entry.path for entry in darwin_proc.open_vnodes(pid) or ()}
+        return os.path.realpath(paths[0])
+    return os.path.realpath(os.readlink(f"/proc/{pid}/fd/0"))
+
+
+def process_comm(pid):
+    if DARWIN:
+        info = darwin_proc.bsd_info(pid)
+        return info.comm if info is not None else None
+    with open(f"/proc/{pid}/comm") as handle:
+        return handle.read().strip()
+
+
+class CountingLibSystem(DARWIN_PROC_TESTS.LinuxLibSystem):
+    """LinuxLibSystem counting the libproc and sysctl calls made through it:
+    proof that an answer came from there and not from /proc."""
+
+    calls = 0
+
+    def proc_listpids(self, *args):
+        self.calls += 1
+        return super().proc_listpids(*args)
+
+    def proc_pidinfo(self, *args):
+        self.calls += 1
+        return super().proc_pidinfo(*args)
+
+    def proc_pidfdinfo(self, *args):
+        self.calls += 1
+        return super().proc_pidfdinfo(*args)
+
+    def proc_pidpath(self, *args):
+        self.calls += 1
+        return super().proc_pidpath(*args)
+
+    def sysctl(self, *args):
+        self.calls += 1
+        return super().sysctl(*args)
+
+
 class FakeParent:
     """A real process on its own pseudo-terminal (fds 0/1/2), standing in for
     the shell that ran ``dotfiles``. With ``hold``, the child opens that file
@@ -486,14 +607,10 @@ class FakeParent:
                 os._exit(127)
         deadline = time.monotonic() + 10
         while time.monotonic() < deadline:
-            try:
-                with open(f"/proc/{self.pid}/cmdline", "rb") as handle:
-                    if handle.read().split(b"\0")[0] == argv[0].encode():
-                        break
-            except OSError:
-                pass
+            if process_argv0(self.pid) == argv[0]:
+                break
             time.sleep(0.02)
-        self.tty = os.path.realpath(os.readlink(f"/proc/{self.pid}/fd/0"))
+        self.tty = process_tty(self.pid)
         self.buf = b""
 
     def read_until(self, pattern, timeout=20):
@@ -578,6 +695,10 @@ class RefreshTerminalTests(unittest.TestCase):
         self.mod._execvp = lambda file, args: self.execs.append((file, list(args)))
         self.parents = []
         self.login_shell = pwd.getpwuid(self.uid).pw_shell
+        if DARWIN:
+            # Decided once per process, by a self-check that compares
+            # os.getppid(): before refresh() patches it.
+            self.assertTrue(darwin_proc.available(), darwin_proc.unavailable_reason())
 
     def tearDown(self):
         for parent in self.parents:
@@ -643,9 +764,13 @@ class RefreshTerminalTests(unittest.TestCase):
         with self.subTest("mark deleted after the shell opened it"):
             zsh = self.parent(["zsh", "-f"], exe=ZSH, hold=other)
             other.unlink()
-            links = [os.readlink(f"/proc/{zsh.pid}/fd/{n}")
-                     for n in os.listdir(f"/proc/{zsh.pid}/fd")]
-            self.assertIn(f"{other} (deleted)", links)
+            if DARWIN:  # no " (deleted)" mark there; perhaps no name at all
+                entries = darwin_proc.open_vnodes(zsh.pid)
+                self.assertTrue(any(entry.nlink == 0 for entry in entries), entries)
+            else:
+                links = [os.readlink(f"/proc/{zsh.pid}/fd/{n}")
+                         for n in os.listdir(f"/proc/{zsh.pid}/fd")]
+                self.assertIn(f"{other} (deleted)", links)
             self.assert_no_exec(self.refresh(zsh))
 
     def test_real_hooked_zsh_is_left_alone(self):
@@ -665,15 +790,22 @@ class RefreshTerminalTests(unittest.TestCase):
         zsh.send("exec bash --norc --noprofile -i\n")
         deadline = time.monotonic() + 10
         while time.monotonic() < deadline:
-            with open(f"/proc/{zsh.pid}/comm") as handle:
-                if handle.read().strip() == "bash":
-                    break
+            if process_comm(zsh.pid) == "bash":
+                break
             time.sleep(0.05)
         self.assertFalse(self.mod._is_hooked(zsh.pid))
         self.assert_exec(self.refresh(zsh))
 
     def test_unreadable_fd_table_counts_as_hooked(self):
         bash = self.parent(["bash", "--norc", "--noprofile", "-i"], exe=BASH)
+        if DARWIN:
+            real_open_vnodes = darwin_proc.open_vnodes
+
+            def open_vnodes(pid):
+                return None if pid == bash.pid else real_open_vnodes(pid)
+            with mock.patch.object(darwin_proc, "open_vnodes", side_effect=open_vnodes):
+                self.assert_no_exec(self.refresh(bash))
+            return
         real_listdir = os.listdir
 
         def listdir(path):
@@ -715,6 +847,10 @@ class RefreshTerminalTests(unittest.TestCase):
             "argv[0] zsh, but python": (["zsh", "-i"], sys.executable),
             "argv[0] bash, but sh": (["bash", "-i"], shutil.which("sh") or "/bin/sh"),
         }
+        if DARWIN:
+            # macOS's /bin/sh runs bash itself (as bash, by name and
+            # executable): another shell stands in.
+            parents["argv[0] bash, but sh"] = (["bash", "-i"], "/bin/ksh")
         for name, (argv, exe) in parents.items():
             with self.subTest(name):
                 self.assert_no_exec(self.refresh(self.parent(argv, exe=exe)))
@@ -996,6 +1132,551 @@ class RefreshTerminalEndToEndTests(DotfilesCmdCase):
                 out = parent.read_until(rb"@@Z@@ |REST-OF-COMMAND-RAN rc=\d+")
                 self.assertIn("REST-OF-COMMAND-RAN rc=0", out)
                 self.assertNotIn("NEW-LOGIN-SHELL", out)
+
+
+# --- macOS -----------------------------------------------------------------------
+
+@unittest.skipUnless(LINUX_PROC, "LinuxLibSystem answers from Linux's /proc")
+class SimulatedMacosRefreshTerminalTests(RefreshTerminalTests):
+    """Every refresh test above with bin/dotfiles (and installer/phases.py,
+    for the parity tests) on its macOS path: the real
+    installer/darwin_proc.py over LinuxLibSystem instead of /proc. The same
+    parents must get the same answer; a mark removed under a shell has no
+    name there (as macOS may give it none), which counts as hooked too."""
+
+    def setUp(self):
+        super().setUp()
+        self.library = CountingLibSystem()
+        DARWIN_PROC_TESTS.use_library(self, self.library)
+        self.mod._darwin_host = lambda: True
+        from installer import phases
+        patcher = mock.patch.object(phases, "_darwin_host", return_value=True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_libproc_is_what_is_asked(self):
+        self.require_login_shell()
+        bash = self.parent(["bash", "--norc", "--noprofile", "-i"], exe=BASH)
+        self.assert_exec(self.refresh(bash))
+        self.assertGreater(self.library.calls, 0)
+        self.assertIs(self.mod._darwin_proc(), darwin_proc)
+
+
+class FakeLibproc:
+    """A scripted installer/darwin_proc.py: each table answers by pid; as
+    for the real module, a pid it does not describe gets None."""
+
+    def __init__(self):
+        self.infos, self.argvs, self.files, self.exes = {}, {}, {}, {}
+        self.raising = set()
+
+    def _answer(self, name, table, pid):
+        if name in self.raising:
+            raise RuntimeError(f"{name} failed")
+        value = table.get(pid)
+        return list(value) if isinstance(value, list) else value
+
+    def bsd_info(self, pid):
+        return self._answer("bsd_info", self.infos, pid)
+
+    def argv(self, pid):
+        return self._answer("argv", self.argvs, pid)
+
+    def open_vnodes(self, pid):
+        return self._answer("open_vnodes", self.files, pid)
+
+    def exe(self, pid):
+        return self._answer("exe", self.exes, pid)
+
+
+def vnode(fd, path="", *, dev=0x7FFFFFF0, ino=0, nlink=1):
+    return darwin_proc.VnodeFd(fd=fd, path=path, dev=dev, ino=ino or 1000 + fd,
+                               nlink=nlink, mode=0o100600, size=0, cloexec=False,
+                               uid=os.getuid(), openflags=darwin_proc.FREAD)
+
+
+class DarwinProbeTests(unittest.TestCase):
+    """bin/dotfiles' checks of its parent on macOS, against a scripted
+    darwin_proc: whatever it cannot tell counts against the exec."""
+
+    PID = 2 ** 22 + 77  # above Linux's pid_max: /proc never answers for it
+    TTY = "/dev/ttys004"
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory(prefix="pdf-darwin-")
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(os.path.realpath(self._tmp.name))
+        self.hook = self.root / "state" / "personal-dotfiles" / "shell-hook"
+        self.hook.parent.mkdir(parents=True)
+        self.hook.touch(mode=0o600)
+        self.mod = load_dotfiles_module()
+        self.fake = FakeLibproc()
+        tty = self.TTY
+        self.fake.infos[self.PID] = darwin_proc.BsdInfo(
+            pid=self.PID, ppid=1, uid=os.getuid(), pgid=self.PID, tdev=4, tpgid=99,
+            comm="bash", name="bash", status=darwin_proc.SSLEEP, start=1.0)
+        self.fake.argvs[self.PID] = ["-bash"]
+        self.fake.files[self.PID] = [vnode(0, tty), vnode(1, tty), vnode(2, tty)]
+        self.fake.exes[self.PID] = "/bin/bash"
+        self.backend = self.fake
+        self.mod._darwin_host = lambda: True
+        self.mod._darwin_proc = lambda: self.backend
+        self.execs = []
+        self.mod._execvp = lambda file, args: self.execs.append((file, list(args)))
+
+    def hooked(self):
+        return self.mod._is_hooked(self.PID, str(self.hook))
+
+    def test_argv(self):
+        self.fake.argvs[self.PID] = ["-zsh", "", "-l", "", ""]
+        # As read from /proc: trailing empty arguments dropped, others kept.
+        self.assertEqual(self.mod._cmdline(self.PID), ["-zsh", "", "-l"])
+        self.assertFalse(self.mod.interactive_invocation(self.mod._cmdline(self.PID)))
+        self.fake.argvs[self.PID] = None
+        with self.assertRaises(OSError):
+            self.mod._cmdline(self.PID)
+
+    def test_shell_process(self):
+        info = self.fake.infos[self.PID]
+        for comm, exe, expected in (("bash", "/bin/bash", True),
+                                    ("zsh", "/opt/homebrew/Cellar/zsh/5.9/bin/zsh", True),
+                                    ("zsh", "/opt/homebrew/bin/python3", False),
+                                    ("Python", "/bin/zsh", False)):
+            with self.subTest(comm=comm, exe=exe):
+                self.fake.infos[self.PID] = info._replace(comm=comm)
+                self.fake.exes[self.PID] = exe
+                self.assertIs(self.mod._shell_process(self.PID), expected)
+        for table in ("infos", "exes"):
+            with self.subTest(missing=table):
+                getattr(self.fake, table)[self.PID] = None
+                with self.assertRaises(OSError):
+                    self.mod._shell_process(self.PID)
+
+    def test_same_terminal(self):
+        tty = self.TTY
+        self.assertTrue(self.mod._same_terminal(self.PID, tty))
+        for files in ([vnode(0, tty), vnode(1, "/tmp/out")], [vnode(1, tty)],
+                      [vnode(0, tty), vnode(1, "")], None):
+            with self.subTest(files=files):
+                self.fake.files[self.PID] = files
+                self.assertFalse(self.mod._same_terminal(self.PID, tty))
+
+    def test_hooked(self):
+        st = os.stat(self.hook)
+        tty = self.TTY
+        std = [vnode(0, tty), vnode(1, tty), vnode(2, tty)]
+        cases = {
+            "the hook file": (vnode(9, str(self.hook)), True),
+            "another state directory's": (
+                vnode(9, "/Volumes/other/state/personal-dotfiles/shell-hook"), True),
+            "the same file under another name": (
+                vnode(9, "/Volumes/x/mark", dev=st.st_dev & 0xFFFFFFFF, ino=st.st_ino), True),
+            "a removed file without a name": (vnode(9, "", nlink=0), True),
+            "a removed file with a name": (vnode(9, "/tmp/bash-heredoc", nlink=0), False),
+            "a file merely named shell-hook": (vnode(9, str(self.root / "shell-hook")), False),
+        }
+        self.fake.files[self.PID] = list(std)
+        self.assertFalse(self.hooked())
+        for name, (entry, expected) in cases.items():
+            with self.subTest(name):
+                self.fake.files[self.PID] = std + [entry]
+                self.assertIs(self.hooked(), expected)
+        self.fake.files[self.PID] = None  # cannot be read: no exec
+        self.assertTrue(self.hooked())
+        # libproc gives the unsigned 32-bit device number.
+        wide = os.stat_result((st.st_mode, st.st_ino, (1 << 32) | 77, 1, 0, 0, 0, 0, 0, 0))
+        self.fake.files[self.PID] = std + [vnode(9, "/Volumes/x/mark", dev=77, ino=st.st_ino)]
+        with mock.patch.object(self.mod.os, "stat", return_value=wide):
+            self.assertTrue(self.hooked())
+
+    def test_backend_trouble_never_execs(self):
+        self.backend = None
+        self.assertTrue(self.hooked())
+        self.assertFalse(self.mod._same_terminal(self.PID, self.TTY))
+        for probe in (self.mod._cmdline, self.mod._shell_process):
+            with self.assertRaises(OSError):
+                probe(self.PID)
+        self.backend = self.fake
+        for name in ("bsd_info", "argv", "open_vnodes", "exe"):
+            with self.subTest(raising=name):
+                self.fake.raising = {name}
+                self.assertFalse(self.refresh())
+        self.assertEqual(self.execs, [])
+
+    def refresh(self):
+        pgrp = os.getpgrp()
+        with mock.patch("os.getppid", return_value=self.PID), \
+                mock.patch("os.isatty", return_value=True), \
+                mock.patch("os.ttyname", return_value=self.TTY), \
+                mock.patch("os.tcgetpgrp", return_value=pgrp), \
+                mock.patch.dict(os.environ, {"XDG_STATE_HOME": str(self.root / "state")}):
+            return self.mod._refresh_terminal()
+
+    def test_refresh_terminal(self):
+        shell = pwd.getpwuid(os.getuid()).pw_shell
+        if not (os.path.isabs(shell) and os.access(shell, os.X_OK)):
+            self.skipTest(f"passwd login shell {shell!r} is not executable")
+        self.assertTrue(self.refresh())
+        self.assertEqual(self.execs, [(shell, [os.path.basename(shell), "-l"])])
+        self.execs.clear()
+        self.fake.files[self.PID].append(vnode(9, str(self.hook)))
+        self.assertFalse(self.refresh())  # hooked: it reloads itself
+        self.assertEqual(self.execs, [])
+
+    def test_backend_is_imported_once_and_checked(self):
+        mod = load_dotfiles_module()
+        loads = []
+
+        class Module:
+            def __init__(self, works):
+                self.works = works
+
+            def available(self):
+                return self.works
+
+        def importer(works):
+            def load():
+                loads.append(works)
+                return Module(works)
+            return load
+        mod._import_darwin_proc = importer(True)
+        backend = mod._darwin_proc()
+        self.assertTrue(backend.works)
+        self.assertIs(mod._darwin_proc(), backend)
+        self.assertEqual(loads, [True])
+        mod = load_dotfiles_module()
+        mod._import_darwin_proc = importer(False)
+        self.assertIsNone(mod._darwin_proc())  # its self-check failed
+        mod = load_dotfiles_module()
+
+        def broken():
+            raise ImportError("no installer/darwin_proc.py in this checkout")
+        mod._import_darwin_proc = broken
+        self.assertIsNone(mod._darwin_proc())
+
+    def test_linux_never_asks_libproc(self):
+        if not LINUX_PROC:
+            self.skipTest("needs Linux's /proc")
+
+        def refuse():
+            raise AssertionError("libproc asked on Linux")
+        self.mod._darwin_host = lambda: False
+        self.mod._darwin_proc = refuse
+        pid = os.getpid()
+        self.assertEqual(self.mod._cmdline(pid)[0], process_argv0(pid))
+        self.mod._shell_process(pid)
+        self.mod._same_terminal(pid, "/dev/null")
+        self.assertFalse(self.mod._is_hooked(pid, str(self.hook)))
+
+
+class DarwinImportTests(unittest.TestCase):
+    """On macOS bin/dotfiles imports installer/darwin_proc.py from its own
+    checkout, as tmux/resurrect-ai-session.py does: through any link to
+    bin/dotfiles, ahead of any other package named installer, without
+    writing bytecode into the checkout, and leaving sys.path as it was."""
+
+    def test_imports_its_own_checkouts_module(self):
+        with tempfile.TemporaryDirectory(prefix="pdf-import-") as tmp:
+            root = Path(tmp)
+            checkout = root / "checkout"
+            (checkout / "bin").mkdir(parents=True)
+            (checkout / "installer").mkdir()
+            shutil.copy(DOTFILES, checkout / "bin" / "dotfiles")
+            for name in ("__init__.py", "darwin_proc.py"):
+                shutil.copy(REPO_ROOT / "installer" / name, checkout / "installer" / name)
+            shadow = root / "shadow" / "installer"
+            shadow.mkdir(parents=True)
+            (shadow / "__init__.py").write_text("")
+            (shadow / "darwin_proc.py").write_text("SHADOW = True\n")
+            link = root / "local-bin" / "dotfiles"
+            link.parent.mkdir()
+            link.symlink_to(checkout / "bin" / "dotfiles")
+            code = (
+                "import importlib.util, json, sys\n"
+                "from importlib.machinery import SourceFileLoader\n"
+                "loader = SourceFileLoader('dotfiles_cmd', sys.argv[1])\n"
+                "spec = importlib.util.spec_from_loader(loader.name, loader)\n"
+                "mod = importlib.util.module_from_spec(spec)\n"
+                "loader.exec_module(mod)\n"
+                "sys.dont_write_bytecode = False\n"
+                "before = list(sys.path)\n"
+                "module = mod._import_darwin_proc()\n"
+                "print(json.dumps({'file': module.__file__,\n"
+                "                  'shadow': getattr(module, 'SHADOW', False),\n"
+                "                  'path_kept': sys.path == before,\n"
+                "                  'no_bytecode': sys.dont_write_bytecode}))\n")
+            env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+                   "PYTHONPATH": str(root / "shadow"), "HOME": tmp, "LANG": "C"}
+            done = subprocess.run([sys.executable, "-c", code, str(link)], env=env,
+                                  capture_output=True, text=True, timeout=60)
+            self.assertEqual(done.returncode, 0, done.stderr)
+            result = json.loads(done.stdout)
+            self.assertEqual(result, {
+                "file": str(checkout / "installer" / "darwin_proc.py"), "shadow": False,
+                "path_kept": True, "no_bytecode": True})
+            self.assertEqual(list(checkout.rglob("__pycache__")), [])
+
+
+class PythonVersionTests(unittest.TestCase):
+    """Under a python older than 3.10 (on macOS the Command Line Tools'
+    3.9), every command but github re-executes itself, before any git
+    action, under Homebrew's python3 or the newest python3.1x on PATH, or
+    stops with exit status 2 and nothing changed."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory(prefix="pdf-python-")
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
+        self.mod = load_dotfiles_module()
+        self.execs = []
+
+        def execv(path, argv):
+            self.execs.append((path, list(argv)))
+            raise SystemExit("re-executed")
+        self.mod._execv = execv
+        self.mod._python_version = lambda: (3, 9)
+        self.brew = self.root / "brew"
+        (self.brew / "bin").mkdir(parents=True)
+        self.path_dir = self.root / "path"
+        self.path_dir.mkdir()
+        self.log = self.root / "python.log"
+        patcher = mock.patch.dict(os.environ, {"HOMEBREW_PREFIX": str(self.brew),
+                                               "PATH": str(self.path_dir)})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def python(self, path, *, ok=True):
+        """A python3 stand-in: the real one (logged), or one too old."""
+        if ok:
+            path.write_text(f"#!/bin/sh\necho \"$0 $*\" >> '{self.log}'\n"
+                            f"exec '{sys.executable}' \"$@\"\n")
+        else:
+            path.write_text("#!/bin/sh\nexit 1\n")
+        path.chmod(0o755)
+        return str(path)
+
+    def test_new_enough_python_runs_on(self):
+        self.mod._python_version = lambda: (3, 10)
+        self.mod._require_python()
+        self.assertEqual(self.execs, [])
+
+    def test_homebrew_python_first(self):
+        brew = self.python(self.brew / "bin" / "python3")
+        self.python(self.path_dir / "python3.13")
+        with mock.patch.object(sys, "argv", ["dotfiles", "update", "--fast"]):
+            with self.assertRaises(SystemExit):
+                self.mod._require_python()
+        self.assertEqual(self.execs, [(brew, [brew, "-B", str(DOTFILES), "update",
+                                              "--fast"])])
+        # Probed as etc/install probes it.
+        self.assertIn(f"-c {self.mod.PYTHON_CHECK}", self.log.read_text())
+
+    def test_newest_python3_1x_on_path_next(self):
+        self.python(self.brew / "bin" / "python3", ok=False)  # too old
+        self.python(self.path_dir / "python3.11")
+        newest = self.python(self.path_dir / "python3.13")
+        (self.path_dir / "python3.14").write_text("#!/bin/sh\n")  # not executable
+        same = self.path_dir / "python3.15"  # this very python: never re-executed
+        same.symlink_to(os.path.realpath(sys.executable))
+        with mock.patch.object(sys, "argv", ["dotfiles", "status"]):
+            with self.assertRaises(SystemExit):
+                self.mod._require_python()
+        self.assertEqual([path for path, _ in self.execs], [newest])
+
+    def test_none_found_stops_before_any_change(self):
+        for darwin, remedy in ((True, "run 'brew install python3'"),
+                               (False, "install python3 3.10 or newer")):
+            with self.subTest(darwin=darwin):
+                self.mod._darwin_host = lambda: darwin
+                out = self.run_require()
+                self.assertEqual(out[0], 2)
+                text = " ".join(out[1].split())
+                self.assertIn("dotfiles needs python 3.10 or newer", text)
+                self.assertIn("this is python 3.9", text)
+                self.assertIn("no newer one was found", text)
+                self.assertIn(remedy, text)
+                self.assertIn("Nothing was changed.", text)
+        self.assertEqual(self.execs, [])
+
+    def test_failed_exec_stops_too(self):
+        self.python(self.path_dir / "python3.12")
+
+        def failing(path, argv):
+            raise OSError("exec format error")
+        self.mod._execv = failing
+        code, out = self.run_require()
+        self.assertEqual(code, 2)
+        self.assertIn("python3.12 failed (exec format error)", out)
+        self.assertIn("Nothing was changed.", out)
+
+    def run_require(self):
+        import contextlib
+        import io
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), mock.patch.object(sys, "argv", ["dotfiles"]):
+            try:
+                self.mod._require_python()
+            except SystemExit as exc:
+                return exc.code, out.getvalue()
+        return None, out.getvalue()
+
+    def test_homebrew_prefix_rule_of_etc_install(self):
+        cases = ((({"HOMEBREW_PREFIX": "/custom/brew//"}, "arm64"), "/custom/brew"),
+                 (({"HOMEBREW_PREFIX": "/"}, "arm64"), "/"),
+                 (({"HOMEBREW_PREFIX": "relative"}, "arm64"), "/opt/homebrew"),
+                 (({}, "arm64"), "/opt/homebrew"),
+                 (({}, "x86_64"), "/usr/local"),
+                 (({}, "aarch64"), None))
+        for (env, machine), expected in cases:
+            with self.subTest(env=env, machine=machine):
+                uname = os.uname_result(("Darwin", "mac", "25.0", "v", machine))
+                with mock.patch.dict(os.environ, env, clear=True), \
+                        mock.patch.object(self.mod.os, "uname", return_value=uname):
+                    self.assertEqual(self.mod._homebrew_prefix(), expected)
+
+    def test_every_command_but_github_requires_it(self):
+        mod = load_dotfiles_module()
+        required = []
+        mod._require_python = lambda: required.append(True)
+        for command in ("update", "install", "status", "restore", "repair", "services",
+                        "gui-apply", "github"):
+            with self.subTest(command):
+                required.clear()
+
+                def fake(argv=(), **kwargs):
+                    """fake command"""
+                    self.assertTrue(required or command == "github")
+                    return 0
+                name = {"install": "install_local", "github": "open_github",
+                        "gui-apply": "gui_apply"}.get(command, command)
+                args = {"restore": ["--baseline"]}.get(command, [])
+                with mock.patch.object(mod, name, fake), \
+                        mock.patch.object(sys, "argv", ["dotfiles", command, *args]):
+                    mod.main()
+                self.assertEqual(bool(required), command != "github")
+
+
+class ReexecEndToEndTests(DotfilesCmdCase):
+    """The re-executed command line runs the same command under the newer
+    python: install.py is called as it would have been."""
+
+    def test_reexecuted_command_runs_install_py(self):
+        wrapper_log = self.root / "wrapper.log"
+        bindir = self.root / "newer"
+        bindir.mkdir()
+        wrapper = bindir / "python3.12"
+        wrapper.write_text(f"#!/bin/sh\necho \"$*\" >> '{wrapper_log}'\n"
+                           f"exec '{sys.executable}' \"$@\"\n")
+        wrapper.chmod(0o755)
+        mod = load_dotfiles_module()
+        recorded = []
+
+        def execv(path, argv):
+            recorded.append(list(argv))
+            raise SystemExit(0)
+        mod._execv = execv
+        mod._python_version = lambda: (3, 9)
+        env = {"HOMEBREW_PREFIX": str(self.root / "no-brew"), "PATH": str(bindir)}
+        with mock.patch.dict(os.environ, env), \
+                mock.patch.object(sys, "argv", ["dotfiles", "status", "--json"]):
+            with self.assertRaises(SystemExit):
+                mod.main()
+        self.assertEqual(self.calls(), [])  # nothing ran under the old python
+        (argv,) = recorded
+        self.assertEqual(argv, [str(wrapper), "-B", str(DOTFILES), "status", "--json"])
+        done = subprocess.run(argv, env=dict(self.env, PATH=f"{bindir}:{self.env['PATH']}"),
+                              cwd=str(self.root), stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE, timeout=120)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        calls = self.calls()
+        self.assertEqual([c["argv"] for c in calls], [["status", "--json"]])
+        self.assertTrue(calls[0]["no_bytecode"])
+        self.assertIn(f"-B {DOTFILES} status --json", wrapper_log.read_text())
+
+    def test_no_newer_python_changes_nothing(self):
+        before = self.head()
+        self.push_upstream()
+        mod = load_dotfiles_module()
+        mod._python_version = lambda: (3, 9)
+        mod._execv = lambda path, argv: self.fail("re-executed")
+        env = {"HOMEBREW_PREFIX": str(self.root / "no-brew"),
+               "PATH": str(self.root / "empty"), "HOME": str(self.home)}
+        with mock.patch.dict(os.environ, env), \
+                mock.patch.object(sys, "argv", ["dotfiles", "update"]):
+            with self.assertRaises(SystemExit) as raised:
+                mod.main()
+        self.assertEqual(raised.exception.code, 2)
+        self.assertEqual(self.head(), before)  # not even fetched and merged
+        self.assertEqual(self.calls(), [])
+
+
+class PlatformCommandTests(unittest.TestCase):
+    def setUp(self):
+        self.mod = load_dotfiles_module()
+        self.delegated = []
+        self.mod._installer = lambda *args: self.delegated.append(list(args)) or 0
+
+    def test_gui_apply_is_not_applicable_on_macos(self):
+        self.mod._darwin_host = lambda: True
+        import contextlib
+        import io
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(self.mod.gui_apply(), 2)
+        self.assertIn("gui-apply is not applicable on macOS", out.getvalue())
+        self.assertIn("Nothing was changed.", out.getvalue())
+        self.assertEqual(self.delegated, [])
+        self.mod._darwin_host = lambda: False
+        self.assertEqual(self.mod.gui_apply(autostart=True), 0)
+        self.assertEqual(self.delegated, [["gui-apply", "--autostart"]])
+
+    def test_install_runs_on_linux_and_macos_only(self):
+        self.mod._available_packages = lambda: ["fzf"]
+        for platform, darwin, allowed in (("linux", False, True), ("darwin", True, True),
+                                          ("freebsd13", False, False)):
+            with self.subTest(platform):
+                self.delegated.clear()
+                self.mod._darwin_host = lambda: darwin
+                with mock.patch.object(sys, "platform", platform):
+                    if allowed:
+                        self.mod.install_local(["fzf"])
+                        self.assertEqual(self.delegated, [["packages", "--only", "fzf"]])
+                    else:
+                        with self.assertRaises(SystemExit):
+                            self.mod.install_local(["fzf"])
+                        self.assertEqual(self.delegated, [])
+
+
+# The standard-library modules bin/dotfiles uses, for interpreters without
+# sys.stdlib_module_names (3.9).
+KNOWN_STDLIB = {
+    "__future__", "argparse", "collections", "contextlib", "functools", "json", "os",
+    "pwd", "shlex", "shutil", "stat", "subprocess", "sys", "tempfile", "webbrowser",
+}
+
+
+class Python39Tests(unittest.TestCase):
+    """bin/dotfiles may start under the Command Line Tools' python3 (3.9) on
+    macOS, before it re-executes itself: 3.9 grammar, standard library only
+    (and installer.darwin_proc of its checkout)."""
+
+    def test_python_3_9_grammar_and_standard_library(self):
+        source = DOTFILES.read_text(encoding="utf-8")
+        tree = ast.parse(source, filename="bin/dotfiles", feature_version=(3, 9))
+        stdlib = KNOWN_STDLIB
+        if hasattr(sys, "stdlib_module_names"):
+            self.assertLessEqual(KNOWN_STDLIB, set(sys.stdlib_module_names))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                modules = [alias.name for alias in node.names]
+            elif isinstance(node, ast.ImportFrom):
+                modules = [node.module or ""]
+            else:
+                continue
+            for module in modules:
+                with self.subTest(module=module):
+                    self.assertTrue(module.split(".")[0] in stdlib or module == "installer",
+                                    module)
 
 
 if __name__ == "__main__":
