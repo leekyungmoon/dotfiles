@@ -245,39 +245,99 @@ def _sysctl_value(name: str) -> str | None:
     return completed.stdout.strip()
 
 
-def _macos_product_version(version_plist: Path) -> str:
-    """ProductVersion from SystemVersion.plist (the real version even when
-    SYSTEM_VERSION_COMPAT=1 makes sw_vers report 10.16), else sw_vers."""
+def _sw_vers_product_version(env: dict[str, str]) -> str | None:
+    """``sw_vers -productVersion`` run with ``env``; None when it cannot run,
+    fails or prints nothing."""
 
-    try:
-        with open(version_plist, "rb") as handle:
-            value = plistlib.load(handle).get("ProductVersion")
-        if isinstance(value, str) and value.strip():
-            return value.strip()
-    except (OSError, ValueError, plistlib.InvalidFileException):
-        pass
     try:
         completed = subprocess.run(
             ["/usr/bin/sw_vers", "-productVersion"],
-            capture_output=True, text=True, timeout=10, check=True,
-            env={**os.environ, "SYSTEM_VERSION_COMPAT": "0"},
+            capture_output=True, text=True, timeout=10, check=False, env=env,
         )
-    except (OSError, subprocess.SubprocessError) as exc:
-        raise PlatformError(f"cannot read the macOS version: {exc}") from exc
-    return completed.stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if completed.returncode != 0:
+        return None
+    return completed.stdout.strip() or None
+
+
+# What strtol(value, NULL, 0) reads of a value: blanks, a sign, then
+# 0x<hex>, 0<octal> or <decimal> digits, up to the first one that does not
+# fit (so "01", "0x1" and "1.5" are all 1, "true" and "" are 0).
+_STRTOL_PREFIX = re.compile(r"[ \t\n\v\f\r]*([+-]?)(0[xX][0-9a-fA-F]+|0[0-7]*|[1-9][0-9]*)")
+
+
+def _system_version_compat(env: dict[str, str]) -> bool:
+    """Whether SYSTEM_VERSION_COMPAT in ``env`` turns libSystem's version
+    compatibility shim on in a process started with it. Libsystem's init.c
+    (macOS 15 and 26 alike) reads the variable with strtol(value, NULL, 0):
+    1 turns the macOS shim on, 2 the iOS one, any other value neither.
+    Unset, libSystem decides by the SDK the program was built with."""
+
+    match = _STRTOL_PREFIX.match(env.get("SYSTEM_VERSION_COMPAT") or "")
+    if match is None:
+        return False
+    sign, digits = match.groups()
+    base = 16 if digits[1:2] in ("x", "X") else 8 if digits[0] == "0" else 10
+    return sign != "-" and int(digits, base) in (1, 2)
+
+
+# What SystemVersionCompat.plist says (10.16 on macOS 11 to 15, 16.0 on 26):
+# no Mac runs either release.
+_COMPAT_VERSION = re.compile(r"^(?:10\.16|16)(?:\.|$)")
+
+
+def _macos_product_version(version_plist: Path, env: dict[str, str], sw_vers) -> str:
+    """ProductVersion from SystemVersion.plist, else sw_vers; from sw_vers
+    first when SYSTEM_VERSION_COMPAT turns libSystem's shim on (see
+    _system_version_compat).
+
+    The shim redirects every open() of SystemVersion.plist in this process
+    to SystemVersionCompat.plist (10.16 on macOS 11 to 15, 16.0 on 26), or
+    iOSSystemVersion.plist, so the plist would name a release this Mac does
+    not run. sw_vers runs with SYSTEM_VERSION_COMPAT=0, which leaves the
+    shim off in its own process; the plist is then only its fallback. With
+    the variable unset, libSystem's SDK rule can still turn the shim on for
+    a python built with an older SDK, so a plist naming one of the compat
+    releases is checked with sw_vers too.
+    """
+
+    sw_vers_env = {**env, "SYSTEM_VERSION_COMPAT": "0"}
+    compat = _system_version_compat(env)
+    version = sw_vers(sw_vers_env) if compat else None
+    if not version:
+        try:
+            with open(version_plist, "rb") as handle:
+                value = plistlib.load(handle).get("ProductVersion")
+            if isinstance(value, str) and value.strip():
+                version = value.strip()
+        except (OSError, ValueError, plistlib.InvalidFileException):
+            pass
+    if not compat and (not version or _COMPAT_VERSION.match(version)):
+        version = sw_vers(sw_vers_env) or version
+    if not version:
+        raise PlatformError(
+            f"cannot read the macOS version from {version_plist} or /usr/bin/sw_vers")
+    return version
 
 
 def detect_macos(*, version_plist: Path | None = None, sysctl=_sysctl_value,
-                 machine: str | None = None) -> Platform:
+                 machine: str | None = None, env: dict[str, str] | None = None,
+                 sw_vers=_sw_vers_product_version) -> Platform:
     """Platform("macos", <major>, <arch>, "darwin").
 
     A process translated by Rosetta 2 reports x86_64 on Apple silicon; it is
     refused instead of guessed, because the Homebrew prefix, the pinned
     darwin artifacts and every LaunchAgent PATH depend on the native
     architecture.
+
+    ``env`` (default: ``os.environ``) and ``sw_vers`` exist so tests can
+    model SYSTEM_VERSION_COMPAT without the real sw_vers; production
+    callers pass neither.
     """
 
-    version = _macos_product_version(version_plist or MACOS_VERSION_PLIST)
+    env = os.environ if env is None else env
+    version = _macos_product_version(version_plist or MACOS_VERSION_PLIST, env, sw_vers)
     release = parse_macos_version(version)
     if sysctl("sysctl.proc_translated") == "1":
         raise PlatformError(

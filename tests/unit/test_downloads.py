@@ -235,34 +235,71 @@ class FetchTests(unittest.TestCase):
         self.assertEqual(dl._OPENER.calls, 2)
         self.assertEqual((self.tmp / "x").read_bytes(), b"payload")
 
+    @staticmethod
+    def linking(version: str, major: int):
+        """This Python's ssl module as if built against that TLS library."""
+        return mock.patch.object(dl, "ssl", types.SimpleNamespace(
+            OPENSSL_VERSION=version, OPENSSL_VERSION_INFO=(major, 0, 0, 0, 0)))
+
     def test_certificate_remedy_per_platform(self):
         python_org = "/Library/Frameworks/Python.framework/Versions/3.13"
         mac = dl.certificate_remedy("darwin", prefix=python_org)
         self.assertIn("brew install python3", mac)
         self.assertIn("Install Certificates.command", mac)
         self.assertIn("SSL_CERT_FILE", mac)
+        self.assertNotIn("openssl@", mac)
         # Homebrew's own python3 already is that remedy: its CA bundle (the
-        # ca-certificates formula) is what is broken, whatever the prefix.
+        # cert.pem of the openssl formula it links, a link to the
+        # ca-certificates formula's) is what is broken, whatever the prefix.
         for prefix in (
                 "/opt/homebrew/opt/python@3.13/Frameworks/Python.framework/Versions/3.13",
                 "/usr/local/Cellar/python@3.12/3.12.11/Frameworks/Python.framework/Versions/3.12",
                 "/Users/me/brew/opt/python@3.14/Frameworks/Python.framework/Versions/3.14"):
-            with self.subTest(prefix=prefix):
+            with self.subTest(prefix=prefix), self.linking("OpenSSL 4.0.3", 4):
                 brew = dl.certificate_remedy("darwin", prefix=prefix)
-                self.assertIn("brew reinstall ca-certificates openssl@3", brew)
+                self.assertIn("brew reinstall ca-certificates openssl@4'", brew)
                 self.assertIn("SSL_CERT_FILE", brew)
                 self.assertNotIn("brew install python3", brew)
                 self.assertNotIn("Install Certificates.command", brew)
         linux = dl.certificate_remedy("linux")
-        self.assertIn("ca-certificates", linux)
-        self.assertIn("SSL_CERT_FILE", linux)
-        self.assertNotIn("brew", linux)
+        self.assertEqual(linux, "install the system CA certificates ('sudo apt-get install "
+                                "ca-certificates'); behind a TLS-inspecting proxy, set "
+                                "SSL_CERT_FILE to its CA bundle")
+        with self.linking("LibreSSL 2.8.3", 2):
+            self.assertEqual(dl.certificate_remedy("linux"), linux)
         # By default this Python decides; a venv counts as the Python it was
         # made from (base_prefix, not prefix).
         host = types.SimpleNamespace(platform="darwin", base_prefix=python_org,
                                      prefix="/opt/homebrew/opt/python@3.13/venv")
         with mock.patch.object(dl, "sys", host):
             self.assertEqual(dl.certificate_remedy(), mac)
+
+    def test_certificate_remedy_names_the_openssl_this_python_links(self):
+        # Homebrew's python3 is python@3.15 now, which links openssl@4 (as
+        # python@3.14 does); python@3.13 and older link openssl@3.
+        # Reinstalling the other one repairs nothing this Python reads.
+        homebrew = "/opt/homebrew/opt/python@3.15/Frameworks/Python.framework/Versions/3.15"
+        for version, major, formula in (("OpenSSL 4.0.3", 4, "openssl@4"),
+                                        ("OpenSSL 3.0.13 30 Jan 2024", 3, "openssl@3")):
+            with self.subTest(version=version), self.linking(version, major):
+                remedy = dl.certificate_remedy("darwin", prefix=homebrew)
+                self.assertIn(f"run 'brew reinstall ca-certificates {formula}', then rerun",
+                              remedy)
+        # LibreSSL, whose OPENSSL_VERSION_INFO says 2, is no openssl formula.
+        # Apple's /usr/bin/python3 (the Command Line Tools' 3.9) is told to
+        # use Homebrew's python3, like a python.org Python; a Homebrew
+        # python3 without OpenSSL gets the CA bundle alone.
+        clt = ("/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/"
+               "Versions/3.9")
+        python_org = "/Library/Frameworks/Python.framework/Versions/3.13"
+        with self.linking("LibreSSL 2.8.3", 2):
+            apple = dl.certificate_remedy("darwin", prefix=clt)
+            other = dl.certificate_remedy("darwin", prefix=homebrew)
+        self.assertEqual(apple, dl.certificate_remedy("darwin", prefix=python_org))
+        self.assertIn("use Homebrew's python3 ('brew install python3';", apple)
+        self.assertNotIn("openssl", apple)
+        self.assertIn("run 'brew reinstall ca-certificates', then rerun", other)
+        self.assertNotIn("openssl", other)
 
 
 # Absolute paths: on macOS gnupg comes from Homebrew, outside /usr/bin:/bin.

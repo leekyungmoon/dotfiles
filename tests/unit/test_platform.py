@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import os
 import pwd
+import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
@@ -112,6 +114,15 @@ def _version_plist(directory: Path, version: str) -> Path:
 
 
 class MacosPlatformTests(unittest.TestCase):
+    def setUp(self):
+        # These tests hand detect_macos a plist. A SYSTEM_VERSION_COMPAT=1
+        # exported on the Mac that runs them would send it to the real
+        # sw_vers instead (MacosVersionCompatTests has that path).
+        patcher = mock.patch.dict(os.environ)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        os.environ.pop("SYSTEM_VERSION_COMPAT", None)
+
     def test_supported_matrix(self):
         cases = [(r, "arm64") for r in ("15", "26", "27")]
         cases += [(r, "amd64") for r in ("15", "26")]
@@ -213,6 +224,128 @@ class MacosPlatformTests(unittest.TestCase):
             path.write_text("ID=ubuntu\nVERSION_ID=24.04\n", encoding="utf-8")
             detected = plat.detect_platform(path)
         self.assertEqual(detected.system, "linux")
+
+
+class MacosVersionCompatTests(unittest.TestCase):
+    """SYSTEM_VERSION_COMPAT=1 (or 2) makes libSystem hand every open() of
+    SystemVersion.plist in the process another plist: SystemVersionCompat's
+    10.16 on macOS 11 to 15, 16.0 on 26. etc/install's sw_vers runs with the
+    variable at 0 and accepts the Mac; install.py, which inherits it, must
+    not refuse the same Mac. sw_vers is a fake here: none runs for real."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.dir = Path(self._tmp.name)
+        self.sw_vers_envs: list[dict[str, str]] = []
+
+    def detect(self, plist_version: str | None, env: dict[str, str], answer=None):
+        """detect_macos on arm64 with a plist saying ``plist_version`` (None:
+        no plist) and a sw_vers that answers ``answer`` (None: it fails)."""
+
+        def sw_vers(child_env):
+            self.sw_vers_envs.append(dict(child_env))
+            return answer
+
+        plist = (self.dir / "missing.plist" if plist_version is None
+                 else _version_plist(self.dir, plist_version))
+        return plat.detect_macos(version_plist=plist, sysctl=lambda name: None,
+                                 machine="arm64", env=env, sw_vers=sw_vers)
+
+    def test_compat_on_asks_sw_vers_and_ignores_the_compat_plist(self):
+        # libSystem's rule: strtol(value, NULL, 0) is 1 (macOS) or 2 (iOS).
+        for compat_plist, real in (("10.16", "15.5"), ("16.0", "26.0.1")):
+            for value in ("1", "2", " 1", "+1", "01", "0x1", "0X02", "1.5"):
+                with self.subTest(plist=compat_plist, value=value):
+                    self.sw_vers_envs.clear()
+                    env = {"SYSTEM_VERSION_COMPAT": value, "PATH": "/usr/bin:/bin"}
+                    detected = self.detect(compat_plist, env, answer=real)
+                    self.assertEqual(detected, plat.Platform("macos", real.split(".")[0],
+                                                             "arm64", "darwin"))
+                    plat.require_supported_platform(detected)
+                    # Asked once, with the variable at 0 and the rest kept.
+                    self.assertEqual(self.sw_vers_envs, [{"SYSTEM_VERSION_COMPAT": "0",
+                                                          "PATH": "/usr/bin:/bin"}])
+                    self.assertEqual(env["SYSTEM_VERSION_COMPAT"], value)
+
+    def test_compat_on_with_a_failing_sw_vers_falls_back_to_the_plist(self):
+        for answer in (None, ""):
+            with self.subTest(answer=answer):
+                self.sw_vers_envs.clear()
+                detected = self.detect("26.1", {"SYSTEM_VERSION_COMPAT": "1"}, answer=answer)
+                self.assertEqual(detected.release, "26")
+                self.assertEqual(len(self.sw_vers_envs), 1)
+        # Neither answers: an error, and sw_vers was not asked twice.
+        self.sw_vers_envs.clear()
+        with self.assertRaises(plat.PlatformError) as caught:
+            self.detect(None, {"SYSTEM_VERSION_COMPAT": "1"})
+        self.assertIn("cannot read the macOS version", str(caught.exception))
+        self.assertEqual(len(self.sw_vers_envs), 1)
+
+    def test_compat_off_reads_the_plist_without_sw_vers(self):
+        values = ("0", "", "3", "10", "-1", "true", "0x", "08", "0x10")
+        for env in [{}] + [{"SYSTEM_VERSION_COMPAT": value} for value in values]:
+            with self.subTest(env=env):
+                self.sw_vers_envs.clear()
+                detected = self.detect("15.6", env, answer="26.0")
+                self.assertEqual(detected.release, "15")
+                self.assertEqual(self.sw_vers_envs, [])
+
+    def test_a_compat_release_without_the_variable_asks_sw_vers(self):
+        # libSystem's SDK rule can hand a python built with an older SDK the
+        # compat plist with the variable unset; no Mac runs 10.16 or 16.x.
+        for compat_plist, real in (("10.16", "15.5"), ("16.0", "26.0.1"), ("16", "26.1")):
+            with self.subTest(plist=compat_plist):
+                self.sw_vers_envs.clear()
+                detected = self.detect(compat_plist, {}, answer=real)
+                self.assertEqual(detected.release, real.split(".")[0])
+                self.assertEqual(self.sw_vers_envs, [{"SYSTEM_VERSION_COMPAT": "0"}])
+        # A failing sw_vers leaves the plist's answer, which is refused.
+        detected = self.detect("16.0", {}, answer=None)
+        self.assertEqual(detected.release, "16")
+        with self.assertRaises(plat.PlatformError):
+            plat.require_supported_platform(detected)
+        # Real releases never ask.
+        self.sw_vers_envs.clear()
+        for version in ("15.6", "26.0", "10.15.7", "27.0"):
+            self.detect(version, {}, answer="99.0")
+        self.assertEqual(self.sw_vers_envs, [])
+
+    def test_compat_off_without_a_plist_still_asks_sw_vers(self):
+        detected = self.detect(None, {"PATH": "/usr/bin"}, answer="15.5")
+        self.assertEqual(detected.release, "15")
+        self.assertEqual(self.sw_vers_envs, [{"PATH": "/usr/bin", "SYSTEM_VERSION_COMPAT": "0"}])
+        self.sw_vers_envs.clear()
+        with self.assertRaises(plat.PlatformError):
+            self.detect(None, {})
+        self.assertEqual(len(self.sw_vers_envs), 1)
+
+    def test_the_environment_defaults_to_this_process(self):
+        plist = _version_plist(self.dir, "16.0")
+        envs = []
+        with mock.patch.dict(os.environ, {"SYSTEM_VERSION_COMPAT": "1"}):
+            detected = plat.detect_macos(version_plist=plist, sysctl=lambda name: None,
+                                         machine="arm64",
+                                         sw_vers=lambda env: envs.append(env) or "26.0.1")
+        self.assertEqual(detected.release, "26")
+        self.assertEqual([env["SYSTEM_VERSION_COMPAT"] for env in envs], ["0"])
+
+    def test_sw_vers_runs_the_system_binary_with_the_given_environment(self):
+        done = subprocess.CompletedProcess([], 0, stdout="26.0.1\n", stderr="")
+        with mock.patch.object(plat.subprocess, "run", return_value=done) as run:
+            self.assertEqual(plat._sw_vers_product_version({"SYSTEM_VERSION_COMPAT": "0"}),
+                             "26.0.1")
+        self.assertEqual(run.call_args.args[0], ["/usr/bin/sw_vers", "-productVersion"])
+        self.assertEqual(run.call_args.kwargs["env"], {"SYSTEM_VERSION_COMPAT": "0"})
+        for outcome in (subprocess.CompletedProcess([], 1, stdout="", stderr="no"),
+                        subprocess.CompletedProcess([], 0, stdout="\n", stderr=""),
+                        FileNotFoundError(2, "No such file or directory"),
+                        subprocess.TimeoutExpired(["/usr/bin/sw_vers"], 10)):
+            with self.subTest(outcome=outcome):
+                effect = ({"side_effect": outcome} if isinstance(outcome, BaseException)
+                          else {"return_value": outcome})
+                with mock.patch.object(plat.subprocess, "run", **effect):
+                    self.assertIsNone(plat._sw_vers_product_version({}))
 
 
 class ResolveTargetTests(unittest.TestCase):

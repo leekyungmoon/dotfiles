@@ -78,23 +78,36 @@ def _homebrew_python(prefix: str) -> bool:
     return "/opt/python@" in prefix or "/Cellar/python@" in prefix
 
 
+def _openssl_formula() -> str | None:
+    """The Homebrew formula of the OpenSSL this Python's ssl module links,
+    by its major version: openssl@4 for Homebrew's python@3.14 and newer,
+    openssl@3 for older ones. None for another TLS library: Apple's
+    /usr/bin/python3 has LibreSSL, whose OPENSSL_VERSION_INFO always says 2."""
+
+    if not ssl.OPENSSL_VERSION.startswith("OpenSSL"):
+        return None
+    return "openssl@%d" % ssl.OPENSSL_VERSION_INFO[0]
+
+
 def certificate_remedy(platform: str | None = None, *, prefix: str | None = None) -> str:
     """What to do when this Python cannot verify any server certificate.
 
     On macOS the usual cause is a python.org build, which ships no CA
     certificates until its 'Install Certificates.command' has run, while
     Homebrew's python3 uses Homebrew's CA bundle; when Homebrew's own python3
-    fails, that bundle (the ca-certificates formula) or a TLS-inspecting
-    proxy is the cause. ``prefix`` defaults to this Python's
-    ``sys.base_prefix``.
+    fails, that bundle (the cert.pem of the openssl formula it links, which
+    points to the ca-certificates formula's) or a TLS-inspecting proxy is
+    the cause. ``prefix`` defaults to this Python's ``sys.base_prefix``.
     """
 
     platform = sys.platform if platform is None else platform
     if platform == "darwin":
         prefix = sys.base_prefix if prefix is None else prefix
         if _homebrew_python(prefix):
-            return ("this is Homebrew's python3: run 'brew reinstall ca-certificates "
-                    f"openssl@3', then rerun; {_PROXY_REMEDY}")
+            formula = _openssl_formula()
+            reinstall = f"ca-certificates {formula}" if formula else "ca-certificates"
+            return (f"this is Homebrew's python3: run 'brew reinstall {reinstall}', "
+                    f"then rerun; {_PROXY_REMEDY}")
         return ("use Homebrew's python3 ('brew install python3'; ~/.dotfiles/install "
                 "runs install.py with it), or, for a python.org Python, run "
                 "'Install Certificates.command' in its /Applications/Python 3.x folder; "

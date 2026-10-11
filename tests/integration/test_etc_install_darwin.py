@@ -13,7 +13,8 @@ A fake Homebrew lives under HOMEBREW_PREFIX: bin/brew records its calls, and
 'brew install' puts git or python3 into bin/ (FAKE_BREW_RC makes it fail);
 bin/python3 records the install.py run like test_etc_install.py's fake,
 answers the login shell lookup from FAKE_PW_SHELL, so no real login shell
-ever starts, and runs as FAKE_PYTHON_MACHINE (default: natively). python3
+ever starts, runs as FAKE_PYTHON_MACHINE (default: natively) and runs the
+CA-certificate probe as if its ssl module linked FAKE_SSL_VERSION. python3
 on PATH must never run on macOS: it is a trap. BSD-like ``mv`` (no -T, no
 long options; FAKE_MV_FAIL makes renames fail, FAKE_MV_RECREATE puts
 something back in the way) and ``readlink`` (only -f and -n) prove that the
@@ -37,6 +38,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import ssl
 import subprocess
 import sys
 import unittest
@@ -139,14 +141,22 @@ exit "${FAKE_BREW_RC:-0}"
 
 # Homebrew's python3: the login shell lookup answers FAKE_PW_SHELL (never
 # the real one), the machine it runs as is FAKE_PYTHON_MACHINE (default:
-# what uname -m says, so native); everything else goes to the recording
-# fake python.
+# what uname -m says, so native), and with FAKE_SSL_VERSION (and its major
+# version, FAKE_SSL_MAJOR) the CA-certificate probe runs as if its ssl
+# module linked that library; everything else goes to the recording fake
+# python.
 FAKE_HOMEBREW_PYTHON = r'''#!/bin/sh
 if [ "$1" = -c ]; then
   case "$2" in
     *pwd.getpwuid*) echo "python3 pwd-lookup" >> "@LOG@"
       echo "${FAKE_PW_SHELL:-/nonexistent/login-shell}"; exit 0 ;;
     *os.uname*) echo "${FAKE_PYTHON_MACHINE:-$(uname -m)}"; exit 0 ;;
+    *get_default_verify_paths*) if [ -n "${FAKE_SSL_VERSION:-}" ]; then
+        exec "@RECORDER@" -c 'import ssl, sys
+ssl.OPENSSL_VERSION = sys.argv[1]
+ssl.OPENSSL_VERSION_INFO = (int(sys.argv[2]), 0, 0, 0, 0)
+exec(sys.argv[3])' "$FAKE_SSL_VERSION" "$FAKE_SSL_MAJOR" "$2"
+      fi ;;
   esac
 fi
 if [ "$1" = install.py ]; then echo "python3 install.py PATH=$PATH" >> "@LOG@"; fi
@@ -304,6 +314,8 @@ class DarwinSimulationTests(FakeHomebrew, base.EtcInstallTests):
         self.assertTrue(paths[0].startswith(f"{self.prefix}/bin:{self.prefix}/sbin:"), paths[0])
         # git from the Command Line Tools, python3 already in Homebrew
         self.assertEqual(self.brew_calls(), [])
+        # The CA probe's openssl formula is only for its error message.
+        self.assertNotIn("openssl@", out + err)
         self.assertNotIn("WARNING", err)
         self.assert_no_linux_tools()
 
@@ -351,13 +363,29 @@ class DarwinSimulationTests(FakeHomebrew, base.EtcInstallTests):
 
     def test_darwin_python3_without_ca_certificates_stops(self):
         # No CA file nor directory for python's default context: install.py's
-        # downloads would fail, so nothing starts.
+        # downloads would fail, so nothing starts. The remedy names the
+        # openssl formula that this python links (Homebrew's python3 links
+        # openssl@4 now); a python without OpenSSL gets the CA bundle alone.
         missing = str(self.case / "no-such-ca")
-        completed = self.run_piped(SSL_CERT_FILE=missing, SSL_CERT_DIR=missing)
-        err = completed.stderr.decode()
-        self.assertIn(f"ERROR: {self.prefix}/bin/python3 finds no CA certificates", err)
-        self.assertIn("brew reinstall ca-certificates openssl@3", err)
-        self.assert_nothing_changed(completed)
+        this_python = (f"openssl@{ssl.OPENSSL_VERSION_INFO[0]}"
+                       if ssl.OPENSSL_VERSION.startswith("OpenSSL") else None)
+        cases = {"this python": ({}, this_python),
+                 "OpenSSL 4": ({"FAKE_SSL_VERSION": "OpenSSL 4.0.3", "FAKE_SSL_MAJOR": "4"},
+                               "openssl@4"),
+                 "OpenSSL 3": ({"FAKE_SSL_VERSION": "OpenSSL 3.6.5", "FAKE_SSL_MAJOR": "3"},
+                               "openssl@3"),
+                 "LibreSSL": ({"FAKE_SSL_VERSION": "LibreSSL 2.8.3", "FAKE_SSL_MAJOR": "2"},
+                              None)}
+        for name, (extra, formula) in cases.items():
+            with self.subTest(name):
+                completed = self.run_piped(SSL_CERT_FILE=missing, SSL_CERT_DIR=missing, **extra)
+                err = completed.stderr.decode()
+                reinstall = f"ca-certificates {formula}" if formula else "ca-certificates"
+                self.assertIn(f"ERROR: {self.prefix}/bin/python3 finds no CA certificates, so "
+                              f"its downloads would fail. Run 'brew reinstall {reinstall}' "
+                              "(or, for a python.org Python, 'Install Certificates.command' "
+                              "in its /Applications/Python 3.x folder), then rerun.\n", err)
+                self.assert_nothing_changed(completed)
 
     # -- which Macs ----------------------------------------------------------------
 

@@ -309,7 +309,7 @@ _prepare_macos() {
     *) _die "unsupported macOS release '${version:-unknown}' on $arch; supported: ${_MACOS_ARM64_RELEASES// /, } on Apple silicon; ${_MACOS_INTEL_RELEASES// /, } on Intel (best effort)." ;;
   esac
   if [[ "$arch" == x86_64 ]]; then
-    echo "WARNING: Intel Macs are best effort only: Homebrew supports them at Tier 3 (no new bottles), so packages may be built from source." >&2
+    echo "WARNING: Intel Macs are best effort only: Homebrew supports them at Tier 3 (no new bottles), so packages may be built from source, which also installs build-only formulae (cmake among them) that the forbidden-formula check does not cover." >&2
   fi
   if [[ "${HOMEBREW_PREFIX:-}" == /* ]]; then
     prefix="$HOMEBREW_PREFIX"
@@ -347,16 +347,22 @@ _prepare_macos() {
     || _die "$python runs as '${machine:-unknown}' on this $arch Mac (an Intel-only build under Rosetta 2?), and install.py refuses that. Use a native Homebrew (on Apple silicon: /opt/homebrew, with HOMEBREW_PREFIX unset or naming it), then rerun."
   # install.py downloads with python's default certificate store (macOS
   # keeps its own in the keychain, and has no /etc/ssl/certs): a CA file or
-  # a CA directory, with something in it (as install.py checks, too).
-  "$python" -c '
+  # a CA directory, with something in it (as install.py checks, too). The
+  # same call prints the openssl formula that python links, which keeps
+  # that store (openssl@4 for Homebrew's python@3.14 and newer, openssl@3
+  # for older ones); a python with another TLS library prints none.
+  local openssl
+  openssl="$("$python" -c '
 import os, ssl, sys
+if ssl.OPENSSL_VERSION.startswith("OpenSSL"):
+    print("openssl@%d" % ssl.OPENSSL_VERSION_INFO[0])
 p = ssl.get_default_verify_paths()
 try:
     found = (p.cafile and os.path.getsize(p.cafile)) or (p.capath and os.listdir(p.capath))
 except OSError:
     found = False
 sys.exit(not found)
-' || _die "$python finds no CA certificates, so its downloads would fail. Run 'brew reinstall ca-certificates openssl@3' (or, for a python.org Python, 'Install Certificates.command' in its /Applications/Python 3.x folder), then rerun."
+')" || _die "$python finds no CA certificates, so its downloads would fail. Run 'brew reinstall ca-certificates${openssl:+ $openssl}' (or, for a python.org Python, 'Install Certificates.command' in its /Applications/Python 3.x folder), then rerun."
 }
 
 # Homebrew is missing. Its official installer asks for the password (an
