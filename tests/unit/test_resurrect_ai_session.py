@@ -533,8 +533,9 @@ class DarwinRoutingTests(DarwinHookCase):
         locks, rollouts = MODULE.open_codex_ids(30)
         self.assertEqual(locks, [ID_A])
         self.assertEqual(sorted(rollouts), sorted([(rollout, ID_B), (firmlinked, ID_A)]))
-        # Descriptors that cannot be read give no live ID.
-        self.assertEqual(MODULE.open_codex_ids(31), ([], []))
+        # Descriptors that cannot be read: cannot tell (darwin_proc's None),
+        # which is not "no live ID", ([], []).
+        self.assertIsNone(MODULE.open_codex_ids(31))
 
     def test_rollout_names_compare_in_any_unicode_normalization(self):
         # APFS takes every normalization of a name for the same name, so
@@ -560,6 +561,24 @@ class DarwinRoutingTests(DarwinHookCase):
         self.assertEqual(
             MODULE.ai_resume_command(10), ["codex", "resume", ID_B, "--disable", "hooks"]
         )
+
+    def test_codex_pane_whose_open_files_cannot_be_read_is_cleared(self):
+        # /resume in the TUI left argv at ID_A; the process holds ID_B's
+        # lock. When libproc cannot read its descriptors, that lock may be
+        # among them: argv proves nothing, and the pane's command is cleared.
+        home = self.home()
+        self.rollout(home, ID_B, {"thread_source": "user"})
+        backend = FakeDarwinProc(
+            {10: (1, 1.0, ["-zsh"]), 30: (10, 2.0, ["codex", "resume", ID_A])},
+            files={30: [f"{home}/.codex/thread-writer-locks/{ID_B}.lock"]},
+        )
+        self.use_darwin(backend)
+        self.assertEqual(MODULE.ai_resume_command(10), ["codex", "resume", ID_B])
+        backend.files[30] = []  # read, and no thread held: the argv ID stands
+        self.assertEqual(MODULE.ai_resume_command(10), ["codex", "resume", ID_A])
+        del backend.files[30]  # cannot be read
+        self.assertEqual(MODULE.ai_resume_command(10), [])
+        self.assertEqual(self.stderr.getvalue(), "")
 
     def test_claude_launcher_prefers_the_path_the_process_was_started_with(self):
         home = self.home()
@@ -732,6 +751,19 @@ class DarwinBackendFailureTests(DarwinHookCase):
         self.use_darwin(Raising({}))
         self.assert_saved_with_one_warning("darwin_proc.all_pids failed: boom")
 
+    def test_open_files_that_raise_clear_the_codex_pane(self):
+        # The warning says unproven commands are cleared; the argv ID of
+        # pane 1's Codex is one of them.
+        class Raising(FakeDarwinProc):
+            def open_vnodes(self, pid):
+                raise RuntimeError("bust")
+
+        self.use_darwin(Raising({
+            101: (1, 1.0, ["-zsh"]),
+            111: (101, 2.0, ["codex", "resume", ID_A]),
+        }))
+        self.assert_saved_with_one_warning("darwin_proc.open_vnodes failed: bust")
+
 
 class DarwinBackendImportTests(unittest.TestCase):
     def test_backend_is_loaded_from_this_checkout_without_bytecode(self):
@@ -775,6 +807,8 @@ class SelfTestTests(unittest.TestCase):
             ("child_commands", {"return_value": []}, "the exact argv of a child"),
             ("process_tree", {"return_value": []}, "the process tree"),
             ("open_codex_ids", {"return_value": ([], [])}, "files a process holds open"),
+            # macOS: darwin_proc cannot tell.
+            ("open_codex_ids", {"return_value": None}, "files a process holds open"),
             ("child_commands", {"side_effect": OSError("broken")}, "unexpected error: broken"),
         )
         for name, behaviour, reason in cases:

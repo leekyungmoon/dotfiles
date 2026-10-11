@@ -324,7 +324,9 @@ def safe_claude_flags(argv: list[str]) -> list[str]:
     return result
 
 
-def open_codex_ids(pid: int) -> tuple[list[str], list[tuple[Path, str]]]:
+def open_codex_ids(pid: int) -> tuple[list[str], list[tuple[Path, str]]] | None:
+    """The thread IDs of the writer locks and rollouts pid holds open. None
+    only on macOS, when that cannot be told (darwin_open_codex_ids)."""
     if DARWIN:
         return darwin_open_codex_ids(pid)
     locks: list[str] = []
@@ -366,16 +368,18 @@ def codex_session_prefixes() -> tuple[str, ...]:
     return tuple(sorted(unicodedata.normalize("NFC", prefix) for prefix in prefixes))
 
 
-def darwin_open_codex_ids(pid: int) -> tuple[list[str], list[tuple[Path, str]]]:
+def darwin_open_codex_ids(pid: int) -> tuple[list[str], list[tuple[Path, str]]] | None:
     """open_codex_ids on macOS: the same checks, on libproc's names for the
-    files pid holds open. When they cannot be read there is no live ID, and
-    ai_resume_command's fail-closed rules apply."""
-    locks: list[str] = []
-    rollouts: list[tuple[Path, str]] = []
+    files pid holds open. None when darwin_proc cannot read them all (its
+    "cannot tell": one descriptor it fails on voids the whole list, where
+    /proc skips just that one). That is not "no live ID": a lock pid holds
+    must never look absent, or ai_resume_command would save argv's stale ID."""
     backend = darwin_backend()
     files = darwin_query(backend.open_vnodes, pid) if backend is not None else None
     if files is None:
-        return locks, rollouts
+        return None
+    locks: list[str] = []
+    rollouts: list[tuple[Path, str]] = []
     session_roots = codex_session_prefixes()
     for entry in files:
         raw_target = entry.path
@@ -583,7 +587,10 @@ def ai_resume_command(pane_pid: int) -> list[str] | None:
     locks: set[str] = set()
     rollouts: set[tuple[Path, str]] = set()
     for pid, _, _, _ in candidates:
-        candidate_locks, candidate_rollouts = open_codex_ids(pid)
+        found = open_codex_ids(pid)
+        if found is None:  # macOS: its open files cannot be read
+            return []
+        candidate_locks, candidate_rollouts = found
         locks.update(candidate_locks)
         rollouts.update(candidate_rollouts)
     live_ids = locks | {item[1] for item in rollouts}
@@ -849,8 +856,8 @@ def self_test_problem() -> str | None:
                     f"{SELF_TEST_ID}.lock")
         lock.parent.mkdir(parents=True)
         with lock.open("w"):
-            locks, _ = open_codex_ids(os.getpid())
-        if SELF_TEST_ID not in locks:
+            found = open_codex_ids(os.getpid())
+        if found is None or SELF_TEST_ID not in found[0]:
             return "the files a process holds open cannot be read"
     return None
 
