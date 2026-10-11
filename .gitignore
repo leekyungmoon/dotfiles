@@ -4,3 +4,8 @@ vim/spell
 
 # python bytecode (the installer runs with bytecode off; this is a safety net)
 __pycache__/
+
+# macOS Finder and AppleDouble metadata (copies onto non-HFS volumes, SMB shares)
+.DS_Store
+._*
+.AppleDouble/

@@ -27,12 +27,17 @@
 # Hand-over. Before the exec this shell writes its session into private files
 # (0600, O_EXCL). They go into $XDG_RUNTIME_DIR/personal-dotfiles when
 # XDG_RUNTIME_DIR is a private directory of ours (in memory, not on disk),
-# else into the state directory. It hands over:
+# else into the state directory. macOS has no XDG_RUNTIME_DIR (one a user
+# exports there is no in-memory directory, so it is not used): there they go
+# into ${TMPDIR%/}/personal-dotfiles when $TMPDIR is a private directory of
+# ours (the per-user /var/folders/.../T, on disk but outside $HOME), else
+# into the state directory. It hands over:
 #   - the kept line and the buffer stack (push-line);
 #   - its own history list (fc -W). The new zsh loads it in place of
 #     $HISTFILE, so 'r', !! and Up still mean this shell's commands. A
 #     session that keeps no history (HISTFILE unset, SAVEHIST=0) hands it over
-#     only through the in-memory place, never through the disk;
+#     only through the in-memory place, never through the disk (so never on
+#     macOS);
 #   - its PATH. The new shell keeps that order. Each entry the new setup
 #     brought goes in front of the first entry of the setup's own that
 #     follows it in the new PATH, so never in front of a venv's or a
@@ -45,7 +50,11 @@
 #   - a venv's 'deactivate' and its _OLD_VIRTUAL_* variables, the directory
 #     stack and OLDPWD.
 # The records go through an unlinked file that is read back through a
-# descriptor, never through the environment. zsh/zshenv sources this file
+# descriptor, never through the environment. The new shell takes an
+# inherited descriptor only when it is what it should be: by its
+# /proc/<pid>/fd link on Linux; on macOS, which has no /proc, by fstat (a
+# regular file of ours: the records unlinked and 0600, the copy of the hook
+# mark the same file as shell-hook). zsh/zshenv sources this file
 # first in the new process, so the hand-over is taken before the startup runs
 # any program; zsh/zshrc calls _pd_reload_startup last, which records the
 # setup's own values and puts the session back. The history file is removed
@@ -72,7 +81,8 @@
 #   ${XDG_STATE_HOME:-$HOME/.local/state}/personal-dotfiles/shell-hook
 # (created empty, 0600, in a 0700 directory when missing). installer/phases.py
 # and bin/dotfiles tell such a shell, which reloads itself, from one without
-# this hook by its /proc/<pid>/fd links; they never restart a hooked shell.
+# this hook by its /proc/<pid>/fd links (on macOS by the descriptors libproc
+# lists for it); they never restart a hooked shell.
 # Close-on-exec: the commands the shell runs do not get it, and 'exec bash'
 # drops it. Across its own reload the shell passes a copy without
 # close-on-exec (_PD_RELOAD_HOOKFD) that the new shell closes once it holds
@@ -183,10 +193,27 @@ function _pd_reload_private_parent() {
 }
 
 # $XDG_RUNTIME_DIR when it is a directory of ours that only we can use.
+# macOS has none of its own: one a user exports there is not the in-memory
+# directory this place stands for, so it never counts.
 function _pd_reload_runtime_ok() {
   emulate -L zsh
   local -A st
+  [[ $OSTYPE != darwin* ]] || return 1
   [[ ${XDG_RUNTIME_DIR:-} == /* ]] && zstat -L -H st -- $XDG_RUNTIME_DIR 2>/dev/null \
+    && (( st[uid] == UID && (st[mode] & 8#170000) == 8#040000 && !(st[mode] & 8#077) ))
+}
+
+# macOS: $TMPDIR (without its trailing slash) when it is a directory of ours
+# that only we can use, as the system makes the per-user /var/folders/.../T.
+# On disk, but outside $HOME (no backup copies a hand-over); a session that
+# keeps no history never hands that over through it.
+function _pd_reload_tmpdir_ok() {
+  emulate -L zsh
+  local -A st
+  local dir=${TMPDIR:-}
+  dir=${dir%/}
+  [[ $OSTYPE == darwin* && $dir == /?* && $dir != */ ]] \
+    && zstat -L -H st -- $dir 2>/dev/null \
     && (( st[uid] == UID && (st[mode] & 8#170000) == 8#040000 && !(st[mode] & 8#077) ))
 }
 
@@ -197,6 +224,8 @@ function _pd_reload_place() {
   _pd_reload_modules || return 1
   if _pd_reload_runtime_ok && _pd_reload_private_dir $XDG_RUNTIME_DIR/personal-dotfiles; then
     REPLY=$XDG_RUNTIME_DIR/personal-dotfiles
+  elif _pd_reload_tmpdir_ok && _pd_reload_private_dir ${TMPDIR%/}/personal-dotfiles; then
+    REPLY=${TMPDIR%/}/personal-dotfiles
   elif _pd_reload_private_dir $_pd_reload_dir; then
     REPLY=$_pd_reload_dir
   fi
@@ -231,17 +260,49 @@ function _pd_reload_fd_is() {
   emulate -L zsh
   local -a target
   [[ $1 == <10-> ]] || return 1
+  [[ -d /proc/$$/fd ]] || { _pd_reload_fd_is_ours "$1" "$2"; return }
   zstat -L -A target +link -- /proc/$$/fd/$1 2>/dev/null || return 1
   [[ ${target[1]%' (deleted)'} == *$2 ]]
 }
 
+# The same without /proc (macOS), where a descriptor has no name to read:
+# fstat tells instead, and only a regular file of ours qualifies. The
+# records ($2 ending in .handover.<pid>) are unlinked by now and 0600; the
+# copy of the hook mark is the very file $_pd_reload_hook_file names. The
+# pid in _PD_RELOAD_PID already proved that this process image is the
+# reloading shell's (zsh/zshenv).
+function _pd_reload_fd_is_ours() {
+  emulate -L zsh
+  local -A st hook
+  zstat -H st -f $1 2>/dev/null || return 1
+  (( st[uid] == UID && (st[mode] & 8#170000) == 8#100000 )) || return 1
+  case $2 in
+    (*/.handover.$$)
+      (( st[nlink] == 0 && !(st[mode] & 8#077) )) ;;
+    (*/shell-hook)
+      zstat -L -H hook -- $_pd_reload_hook_file 2>/dev/null \
+        && (( (hook[mode] & 8#170000) == 8#100000 \
+              && st[device] == hook[device] && st[inode] == hook[inode] )) ;;
+    (*)
+      return 1 ;;
+  esac
+}
+
 # --- session state ------------------------------------------------------------
 
-# The umask (REPLY), from /proc with builtins: no fork.
+# The umask (REPLY), from /proc with builtins: no fork. Without /proc
+# (macOS) the builtin tells, in a subshell: one fork, only at the end of the
+# startup and at a hand-over, never at a prompt. (It says 022 where /proc
+# says 0022; a hand-over only compares values from one source.)
 function _pd_reload_umask() {
   emulate -L zsh
   local line
   REPLY=
+  if [[ ! -r /proc/$$/status ]]; then
+    REPLY=$(builtin umask 2>/dev/null)
+    [[ $REPLY == <-> ]]
+    return
+  fi
   { while IFS= read -r line; do
       if [[ $line == Umask:* ]]; then
         REPLY=${${line#Umask:}//[[:space:]]/}
@@ -454,8 +515,9 @@ function _pd_reload_hand_over() {
     done
   fi
   # The history list, by name: zsh loads it in the new shell. A session that
-  # keeps no history hands it over only through memory. Leftovers of a
-  # process that had this pid go first (a stale .LOCK would stall fc).
+  # keeps no history hands it over only through memory (never on macOS, see
+  # _pd_reload_runtime_ok). Leftovers of a process that had this pid go
+  # first (a stale .LOCK would stall fc).
   _pd_hist=${_pd_reload_wfile:h}/.hist.$$
   if [[ -n ${HISTFILE:-} ]] && (( ${SAVEHIST:-0} > 0 )) \
       || { _pd_reload_runtime_ok && [[ $_pd_hist == $XDG_RUNTIME_DIR/* ]] }; then
@@ -636,17 +698,26 @@ function _pd_reload_disable() {
 # --- startup ------------------------------------------------------------------
 
 # Remove hand-over files of shells that died during a reload, with what
-# zsh's history writing may have left of them (.LOCK, .new).
+# zsh's history writing may have left of them (.LOCK, .new). Without /proc
+# (macOS) 'kill -0', a builtin, tells whether the pid lives: ESRCH and EPERM
+# both mean that no shell of ours has it.
 function _pd_reload_sweep() {
   emulate -L zsh
-  local dir file pid
+  local dir file pid tmp= noproc=
   local -A st
-  for dir in ${XDG_RUNTIME_DIR:+$XDG_RUNTIME_DIR/personal-dotfiles} $_pd_reload_dir; do
-    [[ $dir == $_pd_reload_dir ]] || _pd_reload_runtime_ok || continue
+  _pd_reload_tmpdir_ok && tmp=${TMPDIR%/}/personal-dotfiles   # macOS only
+  [[ -d /proc/self ]] || noproc=1
+  for dir in ${XDG_RUNTIME_DIR:+$XDG_RUNTIME_DIR/personal-dotfiles} $_pd_reload_dir $tmp; do
+    [[ $dir == $_pd_reload_dir || $dir == $tmp ]] || _pd_reload_runtime_ok || continue
     zstat -L -H st -- $dir 2>/dev/null || continue
     (( st[uid] == UID && (st[mode] & 8#170000) == 8#040000 && !(st[mode] & 8#022) )) || continue
     for file in $dir/.(hist|handover).<->(|.LOCK|.new)(N); do
       pid=${${${file:t}#.(hist|handover).}%%.*}
+      if [[ -n $noproc ]]; then
+        [[ $pid == $$ ]] || { [[ $pid == [1-9]* ]] && builtin kill -0 $pid 2>/dev/null } \
+          || zf_rm -f -- $file 2>/dev/null
+        continue
+      fi
       [[ $pid == $$ || -e /proc/$pid ]] || zf_rm -f -- $file 2>/dev/null
     done
   done
@@ -659,6 +730,7 @@ function _pd_reload_own_hist() {
   local -A st
   [[ $1 == $_pd_reload_dir/.hist.$$ ]] \
     || { _pd_reload_runtime_ok && [[ $1 == $XDG_RUNTIME_DIR/personal-dotfiles/.hist.$$ ]] } \
+    || { _pd_reload_tmpdir_ok && [[ $1 == ${TMPDIR%/}/personal-dotfiles/.hist.$$ ]] } \
     || return 1
   zstat -L -H st -- $1 2>/dev/null && (( st[uid] == UID && (st[mode] & 8#170000) == 8#100000 ))
 }

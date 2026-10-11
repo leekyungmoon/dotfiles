@@ -7,6 +7,18 @@ if [[ ! ${target_pane} =~ ^%[0-9]+$ ]]; then
   exit 2
 fi
 
+# macOS: C-v goes to the pane as it is. Claude Code and Codex read an image
+# from the system pasteboard themselves on C-v, and Cmd-V is the terminal's
+# own text paste, so there is nothing to bridge. The path below is for
+# Linux: it needs GNU timeout, /dev/pts ttys and a Wayland or X11 clipboard,
+# none of which macOS has, and it must not swallow the key there (vim,
+# zsh's quoted-insert). This part runs under macOS's /bin/bash 3.2 too; the
+# shell tells the platform without a fork ($OSTYPE).
+if [[ ${OSTYPE:-} == darwin* ]]; then
+  tmux send-keys -t "${target_pane}" C-v >/dev/null 2>&1
+  exit 0
+fi
+
 kill_grace=0.10s
 tmux_query_timeout=0.75s
 process_query_timeout=0.50s

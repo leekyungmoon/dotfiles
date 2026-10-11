@@ -19,6 +19,21 @@ PBPASTE_PROBE_TIMEOUT=${PBPASTE_PROBE_TIMEOUT:-0.75}
 PBPASTE_READ_TIMEOUT=${PBPASTE_READ_TIMEOUT:-2}
 PBPASTE_KILL_GRACE=${PBPASTE_KILL_GRACE:-0.10}
 
+# macOS's own pbpaste, which this script shadows on PATH (see bin/pbcopy).
+# PBPASTE_NATIVE names another binary; the tests point it at a fake.
+pbpaste_native=${PBPASTE_NATIVE:-/usr/bin/pbpaste}
+
+# macOS outside an SSH session: the call goes to the system pbpaste
+# unchanged, its own options too (-pboard, -Prefer). --tmux-buffer,
+# --backend and --help stay ours.
+if [[ ${OSTYPE:-} == darwin* && -z ${SSH_TTY:-} && -z ${SSH_CONNECTION:-} \
+      && -x ${pbpaste_native} ]]; then
+  case ${1:-} in
+    --tmux-buffer|--backend|--help|-h) ;;
+    *) exec "${pbpaste_native}" "$@" ;;
+  esac
+fi
+
 mode=clipboard
 print_backend=0
 
@@ -91,7 +106,7 @@ read_clipboard() {
 
 probe_macos() {
   [[ -z ${SSH_TTY:-} ]] || return 1
-  [[ -x /usr/bin/pbpaste ]]
+  [[ -x ${pbpaste_native} ]]
 }
 
 if [[ ${mode} == tmux-buffer ]]; then
@@ -100,13 +115,22 @@ if [[ ${mode} == tmux-buffer ]]; then
     exit 1
   fi
   (( print_backend )) && { printf 'tmux-buffer\n'; exit 0; }
+  # macOS has no timeout(1); the local tmux server answers this read itself.
+  if [[ ${OSTYPE:-} == darwin* ]]; then
+    exec tmux save-buffer -
+  fi
   # show-buffer reproduces the buffer bytes; save-buffer to stdout adds nothing.
   run_bounded "${PBPASTE_READ_TIMEOUT}" tmux save-buffer -
   exit $?
 fi
 
 backend=""
-if probe_wayland; then
+# macOS: the system pasteboard first, the one pbcopy writes. launchd exports
+# DISPLAY for XQuartz to every process, so an X11 probe could otherwise
+# answer with a different clipboard.
+if [[ ${OSTYPE:-} == darwin* ]] && probe_macos; then
+  backend=macos
+elif probe_wayland; then
   backend=wayland
 elif probe_x11; then
   backend=x11
@@ -125,8 +149,8 @@ if [[ -z ${backend} ]]; then
       printf '  tmux buffer explicitly, or run pbpaste on the local machine.\n'
     else
       printf '  Wanted wl-paste (WAYLAND_DISPLAY), xclip (DISPLAY) or\n'
-      printf '  /usr/bin/pbpaste, and none answered within %ss.\n' \
-        "${PBPASTE_PROBE_TIMEOUT}"
+      printf '  %s, and none answered within %ss.\n' \
+        "${pbpaste_native}" "${PBPASTE_PROBE_TIMEOUT}"
     fi
   } >&2
   exit 1
@@ -144,7 +168,7 @@ case ${backend} in
     read_clipboard "${X11_EMPTY}" xclip -selection clipboard -out
     ;;
   macos)
-    exec /usr/bin/pbpaste
+    exec "${pbpaste_native}"
     ;;
 esac
 

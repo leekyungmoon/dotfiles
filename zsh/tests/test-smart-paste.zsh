@@ -2,7 +2,26 @@
 
 emulate -LR zsh
 setopt errexit nounset pipefail
-export LC_ALL=C.UTF-8
+# A UTF-8 locale for the Hangul cases: C.UTF-8 where it exists (glibc lists
+# it as C.utf8), else en_US.UTF-8. macOS has no C.UTF-8, and zsh keeps the
+# inherited locale without a word when a name does not exist.
+() {
+    local candidate
+    local -a available
+    available=(${(f)"$(locale -a 2>/dev/null || :)"})
+    available=(${(L)available//-/})
+    for candidate in C.UTF-8 en_US.UTF-8; do
+        if (( ${available[(Ie)${(L)candidate//-/}]} )); then
+            export LC_ALL=$candidate
+            return 0
+        fi
+    done
+    export LC_ALL=C.UTF-8
+}
+if (( ${#${:-한}} != 1 )); then
+    print -u2 -r -- "FAIL: no UTF-8 locale (LC_ALL=$LC_ALL); the Hangul cases cannot run"
+    exit 1
+fi
 
 typeset -gr SMART_PASTE_TEST_DIR=${0:A:h}
 source $SMART_PASTE_TEST_DIR/../zsh.d/zsh_custom_settings.zsh
@@ -293,11 +312,19 @@ assert_repair_widget_success() {
 assert_interactive_install() {
     local source_path=$SMART_PASTE_TEST_DIR/../zsh.d/zsh_custom_settings.zsh
     local output
+    local -a pty_run
     local probe=$'emulate -LR zsh\nsetopt errexit nounset pipefail\nfunction _test_original_paste() { :; }\nzle -N bracketed-paste _test_original_paste\nsource "$SMART_PASTE_SOURCE"\nfirst_saved=${widgets[_smart_original_bracketed_paste]-}\nfirst_active=${widgets[bracketed-paste]-}\nsource "$SMART_PASTE_SOURCE"\n[[ $first_saved == user:_test_original_paste ]]\n[[ ${widgets[_smart_original_bracketed_paste]-} == $first_saved ]]\n[[ $first_active == user:_smart_bracketed_paste ]]\n[[ ${widgets[bracketed-paste]-} == $first_active ]]\nzle -A bracketed-paste _test_saved_smart_paste\nfunction _test_outer_paste() { zle _test_saved_smart_paste; }\nzle -N bracketed-paste _test_outer_paste\nouter_active=${widgets[bracketed-paste]-}\nsource "$SMART_PASTE_SOURCE"\n[[ $outer_active == user:_test_outer_paste ]]\n[[ ${widgets[bracketed-paste]-} == $outer_active ]]\n[[ ${widgets[_test_saved_smart_paste]-} == user:_smart_bracketed_paste ]]\n[[ ${widgets[_smart_original_bracketed_paste]-} == $first_saved ]]\n[[ ${widgets[smart-paste-repair]-} == user:_smart_paste_repair_buffer ]]\n[[ $(bindkey -M emacs "^[j") == \"\\\"^[j\\\" smart-paste-repair\" ]]\n[[ $(bindkey -M viins "^[j") == \"\\\"^[j\\\" smart-paste-repair\" ]]\n[[ $(bindkey -M vicmd "^[j") == \"\\\"^[j\\\" smart-paste-repair\" ]]\nprint -r -- INTERACTIVE_INSTALL_OK'
     (( ++assertions ))
 
+    # On a pseudo terminal: util-linux script(1) takes the command with -c,
+    # BSD script(1) (macOS) takes the typescript file first, then the command.
+    if [[ $(script --version 2>/dev/null || :) == *util-linux* ]]; then
+        pty_run=(script -qefc 'zsh -dfi -c "$SMART_PASTE_PROBE"' /dev/null)
+    else
+        pty_run=(script -q /dev/null zsh -dfi -c "$probe")
+    fi
     if ! output=$(SMART_PASTE_SOURCE=$source_path SMART_PASTE_PROBE=$probe \
-        script -qefc 'zsh -dfi -c "$SMART_PASTE_PROBE"' /dev/null) ||
+        "${pty_run[@]}") ||
        [[ $output != *INTERACTIVE_INSTALL_OK* ]]; then
         print -u2 -r -- 'FAIL: interactive install and repeated source'
         print -u2 -r -- "  output: ${(qqq)output}"

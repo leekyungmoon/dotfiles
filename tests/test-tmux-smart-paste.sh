@@ -1,4 +1,12 @@
 #!/usr/bin/env bash
+# Tests for bin/tmux-smart-paste with mocked tmux, ps and clipboard tools.
+#
+# The macOS cases come first and run anywhere: the script tells the platform
+# by $OSTYPE, which bash keeps from the environment. They run the script with
+# the bash that runs this file, so running it with /bin/bash 3.2 tests that
+# path under 3.2. The Linux cases need GNU timeout and do not run on macOS,
+# where that path is never taken. (Assertions end in `|| exit 1`: a failing
+# [[ ]] does not stop bash 3.2 under set -e.)
 
 set -euo pipefail
 
@@ -153,7 +161,7 @@ case ${1:-} in
     # The helper's first tmux call: what the caller (pane binding) had.
     printf 'display-message:XAUTHORITY=%s\n' "${XAUTHORITY-<unset>}" \
       >>"${MOCK_ENV_LOG}"
-    printf '/dev/pts/77|||TSP|||%s\n' \
+    printf '%s|||TSP|||%s\n' "${MOCK_PANE_TTY:-/dev/pts/77}" \
       "${MOCK_PANE_CURRENT_COMMAND:-zsh}"
     ;;
   load-buffer)
@@ -168,6 +176,10 @@ case ${1:-} in
     ;;
   send-keys)
     printf 'send-keys:%s\n' "$*" >>"${MOCK_LOG}"
+    if [[ ${MOCK_TMUX_SEND_MODE:-ok} == fail ]]; then
+      printf "can't find pane: %s\n" "${3:-}" >&2
+      exit 1
+    fi
     ;;
   delete-buffer)
     printf 'delete-buffer:%s\n' "$*" >>"${MOCK_LOG}"
@@ -212,6 +224,8 @@ run_case() {
       "${MOCK_OUTER_TIMEOUT}" "${command[@]}")
   fi
   PATH="${mock_bin}:/usr/bin:/bin" \
+    OSTYPE="${MOCK_OSTYPE}" \
+    MOCK_PANE_TTY="${MOCK_PANE_TTY}" \
     DISPLAY="${MOCK_SESSION_DISPLAY}" \
     WAYLAND_DISPLAY="${MOCK_WAYLAND_DISPLAY}" \
     XDG_RUNTIME_DIR="${MOCK_SESSION_XDG_RUNTIME_DIR}" \
@@ -246,6 +260,8 @@ run_case() {
 }
 
 reset_case() {
+  MOCK_OSTYPE=linux-gnu
+  MOCK_PANE_TTY=/dev/pts/77
   MOCK_SESSION_DISPLAY=:0
   MOCK_WAYLAND_DISPLAY=wayland-test
   MOCK_SESSION_XDG_RUNTIME_DIR=/run/user/1000
@@ -278,7 +294,7 @@ assert_buffer_cleaned() {
   buffer_name=$(sed -n \
     's/^load-buffer:load-buffer -b \([^ ]*\) -$/\1/p' \
     "${MOCK_LOG}")
-  [[ ${buffer_name} =~ ^smart-paste-77-[0-9]+$ ]]
+  [[ ${buffer_name} =~ ^smart-paste-77-[0-9]+$ ]] || return 1
   grep -Fxq \
     "delete-buffer:delete-buffer -b ${buffer_name}" \
     "${MOCK_LOG}"
@@ -293,6 +309,80 @@ MOCK_PAYLOAD_FILE=${test_root}/payload
 MOCK_ENV_LOG=${test_root}/env.log
 MOCK_WL_PID_FILE=${test_root}/wl.pid
 MOCK_XCLIP_PID_FILE=${test_root}/xclip.pid
+
+# --- macOS ----------------------------------------------------------------------
+
+# On PATH only the tmux mock and stand-ins for what the Linux path needs,
+# which log a call and fail: none of them may run on macOS.
+darwin_bin=${test_root}/darwin-bin
+mkdir -p -- "${darwin_bin}"
+ln -s -- "${BASH}" "${darwin_bin}/bash"
+cp -- "${mock_bin}/tmux" "${darwin_bin}/tmux"
+cat >"${darwin_bin}/not-on-macos" <<'EOF'
+#!/bin/sh
+printf 'not-on-macos:%s %s\n' "${0##*/}" "$*" >>"${MOCK_LOG}"
+exit 127
+EOF
+chmod +x -- "${darwin_bin}/not-on-macos"
+for tool in timeout ps wl-paste xclip; do
+  ln -s -- not-on-macos "${darwin_bin}/${tool}"
+done
+
+# run_darwin_case OSTYPE PANE: the script, under this bash, with the tmux mock
+# reporting a macOS pane tty (/dev/ttysNNN) and an AI TUI in the pane.
+run_darwin_case() {
+  : >"${MOCK_LOG}"
+  : >"${MOCK_ENV_LOG}"
+  PATH="${darwin_bin}" \
+    OSTYPE="$1" \
+    MOCK_LOG="${MOCK_LOG}" \
+    MOCK_ENV_LOG="${MOCK_ENV_LOG}" \
+    MOCK_PANE_TTY=/dev/ttys003 \
+    MOCK_PANE_CURRENT_COMMAND=codex \
+    MOCK_TMUX_SEND_MODE="${MOCK_TMUX_SEND_MODE:-ok}" \
+    "${BASH}" "${script_path}" "$2"
+}
+
+# C-v goes to the pane at once: no tty, process or clipboard query, no timeout.
+run_darwin_case darwin24 %77
+[[ $(<"${MOCK_LOG}") == 'send-keys:send-keys -t %77 C-v' ]] || exit 1
+[[ ! -s ${MOCK_ENV_LOG} ]] || exit 1
+
+# Homebrew bash names itself darwin24.0.0 or so: still macOS.
+run_darwin_case darwin24.0.0 %5
+[[ $(<"${MOCK_LOG}") == 'send-keys:send-keys -t %5 C-v' ]] || exit 1
+
+# The pane id is still checked first.
+if run_darwin_case darwin24 bad-pane; then
+  exit 1
+else
+  [[ $? -eq 2 ]] || exit 1
+fi
+[[ ! -s ${MOCK_LOG} ]] || exit 1
+
+# A pane that is gone fails the binding, as on Linux.
+if MOCK_TMUX_SEND_MODE=fail run_darwin_case darwin24 %77 2>/dev/null; then
+  exit 1
+fi
+grep -Fxq 'send-keys:send-keys -t %77 C-v' "${MOCK_LOG}"
+
+# Control: the Linux path needs timeout(1) before its first tmux call, which
+# is why macOS must never reach it.
+if run_darwin_case linux-gnu %77; then
+  exit 1
+fi
+grep -q '^not-on-macos:timeout ' "${MOCK_LOG}"
+if grep -q '^send-keys:' "${MOCK_LOG}"; then
+  exit 1
+fi
+
+if [[ ${OSTYPE} == darwin* ]]; then
+  printf 'SKIP: the Linux path (GNU timeout, /dev/pts, Wayland/X11) does not run on macOS\n' >&2
+  printf 'PASS: tmux smart paste (macOS)\n'
+  exit 0
+fi
+
+# --- Linux ----------------------------------------------------------------------
 
 reset_case
 MOCK_XCLIP_TYPES_MODE=fail
@@ -323,9 +413,9 @@ MOCK_TTY_COMMANDS=$'zsh 77 77\ncodex 77 77'
 run_case
 grep -Fxq 'send-keys:send-keys -t %77 C-v' "${MOCK_LOG}"
 [[ $(grep -Fc 'show-environment:show-environment -g' \
-  "${MOCK_LOG}") -eq 1 ]]
+  "${MOCK_LOG}") -eq 1 ]] || exit 1
 first_backend_call=$(sed -n '1p' "${MOCK_BACKEND_LOG}")
-[[ ${first_backend_call} == 'wl-paste:--list-types' ]]
+[[ ${first_backend_call} == 'wl-paste:--list-types' ]] || exit 1
 if grep -q '^xclip:' "${MOCK_BACKEND_LOG}"; then
   exit 1
 fi
@@ -354,7 +444,7 @@ grep -Fxq 'send-keys:send-keys -t %77 C-v' "${MOCK_LOG}"
 grep -Fxq 'xclip:-selection clipboard -out -target TARGETS' \
   "${MOCK_BACKEND_LOG}"
 grep -Fxq 'display-message:XAUTHORITY=<unset>' "${MOCK_ENV_LOG}"
-[[ $(grep -c '^xclip:' "${MOCK_ENV_LOG}") -eq 1 ]]
+[[ $(grep -c '^xclip:' "${MOCK_ENV_LOG}") -eq 1 ]] || exit 1
 grep -Fxq 'xclip:XAUTHORITY=/home/fixture/.Xauthority' "${MOCK_ENV_LOG}"
 
 # The X11 text payload read (second xclip call) uses the same import.
@@ -368,11 +458,11 @@ MOCK_X11_CLIPBOARD_TYPES='TARGETS text/plain;charset=utf-8'
 MOCK_X11_CLIPBOARD_TEXT='x11 text via imported auth'
 MOCK_TTY_COMMANDS='zsh 77 77'
 run_case
-[[ $(<"${MOCK_PAYLOAD_FILE}") == 'x11 text via imported auth' ]]
+[[ $(<"${MOCK_PAYLOAD_FILE}") == 'x11 text via imported auth' ]] || exit 1
 grep -Fxq 'display-message:XAUTHORITY=<unset>' "${MOCK_ENV_LOG}"
-[[ $(grep -c '^xclip:' "${MOCK_ENV_LOG}") -eq 2 ]]
+[[ $(grep -c '^xclip:' "${MOCK_ENV_LOG}") -eq 2 ]] || exit 1
 [[ $(grep -Fxc 'xclip:XAUTHORITY=/home/fixture/.Xauthority' \
-  "${MOCK_ENV_LOG}") -eq 2 ]]
+  "${MOCK_ENV_LOG}") -eq 2 ]] || exit 1
 assert_buffer_cleaned
 
 # A caller that already has XAUTHORITY keeps its own value.
@@ -420,7 +510,7 @@ MOCK_TTY_COMMANDS=$'nvim 77 77\ncodex 88 77'
 MOCK_PANE_CURRENT_COMMAND=nvim
 run_case
 grep -Fxq 'send-keys:send-keys -t %77 C-v' "${MOCK_LOG}"
-[[ ! -s ${MOCK_BACKEND_LOG} ]]
+[[ ! -s ${MOCK_BACKEND_LOG} ]] || exit 1
 
 # tmux's current-command value remains a compatibility signal when a packaged
 # AI TUI does not expose codex/claude as its process comm.
@@ -439,7 +529,7 @@ MOCK_CLIPBOARD_TYPES='text/plain;charset=utf-8'
 MOCK_CLIPBOARD_TEXT='plain text'
 MOCK_TTY_COMMANDS='zsh 77 77'
 run_case
-[[ $(<"${MOCK_PAYLOAD_FILE}") == 'plain text' ]]
+[[ $(<"${MOCK_PAYLOAD_FILE}") == 'plain text' ]] || exit 1
 grep -Eq '^paste-buffer:paste-buffer .* -p$' "${MOCK_LOG}"
 assert_buffer_cleaned
 
@@ -457,10 +547,10 @@ MOCK_CLIPBOARD_TYPES=image/png
 MOCK_TTY_COMMANDS='zsh 77 77'
 MOCK_OUTER_TIMEOUT=2s
 run_case
-[[ $(<"${MOCK_PAYLOAD_FILE}") == 'current x11 text' ]]
+[[ $(<"${MOCK_PAYLOAD_FILE}") == 'current x11 text' ]] || exit 1
 first_backend_call=$(sed -n '1p' "${MOCK_BACKEND_LOG}")
 [[ ${first_backend_call} == \
-  'xclip:-selection clipboard -out -target TARGETS' ]]
+  'xclip:-selection clipboard -out -target TARGETS' ]] || exit 1
 if grep -q '^wl-paste:' "${MOCK_BACKEND_LOG}"; then
   exit 1
 fi
@@ -486,7 +576,7 @@ MOCK_X11_CLIPBOARD_TEXT='x11 fallback text'
 MOCK_TTY_COMMANDS='zsh 77 77'
 MOCK_OUTER_TIMEOUT=2s
 run_case
-[[ $(<"${MOCK_PAYLOAD_FILE}") == 'x11 fallback text' ]]
+[[ $(<"${MOCK_PAYLOAD_FILE}") == 'x11 fallback text' ]] || exit 1
 grep -Eq '^paste-buffer:paste-buffer .* -p$' "${MOCK_LOG}"
 assert_buffer_cleaned
 
@@ -510,7 +600,7 @@ MOCK_X11_CLIPBOARD_TYPES='TARGETS image/png'
 MOCK_TTY_COMMANDS=$'zsh 77 77\ncodex 77 77'
 MOCK_OUTER_TIMEOUT=2s
 run_case
-[[ $(<"${MOCK_PAYLOAD_FILE}") == 'current wayland text' ]]
+[[ $(<"${MOCK_PAYLOAD_FILE}") == 'current wayland text' ]] || exit 1
 if grep -q '^send-keys:' "${MOCK_LOG}"; then
   exit 1
 fi
@@ -527,7 +617,7 @@ MOCK_TTY_COMMANDS=$'zsh 77 77\ncodex 77 77'
 MOCK_OUTER_TIMEOUT=2s
 run_case
 grep -Fxq 'send-keys:send-keys -t %77 C-v' "${MOCK_LOG}"
-[[ -s ${MOCK_WL_PID_FILE} ]]
+[[ -s ${MOCK_WL_PID_FILE} ]] || exit 1
 if kill -0 "$(<"${MOCK_WL_PID_FILE}")" 2>/dev/null; then
   exit 1
 fi
@@ -542,13 +632,13 @@ if run_case; then
   exit 1
 else
   status=$?
-  [[ ${status} -eq 1 ]]
+  [[ ${status} -eq 1 ]] || exit 1
 fi
 if grep -q '^paste-buffer:' "${MOCK_LOG}"; then
   exit 1
 fi
 assert_buffer_cleaned
-[[ -s ${MOCK_WL_PID_FILE} ]]
+[[ -s ${MOCK_WL_PID_FILE} ]] || exit 1
 if kill -0 "$(<"${MOCK_WL_PID_FILE}")" 2>/dev/null; then
   exit 1
 fi
@@ -564,13 +654,13 @@ if run_case; then
   exit 1
 else
   status=$?
-  [[ ${status} -eq 1 ]]
+  [[ ${status} -eq 1 ]] || exit 1
 fi
 if grep -q '^paste-buffer:' "${MOCK_LOG}"; then
   exit 1
 fi
 assert_buffer_cleaned
-[[ -s ${MOCK_XCLIP_PID_FILE} ]]
+[[ -s ${MOCK_XCLIP_PID_FILE} ]] || exit 1
 if kill -0 "$(<"${MOCK_XCLIP_PID_FILE}")" 2>/dev/null; then
   exit 1
 fi
@@ -585,15 +675,28 @@ if run_case; then
   exit 1
 else
   status=$?
-  [[ ${status} -eq 1 ]]
+  [[ ${status} -eq 1 ]] || exit 1
 fi
 grep -Eq '^paste-buffer:paste-buffer .* -p$' "${MOCK_LOG}"
 assert_buffer_cleaned
 
+# The Linux path accepts only Linux pane ttys; a macOS one (/dev/ttysNNN)
+# ends it before anything is sent (macOS takes the branch tested above).
+reset_case
+MOCK_PANE_TTY=/dev/ttys003
+if run_case; then
+  exit 1
+else
+  [[ $? -eq 1 ]] || exit 1
+fi
+if grep -q '^send-keys:' "${MOCK_LOG}"; then
+  exit 1
+fi
+
 if PATH="${mock_bin}:/usr/bin:/bin" "${script_path}" bad-pane; then
   exit 1
 else
-  [[ $? -eq 2 ]]
+  [[ $? -eq 2 ]] || exit 1
 fi
 
 printf 'PASS: tmux smart paste\n'

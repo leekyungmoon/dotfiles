@@ -401,6 +401,16 @@ alias ipynb0='ipynb --ip=0.0.0.0'
 alias jupyter='${$(which python)%/*}/jupyter'
 alias jupyter-lab='${$(which python)%/*}/jupyter-lab --no-browser'
 
+# macOS has no `python`: the alias above stands in for it, and `which python`
+# then prints "python: aliased to python3" rather than a path. There these
+# take the directory of the real binary instead (a venv's or conda's first).
+if [[ $OSTYPE == darwin* ]]; then
+    alias python-config='${${commands[python]:-$commands[python3]}:h}/python3-config'
+    alias python3-config='${${commands[python]:-$commands[python3]}:h}/python3-config'
+    alias jupyter='${${commands[python]:-$commands[python3]}:h}/jupyter'
+    alias jupyter-lab='${${commands[python]:-$commands[python3]}:h}/jupyter-lab --no-browser'
+fi
+
 # ptpython
 alias ptpython='python -m ptpython'
 alias ptipython='python -m ptpython.entry_points.run_ptipython'

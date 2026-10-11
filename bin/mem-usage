@@ -1,9 +1,11 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 
 from __future__ import division
 from __future__ import print_function
 
+import re
 import subprocess
+import sys
 
 GREEN = '\033[0;32m'
 YELLOW = '\033[0;33m'
@@ -24,18 +26,75 @@ def ascii_bar(value, max_value, color=GREEN, width=27, unit='', end='\n'):
     print('', end=end)
 
 
+# macOS has neither free(1) nor /proc/meminfo. The numbers come from sysctl
+# and vm_stat instead, in MiB like `free -m`: the total from hw.memsize;
+# "used" as Activity Monitor counts Memory Used (app memory, i.e. anonymous
+# pages that are not purgeable, plus wired and compressed pages); the swap
+# from vm.swapusage ("total = 2048.00M  used = 1024.25M  free = ...").
+_UNITS = {'': 1, 'B': 1, 'K': 1 << 10, 'M': 1 << 20, 'G': 1 << 30, 'T': 1 << 40}
+
+
+def _command(*argv):
+    out = subprocess.check_output(argv)
+    if isinstance(out, bytes):
+        out = out.decode()
+    return out
+
+
+def vm_stat_pages(text):
+    """The page size and {statistic: pages} of vm_stat's output."""
+    size = re.search(r'page size of (\d+) bytes', text)
+    pages = {}
+    for line in text.splitlines()[1:]:
+        name, sep, value = line.rpartition(':')
+        value = value.strip().rstrip('.')
+        if sep and value.isdigit():
+            pages[name.strip().strip('"')] = int(value)
+    return (int(size.group(1)) if size else 0), pages
+
+
+def swapusage_mib(text):
+    """(used, total) in MiB from the value of sysctl vm.swapusage."""
+    values = {}
+    for key, number, unit in re.findall(r'(\w+) = ([0-9.]+)([BKMGT]?)', text):
+        values[key] = float(number) * _UNITS[unit] / (1 << 20)
+    return values.get('used', 0.0), values.get('total', 0.0)
+
+
+def darwin_usage():
+    """(mem_used, mem_total, swap_used, swap_total) in MiB on macOS."""
+    mem_total = int(_command('sysctl', '-n', 'hw.memsize').strip()) / (1 << 20)
+    page_size, pages = vm_stat_pages(_command('vm_stat'))
+    if not page_size:
+        raise ValueError('vm_stat printed no page size')
+    app = pages.get('Anonymous pages', pages.get('Pages active', 0)) \
+        - pages.get('Pages purgeable', 0)
+    used_pages = max(app, 0) + pages.get('Pages wired down', 0) \
+        + pages.get('Pages occupied by compressor', 0)
+    mem_used = used_pages * page_size / (1 << 20)
+    swap_used, swap_total = swapusage_mib(_command('sysctl', '-n', 'vm.swapusage'))
+    return mem_used, mem_total, swap_used, swap_total
+
+
 def main(width=27):
-    lines = subprocess.check_output(['free', '-m'])
-    if isinstance(lines, bytes):
-        lines = lines.decode()
-    lines = lines.strip().split('\n')
-    mem, swap = lines[1], lines[2]
+    if sys.platform == 'darwin':
+        try:
+            mem_used, mem_total, swap_used, swap_total = darwin_usage()
+        except (OSError, ValueError, subprocess.CalledProcessError) as e:
+            sys.stderr.write('mem-usage: cannot read the memory statistics: %s\n' % e)
+            return 1
+    else:
+        lines = subprocess.check_output(['free', '-m'])
+        if isinstance(lines, bytes):
+            lines = lines.decode()
+        lines = lines.strip().split('\n')
+        mem, swap = lines[1], lines[2]
 
-    mem_total, mem_used, mem_free, mem_shared, mem_buffcache, mem_avail = map(int, mem.split()[1:])
-    swap_total, swap_used, swap_free = map(int, swap.split()[1:])
+        mem_total, mem_used, mem_free, mem_shared, mem_buffcache, mem_avail = map(int, mem.split()[1:])
+        swap_total, swap_used, swap_free = map(int, swap.split()[1:])
 
-    # include shared memory usage; htop also needs to do so!
-    mem_used += mem_shared
+        # include shared memory usage; htop also needs to do so!
+        mem_used += mem_shared
 
     print("Mem : ", end='')
     ascii_bar((mem_used) / 1024., mem_total / 1024.,
@@ -52,4 +111,4 @@ if __name__ == '__main__':
     parser.add_argument('--width', default=27, type=int)
     args = parser.parse_args()
 
-    main(**vars(args))
+    sys.exit(main(**vars(args)))

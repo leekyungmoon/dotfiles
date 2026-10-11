@@ -17,6 +17,25 @@ set -uo pipefail
 PBCOPY_PROBE_TIMEOUT=${PBCOPY_PROBE_TIMEOUT:-0.75}
 PBCOPY_KILL_GRACE=${PBCOPY_KILL_GRACE:-0.10}
 
+# macOS's own pbcopy, which this script shadows on PATH (~/.local/bin comes
+# first) for every caller: Neovim's clipboard provider, scripts, tmux.
+# PBCOPY_NATIVE names another binary; the tests point it at a fake so they
+# never touch the real pasteboard.
+pbcopy_native=${PBCOPY_NATIVE:-/usr/bin/pbcopy}
+
+# macOS outside an SSH session: the system pasteboard is the clipboard, so
+# the call goes to it unchanged, its own options too (-pboard, -Prefer),
+# exactly as if this script were not on PATH. Only --backend and --help stay
+# ours. Over SSH the selection below still prefers OSC52, which reaches the
+# terminal the user actually sits at.
+if [[ ${OSTYPE:-} == darwin* && -z ${SSH_TTY:-} && -z ${SSH_CONNECTION:-} \
+      && -x ${pbcopy_native} ]]; then
+  case ${1:-} in
+    --backend|--help|-h) ;;
+    *) exec "${pbcopy_native}" "$@" ;;
+  esac
+fi
+
 print_backend=0
 case ${1:-} in
   --backend) print_backend=1 ;;
@@ -67,7 +86,7 @@ probe_x11() {
 backend=osc52
 if [[ -z ${SSH_TTY:-} ]]; then
   # Keep the native macOS behavior used by Neovim's clipboard provider.
-  if [[ -x /usr/bin/pbcopy ]]; then
+  if [[ -x ${pbcopy_native} ]]; then
     backend=macos
   elif probe_wayland; then
     backend=wayland
@@ -79,7 +98,7 @@ fi
 (( print_backend )) && { printf '%s\n' "${backend}"; exit 0; }
 
 case ${backend} in
-  macos) exec /usr/bin/pbcopy ;;
+  macos) exec "${pbcopy_native}" ;;
   wayland)
     # wl-copy reads stdin, then daemonizes to serve the selection. It keeps
     # whatever stdout/stderr it inherited, so a caller reading our output

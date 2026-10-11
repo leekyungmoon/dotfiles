@@ -1,13 +1,21 @@
 #!/usr/bin/env zsh
 # zsh/zsh.d/dotfiles-reload.zsh in real interactive shells on a pseudo-terminal.
 #
-# Two tiers, both driven by the embedded python3 script, each shell with a
+# Three tiers, all driven by the embedded python3 script, each shell with a
 # temporary HOME, ZDOTDIR and XDG_{STATE,DATA,CACHE,CONFIG}_HOME:
 #
 # fixture  A small ~/.zshrc with the history options this repository ends up
 #          with (prezto's history module, zsh/zsh.d/envs.zsh) that sources
 #          only the reload module (and, for login shells, the repository's
 #          zsh/zprofile). No network.
+# noproc   The fixture tier again, against a copy of the module whose /proc
+#          paths name a directory that does not exist: the shells take the
+#          branches they take on macOS, which has no /proc (an inherited
+#          descriptor told by fstat, the umask from the builtin, 'kill -0'
+#          for the sweep). Then the macOS cases, with that copy's $OSTYPE
+#          tests answering darwin: the hand-over in $TMPDIR, never in
+#          XDG_RUNTIME_DIR. The test's own checks still read the real /proc,
+#          so this tier runs on Linux.
 # real     The repository's own zshenv, zprofile, zshrc, zpreztorc and zsh/
 #          directory (~/.zsh -> the repository's zsh/*, ~/.zshrc -> zsh/zshrc,
 #          ...) with the whole plugin stack: antidote and fasd at the commits
@@ -17,7 +25,8 @@
 #          (git clone), unless RELOAD_TEST_PLUGIN_CACHE names a directory with
 #          antidote/, fasd/ and antidote-home/ from an earlier run. Without
 #          them the tier fails, or is skipped with RELOAD_TEST_ALLOW_SKIP=1.
-#          RELOAD_TEST_TIERS="fixture" (or "real") runs one tier only.
+# RELOAD_TEST_TIERS="fixture noproc real" is the default; name fewer to run
+# fewer (RELOAD_TEST_TIERS="fixture noproc" needs no network).
 #
 # An "update" in a test writes a new generation and changes what the setup
 # defines: the new setup has an alias 'td' that the old one lacks.
@@ -36,7 +45,13 @@
 # the reload, is close-on-exec (commands and 'exec bash' do not have it);
 # a missing state directory is created 0700 with the file 0600; a symlinked,
 # group-writable or unwritable one is refused without a message; strace sees
-# no fork and no write to the state directory over prompts (fixture tier).
+# no fork and no write to the state directory over prompts (fixture tier);
+# an inherited descriptor that is no hand-over is neither read nor closed.
+# Without /proc (noproc tier) the same, and on macOS: the hand-over goes
+# into a private $TMPDIR/personal-dotfiles (a $TMPDIR open to others, a
+# symlink or none leaves it to the state directory), dead shells' leftovers
+# there are swept, XDG_RUNTIME_DIR is never used, and a session that keeps
+# no history writes none.
 #
 # The shells never see TMUX/TMUX_PANE/DBUS/XDG_RUNTIME_DIR; tmux and
 # systemctl on their PATH are fakes, and TMUX_TMPDIR is private.
@@ -58,11 +73,34 @@ repo, work = sys.argv[1], sys.argv[2]
 failures, skips, passes = [], [], []
 UID = os.getuid()
 
+if not os.path.isdir("/proc/self/fd"):
+    # The checks themselves read /proc: the descriptors, environment and fd
+    # flags of the shells under test. The module's own macOS branches (no
+    # /proc, $TMPDIR) run on Linux, in the noproc tier, and natively on macOS
+    # in zsh/tests/test-reload-platform.zsh.
+    print("SKIP: no /proc here (macOS?): this test inspects its shells through "
+          "/proc; on Linux its noproc tier covers the macOS branches, and on "
+          "macOS zsh/tests/test-reload-platform.zsh checks them natively")
+    sys.exit(0)
+
+# What the fixture shells source as the module, and where a tier keeps its
+# shells: the repository's module for the fixture tier, a copy without /proc
+# for the noproc tier (see use_module).
+REPO_MODULE = os.path.join(repo, "zsh", "zsh.d", "dotfiles-reload.zsh")
+MODULE = REPO_MODULE
+FX_PREFIX = "fx-"
+TIER = ""   # put in front of check and skip names: which tier said it
+
 
 def check(name, cond, detail=""):
+    name = TIER + name
     (passes if cond else failures).append(name if cond else f"{name}: {detail}")
     if not cond:
         print(f"FAIL {name}: {detail}", flush=True)
+
+
+def skip(message):
+    skips.append(TIER + message)
 
 
 def strip(text):
@@ -234,7 +272,8 @@ def base_env(root, home, zdotdir):
     env = {"HOME": home, "ZDOTDIR": zdotdir, "TERM": "xterm-256color", "LANG": "C.UTF-8",
            "USER": os.environ.get("USER", "user"), "SHELL": shutil.which("zsh") or "zsh",
            "PATH": fakebin(root) + ":/usr/local/bin:/usr/bin:/bin",
-           "TMUX_TMPDIR": os.path.join(root, "tmux"), "RELOAD_TEST_REPO": repo}
+           "TMUX_TMPDIR": os.path.join(root, "tmux"), "RELOAD_TEST_REPO": repo,
+           "RELOAD_TEST_MODULE": MODULE}
     os.makedirs(env["TMUX_TMPDIR"], mode=0o700, exist_ok=True)
     for name, sub in xdg.items():
         env[name] = os.path.join(root, sub)
@@ -273,7 +312,7 @@ else
   [[ -d $ZDOTDIR/added ]] && path=($ZDOTDIR/added $path)
 fi
 [[ -r $ZDOTDIR/pre-module.zsh ]] && source $ZDOTDIR/pre-module.zsh
-source $RELOAD_TEST_REPO/zsh/zsh.d/dotfiles-reload.zsh
+source $RELOAD_TEST_MODULE
 _t_precmd() { print -r -- "prompt $$ ${_pd_reload_loaded:-none}" >> $ZDOTDIR/prompts.log }
 precmd_functions+=(_t_precmd)
 [[ -r $ZDOTDIR/post-module.zsh ]] && source $ZDOTDIR/post-module.zsh
@@ -286,7 +325,7 @@ precmd_functions+=(_t_precmd)
 FIXTURE_ZSHENV_EARLY = r'''
 if [[ -n ${_PD_RELOAD_PID:-} ]]; then
   if [[ $_PD_RELOAD_PID == $$ && -o interactive ]]; then
-    _pd_reload_early=1 source $RELOAD_TEST_REPO/zsh/zsh.d/dotfiles-reload.zsh
+    _pd_reload_early=1 source $RELOAD_TEST_MODULE
   fi
   unset _PD_RELOAD_PID _PD_RELOAD_FD _PD_RELOAD_HOOKFD
 fi
@@ -296,8 +335,8 @@ fi
 class Fixture:
     def __init__(self, name, login=False, gen="g1", state_setup=None, extra_path=None,
                  strace_log=None, unset_state=False, tools=False, runtime=False,
-                 startup_call=True, early=True, files=None):
-        self.root = os.path.join(work, "fx-" + name)
+                 startup_call=True, early=True, files=None, tmpdir=None):
+        self.root = os.path.join(work, FX_PREFIX + name)
         self.home = os.path.join(self.root, "home")
         self.zdot = os.path.join(self.root, "zdot")
         os.makedirs(self.home)
@@ -310,6 +349,13 @@ class Fixture:
             self.runtime = os.path.join(self.root, "run")
             os.makedirs(self.runtime, mode=0o700)
             self.env["XDG_RUNTIME_DIR"] = self.runtime
+        # $TMPDIR as macOS sets it: a directory with that mode, named with a
+        # trailing slash. (A state_setup may still change self.env.)
+        self.tmp = os.path.join(self.root, "T")
+        if tmpdir is not None:
+            os.makedirs(self.tmp)
+            os.chmod(self.tmp, tmpdir)
+            self.env["TMPDIR"] = self.tmp + "/"
         if not startup_call:
             open(os.path.join(self.zdot, "no-startup-call"), "w").close()
         for fname, body in (files or {}).items():  # hook points of FIXTURE_ZSHRC
@@ -385,6 +431,21 @@ def case(name):
 CASES = []
 
 
+@case("fixture: the shells run the module under test")
+def _():
+    # The noproc tier is only worth something when its shells really have the
+    # copy without /proc, and the fixture tier when they have the real one.
+    fx = Fixture("module")
+    sh = fx.sh
+    since = len(sh.buf)
+    sh.run("[[ ${functions[_pd_reload_fd_is]} == *nonexistent-proc* ]] "
+           "&& print -r -- NOPROC-${:-YES} || print -r -- NOPROC-${:-NO}")
+    want = "NOPROC-NO" if MODULE == REPO_MODULE else "NOPROC-YES"
+    check("module: the module under test is loaded", want in strip(sh.text(since)),
+          tail(strip(sh.text(since))))
+    fx.close()
+
+
 @case("fixture: unchanged generation never reloads")
 def _():
     fx = Fixture("unchanged")
@@ -401,8 +462,7 @@ def _():
 def _():
     fx = Fixture("resource")
     sh = fx.sh
-    sh.run("source $RELOAD_TEST_REPO/zsh/zsh.d/dotfiles-reload.zsh; "
-           "source $RELOAD_TEST_REPO/zsh/zsh.d/dotfiles-reload.zsh")
+    sh.run("source $RELOAD_TEST_MODULE; source $RELOAD_TEST_MODULE")
     check("resource: one hook fd", len(hook_links(sh.pid)) == 1, hook_links(sh.pid))
     check("resource: hooks not doubled",
           sh.loaded() == "g1" and len(sh.starts()) == 1, sh.starts())
@@ -1014,9 +1074,9 @@ def _():
 @case("fixture: a session that keeps no history never writes it to disk")
 def _():
     if not shutil.which("strace"):
-        skips.append("private history: strace not installed")
+        skip("private history: strace not installed")
         return
-    log = os.path.join(work, "strace-private.log")
+    log = os.path.join(work, FX_PREFIX + "strace-private.log")
     fx = Fixture("private-disk", strace_log=log)
     sh = fx.sh
     sh.run("unset HISTFILE")
@@ -1270,6 +1330,53 @@ def _():
     fx.close()
 
 
+@case("fixture: an inherited descriptor that is no hand-over is neither read nor closed")
+def _():
+    # Any process can export _PD_RELOAD_* with its own pid and exec zsh. The
+    # descriptors it names count only when they are what a reloading shell
+    # passes: records it unlinked, a copy of the hook mark. Records that still
+    # have their name, another file in the hook mark's place, pipes and an
+    # unlinked FIFO (reading it would block the shell) are not, so nothing of
+    # them is read, run or closed (without /proc, fstat tells: nlink, file
+    # type, dev/ino).
+    fx = Fixture("forged")
+    sh = fx.sh
+    forged, other = os.path.join(fx.root, "forged"), os.path.join(fx.root, "other")
+    fifo = os.path.join(fx.root, "fifo")
+    for path in (forged, other):
+        with open(path, "w") as handle:
+            handle.write("'v' '1' 'line' 'print -r -- FORGED-RAN'")
+        os.chmod(path, 0o600)
+    os.mkfifo(fifo, 0o600)
+    for kind, opens, expect in (
+            ("files", f"{{rec}}<{forged} {{hook}}<{other}", (forged, other)),
+            ("pipes", "{rec}< <(print -r -- x) {hook}< <(print -r -- y)", ("pipe:", "pipe:")),
+            ("fifo", f"{{rec}}<>{fifo} {{hook}}<>{fifo}; rm -f -- {fifo}", (fifo, fifo))):
+        starts, prompts = len(sh.starts()), len(sh.prompts())
+        since = len(sh.buf)
+        sh.send(f"exec {opens}; print -r -- $rec $hook >| $ZDOTDIR/forged.fds; "
+                "export _PD_RELOAD_PID=$$ _PD_RELOAD_FD=$rec _PD_RELOAD_HOOKFD=$hook; "
+                "exec zsh -i\r")
+        sh.wait(lambda: len(sh.starts()) == starts + 1 and len(sh.prompts()) > prompts,
+                f"forged {kind}: the new zsh")
+        sh.pump(0.5)
+        with open(os.path.join(fx.zdot, "forged.fds")) as handle:
+            fds = [int(n) for n in handle.read().split()]
+        links = dict(_fd_links(sh.pid))
+        out = strip(sh.text(since))
+        check(f"forged {kind}: nothing of it ran", "FORGED-RAN" not in out, tail(out))
+        check(f"forged {kind}: neither descriptor was closed",
+              all(links.get(fd, "").startswith(want) for fd, want in zip(fds, expect)),
+              (fds, links))
+        check(f"forged {kind}: the new zsh holds one hook mark, its own",
+              len(hook_links(sh.pid)) == 1, hook_links(sh.pid))
+        since = len(sh.buf)
+        sh.run("print -r -- LEAK-${#${(M)${(f)\"$(env)\"}:#_PD_RELOAD*}}")
+        check(f"forged {kind}: no _PD_RELOAD_* in the environment",
+              "LEAK-0" in strip(sh.text(since)), strip(sh.text(since))[-200:])
+    fx.close()
+
+
 @case("fixture: the state directory is created, or refused safely")
 def _():
     fx = Fixture("statedir", gen=None, unset_state=True)
@@ -1344,9 +1451,9 @@ def _():
                 if not os.path.islink(p):
                     os.chmod(p, 0o700)
         fx.close()
-    skips.append("statedir: a directory owned by another user (needs root or user "
-                 "namespaces, unavailable unprivileged here); the uid check is the "
-                 "same zstat test as for the symlink/mode cases")
+    skip("statedir: a directory owned by another user (needs root or user "
+         "namespaces, unavailable unprivileged here); the uid check is the "
+         "same zstat test as for the symlink/mode cases")
 
     # A refused state directory, but a private XDG_RUNTIME_DIR: the hand-over
     # goes there (memory, never the disk) and the shell reloads.
@@ -1386,9 +1493,9 @@ def _():
 @case("fixture: no fork and no write to the state directory over prompts (strace)")
 def _():
     if not shutil.which("strace"):
-        skips.append("strace: not installed")
+        skip("strace: not installed")
         return
-    log = os.path.join(work, "strace.log")
+    log = os.path.join(work, FX_PREFIX + "strace.log")
     fx = Fixture("strace", strace_log=log)
     sh = fx.sh
     sh.run("")
@@ -1408,6 +1515,175 @@ def _():
     check("strace: traced the prompts", len(new) > 0 and reads, len(new))
     check("strace: no fork or exec", forks == [], forks[:5])
     check("strace: no write in the state directory", writes == [], writes[:5])
+    fx.close()
+
+
+# ---------------------------------------------------------------- noproc tier
+
+def noproc_module(darwin=False):
+    """A copy of the module as macOS has it: every /proc path names a
+    directory that does not exist, so no /proc branch can run. With darwin,
+    its $OSTYPE tests answer darwin as well."""
+    with open(REPO_MODULE, encoding="utf-8") as handle:
+        text = handle.read()
+    text = text.replace("/proc/", "/nonexistent-proc/")
+    if darwin:
+        text = text.replace("$OSTYPE", "darwin24.0")
+    code = [l for l in text.splitlines() if not l.lstrip().startswith("#")]
+    left = [l for l in code if "/proc" in l.replace("/nonexistent-proc/", "")
+            or (darwin and "OSTYPE" in l)]
+    if left or os.path.exists("/nonexistent-proc"):
+        raise RuntimeError(f"cannot take /proc out of the module: {left[:3]}")
+    folder = os.path.join(work, "module-darwin" if darwin else "module-noproc")
+    os.makedirs(folder, exist_ok=True)
+    path = os.path.join(folder, "dotfiles-reload.zsh")
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write(text)
+    return path
+
+
+def use_module(path, prefix, tier):
+    global MODULE, FX_PREFIX, TIER
+    MODULE, FX_PREFIX, TIER = path, prefix, tier
+
+
+def _created(log, marker):
+    """The files with marker in their path that the strace log shows
+    created (openat with O_CREAT)."""
+    with open(log) as handle:
+        lines = handle.read().splitlines()
+    out = []
+    for line in lines:
+        found = re.search(r'openat\([^"]*"([^"]*)"', line)
+        if found and "O_CREAT" in line and marker in found.group(1):
+            out.append(found.group(1))
+    return out
+
+
+def _strace_log(name):
+    return os.path.join(work, FX_PREFIX + name) if shutil.which("strace") else None
+
+
+MAC_CASES = []
+
+
+def mac(name):
+    def wrap(fn):
+        MAC_CASES.append((name, fn))
+        return fn
+    return wrap
+
+
+@mac("macos: the hand-over goes through $TMPDIR/personal-dotfiles")
+def _():
+    log = _strace_log("strace-tmpdir.log")
+    fx = Fixture("tmpdir", tmpdir=0o700, strace_log=log)
+    sh = fx.sh
+    sh.run("print -r -- EARLIER-${:-CMD}")
+    fx.update("g2")
+    since = len(sh.buf)
+    sh.send("td\r")
+    sh.wait_text(r"TD-NEW-\d+-g2", since)
+    sh.wait(lambda: sh.loaded() == "g2", "macos tmpdir: new prompt")
+    sh.pump(0.3)
+    out = strip(sh.text(since))
+    check("macos tmpdir: td ran once, in the new shell",
+          out.count("TD-NEW-") == 1 and f"TD-NEW-{sh.pid}-g2" in out
+          and len(sh.starts()) == 2, (tail(out), sh.starts()))
+    place = os.path.join(fx.tmp, "personal-dotfiles")
+    mode = os.lstat(place).st_mode if os.path.lexists(place) else 0
+    check("macos tmpdir: $TMPDIR/personal-dotfiles, made 0700, empty again",
+          stat.S_ISDIR(mode) and stat.S_IMODE(mode) == 0o700 and os.listdir(place) == [],
+          (oct(mode), os.listdir(place) if stat.S_ISDIR(mode) else None))
+    check("macos tmpdir: nothing in the state directory", _left(fx) == [], _left(fx))
+    check("macos tmpdir: one hook fd after the reload", len(hook_links(sh.pid)) == 1,
+          hook_links(sh.pid))
+    if log:
+        made = _created(log, "/.handover.") + _created(log, "/.hist.")
+        check("macos tmpdir: the records and the history list were made there only",
+              any("/.handover." in p for p in made) and any("/.hist." in p for p in made)
+              and all(p.startswith(place + "/") for p in made), made)
+    else:
+        skip("macos tmpdir: strace not installed (where the files were made)")
+    fx.close()
+
+
+@mac("macos: XDG_RUNTIME_DIR is never used; a session that keeps no history writes none")
+def _():
+    log = _strace_log("strace-private.log")
+    fx = Fixture("private", tmpdir=0o700, runtime=True, strace_log=log)
+    sh = fx.sh
+    sh.run("unset HISTFILE")
+    sh.run("print -r -- PRIVATE-${:-CMD}")
+    fx.update("g2")
+    since = len(sh.buf)
+    sh.send("print -r -- AFTER-$_pd_reload_loaded:${+HISTFILE}\r")
+    sh.wait_text(r"AFTER-g2:0", since)
+    sh.pump(0.3)
+    check("macos private: reloaded, HISTFILE still unset", len(sh.starts()) == 2, sh.starts())
+    check("macos private: nothing in XDG_RUNTIME_DIR", os.listdir(fx.runtime) == [],
+          os.listdir(fx.runtime))
+    check("macos private: the records went through $TMPDIR",
+          os.path.isdir(os.path.join(fx.tmp, "personal-dotfiles")), os.listdir(fx.tmp))
+    if log:
+        made = _created(log, "/.hist.")
+        check("macos private: no history file made anywhere", made == [], made)
+    else:
+        skip("macos private: strace not installed (no history file made)")
+    fx.close()
+
+
+@mac("macos: a $TMPDIR open to others, a symlink or none leaves it to the state directory")
+def _():
+    def symlinked(fx):
+        real = os.path.join(fx.root, "T-real")
+        os.makedirs(real, mode=0o700)
+        os.symlink(real, fx.tmp)
+        fx.env["TMPDIR"] = fx.tmp + "/"
+        write_gen(fx.state, "g1")
+
+    for kind, kwargs in (("open", {"tmpdir": 0o755}), ("symlinked", {"state_setup": symlinked}),
+                         ("unset", {})):
+        log = _strace_log(f"strace-refused-{kind}.log")
+        fx = Fixture("refused-" + kind, strace_log=log, **kwargs)
+        sh = fx.sh
+        fx.update("g2")
+        since = len(sh.buf)
+        sh.send("td\r")
+        sh.wait_text(r"TD-NEW-\d+-g2", since)
+        sh.wait(lambda: sh.loaded() == "g2", f"macos {kind} TMPDIR: new prompt")
+        check(f"macos {kind} TMPDIR: still reloads", len(sh.starts()) == 2, sh.starts())
+        place = os.path.join(fx.tmp, "personal-dotfiles")
+        check(f"macos {kind} TMPDIR: nothing made there", not os.path.lexists(place), place)
+        check(f"macos {kind} TMPDIR: nothing left in the state directory", _left(fx) == [],
+              _left(fx))
+        if log:
+            made = _created(log, "/.handover.")
+            folder = os.path.join(fx.state, "personal-dotfiles") + "/"
+            check(f"macos {kind} TMPDIR: the records went through the state directory",
+                  made and all(p.startswith(folder) for p in made), made)
+        fx.close()
+
+
+@mac("macos: hand-over leftovers of dead shells in $TMPDIR are swept")
+def _():
+    child = os.fork()
+    if child == 0:
+        os._exit(0)
+    os.waitpid(child, 0)   # a pid that is gone
+    live = os.getpid()
+
+    def leftovers(fx):
+        write_gen(fx.state, "g1")
+        place = os.path.join(fx.tmp, "personal-dotfiles")
+        os.makedirs(place, mode=0o700)
+        for name in (f".hist.{child}", f".hist.{child}.LOCK", f".hist.{child}.new",
+                     f".handover.{child}", ".handover.0", f".hist.{live}", "keep.txt"):
+            open(os.path.join(place, name), "w").close()
+    fx = Fixture("sweep", tmpdir=0o700, state_setup=leftovers)
+    names = sorted(os.listdir(os.path.join(fx.tmp, "personal-dotfiles")))
+    check("macos sweep: a dead shell's files go, a live one's and others stay",
+          names == sorted([f".hist.{live}", "keep.txt"]), names)
     fx.close()
 
 
@@ -1939,6 +2215,7 @@ def _comm(pid):
 def run(cases):
     only = os.environ.get("RELOAD_TEST_ONLY")  # a regex on the case names
     for name, fn in cases:
+        name = TIER + name   # "noproc fixture: ..." in the noproc tier
         if only and not re.search(only, name):
             continue
         print(f"-- {name}", flush=True)
@@ -1949,11 +2226,24 @@ def run(cases):
             print(f"FAIL {name}: {type(exc).__name__}: {str(exc)[:1500]}", flush=True)
 
 
-tiers = os.environ.get("RELOAD_TEST_TIERS", "fixture real").split()
+tiers = os.environ.get("RELOAD_TEST_TIERS", "fixture noproc real").split()
 if "fixture" in tiers:
     run(CASES)
 else:
     skips.append("fixture tier: not selected (RELOAD_TEST_TIERS)")
+if "noproc" in tiers:
+    try:
+        modules = noproc_module(), noproc_module(darwin=True)
+    except (OSError, RuntimeError) as exc:
+        failures.append(f"noproc tier: {type(exc).__name__}: {exc}")
+    else:
+        use_module(modules[0], "np-", "noproc ")
+        run(CASES)
+        use_module(modules[1], "mac-", "noproc ")
+        run(MAC_CASES)
+        use_module(REPO_MODULE, "fx-", "")
+else:
+    skips.append("noproc tier: not selected (RELOAD_TEST_TIERS)")
 if "real" not in tiers:
     skips.append("real tier: not selected (RELOAD_TEST_TIERS)")
 else:

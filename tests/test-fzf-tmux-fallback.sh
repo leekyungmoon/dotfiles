@@ -14,7 +14,8 @@
 #     on a pseudo terminal, open fzf and act on the selection.
 #
 # Usage: TMUX_BINARIES="/path/to/tmux-3.2a /usr/bin/tmux" tests/test-fzf-tmux-fallback.sh
-# (default: /usr/bin/tmux). FZF_BIN selects fzf (default: fzf on $PATH).
+# (default: tmux on $PATH, e.g. Homebrew's on macOS). FZF_BIN selects fzf
+# (default: fzf on $PATH). Runs under bash 3.2 and with BSD script(1) too.
 #
 # Isolation, all load-bearing: $TMUX/$TMUX_PANE are unset first (an inherited
 # $TMUX silently targets the caller's server); every harness call passes -S
@@ -66,7 +67,17 @@ for tool in zsh script; do
     exit 0
   fi
 done
-read -r -a tmux_binaries <<<"${TMUX_BINARIES:-/usr/bin/tmux}"
+read -r -a tmux_binaries <<<"${TMUX_BINARIES:-$(command -v tmux || echo /usr/bin/tmux)}"
+
+# The real client runs on a pseudo terminal through script(1): util-linux's
+# takes the command with -c, BSD's (macOS) takes the typescript file first and
+# the command after it.
+script_bin=$(command -v script)
+if "${script_bin}" --version 2>/dev/null | grep -q util-linux; then
+  script_on_pty() { "${script_bin}" -qfec "$2" "$1"; }
+else
+  script_on_pty() { "${script_bin}" -q -F "$1" sh -c "$2"; }
+fi
 
 workdir=$(mktemp -d)
 # Sockets get their own short directory: unix socket paths are limited to
@@ -223,8 +234,9 @@ EOF
   # logged from here on must not contain errors (the control above logs one).
   t new-session -d -s other -x 160 -y 40 "cat"
   mkfifo "${run}/keys"
-  script -qfec "stty rows 40 cols 160; exec ${tmux_bin} -S ${socket} attach -t main" \
-    "${run}/typescript" <"${run}/keys" >/dev/null 2>&1 &
+  script_on_pty "${run}/typescript" \
+    "stty rows 40 cols 160; exec ${tmux_bin} -S ${socket} attach -t main" \
+    <"${run}/keys" >/dev/null 2>&1 &
   client_pid=$!
   exec 7>"${run}/keys"
   client_attached() { [[ -n $(t list-clients -F '#{client_tty}' 2>/dev/null) ]]; }
@@ -320,7 +332,7 @@ ok
 if ((${#tested[@]} == 0)); then
   fail "no tmux binary was tested"
 fi
-printf 'tested tmux: %s; fzf: %s\n' "${tested[*]}" "$("${fzf_bin}" --version)"
+printf 'tested tmux: %s; fzf: %s\n' "${tested[*]-}" "$("${fzf_bin}" --version)"
 if ((failures)); then
   printf '%d of %d checks failed\n' "${failures}" "${checks}" >&2
   exit 1

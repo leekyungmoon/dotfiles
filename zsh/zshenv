@@ -74,6 +74,23 @@ fi
 # see: https://gist.github.com/Linerre/f11ad4a6a934dcf01ee8415c9457e7b2
 unsetopt GLOBAL_RCS
 
+# macOS Terminal.app: the /etc/zshrc that ~/.zshrc sources loads
+# /etc/zshrc_Apple_Terminal, whose "shell sessions" keep a history per window
+# under ~/.zsh_sessions and save it from a zshexit hook. That works against
+# the one ~/.zsh_history (zsh.d/envs.zsh) and against the history a shell
+# hands over when it reloads itself (zsh.d/dotfiles-reload.zsh). Apple's
+# documented switch; the window's working directory (OSC 7) still works.
+if [[ "$OSTYPE" == darwin* ]]; then
+  export SHELL_SESSIONS_DISABLE=1
+fi
+
+# ptpython reads its config from ~/Library/Application Support/ptpython on
+# macOS (the platform default); point it at the managed XDG location instead,
+# which is where the installer links python/ptpython.config.py.
+if [[ "$OSTYPE" == darwin* && -z "$PTPYTHON_CONFIG_HOME" ]]; then
+  export PTPYTHON_CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}/ptpython"
+fi
+
 #
 # Paths ($PATH, $path)
 #
@@ -117,6 +134,12 @@ if [[ $(uname) == "Darwin" ]]; then
   if [[ $(uname -m) == "arm64" ]] && [[ -d "/opt/homebrew" ]]; then
     # Default homebrew installation for arm64
     export HOMEBREW="/opt/homebrew"
+    # What `brew shellenv` exports (this file stands in for it). Homebrew's
+    # installer asks to append `eval "$(brew shellenv)"` to ~/.zprofile:
+    # that file is this checkout's zsh/zprofile, and shellenv would also put
+    # Homebrew's bin in front of ~/.local/bin and the pinned tools (below).
+    export HOMEBREW_PREFIX="$HOMEBREW" HOMEBREW_CELLAR="$HOMEBREW/Cellar"
+    export HOMEBREW_REPOSITORY="$HOMEBREW"
   elif [[ -d "$HOME/.homebrew" ]]; then
     # Allow local installation for Homebrew (without sudo)
     export HOMEBREW="$HOME/.homebrew"
@@ -124,6 +147,14 @@ if [[ $(uname) == "Darwin" ]]; then
 
   if [[ -n "$HOMEBREW" ]]; then
     prepend_path "$HOMEBREW/bin"
+    # sbin too, right behind bin, where brew shellenv puts it (brew doctor
+    # asks for it); also when an inherited $PATH has bin already.
+    () {
+      local sbin="$HOMEBREW/sbin"
+      [[ -d "$sbin" ]] && (( ! ${path[(I)$sbin]} )) || return 0
+      local -i i=${path[(i)$HOMEBREW/bin]}
+      path=( ${path[1,i]} "$sbin" ${path[i+1,-1]} )
+    }
     # Homebrew ruby is keg-only, no links at /opt/homebrew/bin.
     # Note that we need to pin an exact version of ruby
     prepend_path "$HOMEBREW/opt/ruby@3.0/bin"
@@ -282,7 +313,14 @@ export PYTHONBREAKPOINT='pudb.set_trace'
 
 if [[ "$(uname)" == "Darwin" ]]; then
     # Mac OS X: use python shipped by Homebrew for virtualenv.
-    export VIRTUALENVWRAPPER_PYTHON='/usr/local/bin/python'
+    if [[ -x /usr/local/bin/python ]]; then
+        export VIRTUALENVWRAPPER_PYTHON='/usr/local/bin/python'
+    else
+        # Current Homebrew ships only python3, and Apple silicon's lives in
+        # /opt/homebrew: the python3 that $PATH finds (Homebrew's ahead of
+        # the system one).
+        export VIRTUALENVWRAPPER_PYTHON="${commands[python3]:-/usr/bin/python3}"
+    fi
 else
     # use default system python for virtualenv.
     export VIRTUALENVWRAPPER_PYTHON='/usr/bin/python'
