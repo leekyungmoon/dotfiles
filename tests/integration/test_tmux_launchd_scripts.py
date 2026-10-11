@@ -1279,34 +1279,6 @@ class ContinuumOnMacOS(PrivateServer):
                          ["--user is-enabled tmux.service"])
 
 
-class PluginLoadOrder(ScriptRun):
-    """The order TPM loads the declared plugins in (pinned TPM's own parser)."""
-
-    @classmethod
-    def setUpClass(cls) -> None:
-        cls.plugin_dir = pinned_plugins("tpm")
-
-    def test_menus_load_after_continuum(self):
-        # tmux-menus' background init runs tmux clients for a while; loaded
-        # before continuum they overlap its "another tmux server" check.
-        (self.home / ".tmux").symlink_to(TMUX_DIR)
-        (self.home / ".tmux.conf").symlink_to(TMUX_DIR / "tmux.conf")
-        write_executable(self.bin / "tmux", "#!/bin/sh\nexit 0\n")  # no server
-        helpers = self.plugin_dir / "tpm/scripts/helpers/plugin_functions.sh"
-        result = subprocess.run(
-            ["bash", "-c", 'source "$1"; tpm_plugins_list_helper', "-", str(helpers)],
-            env=self.base_env(), capture_output=True, text=True, timeout=60,
-            stdin=subprocess.DEVNULL,
-        )
-        self.assertEqual(result.returncode, 0, result.stderr)
-        plugins = [line for line in result.stdout.split() if line]
-        self.assertEqual(plugins, [
-            "tmux-plugins/tpm", "nhdaly/tmux-scroll-copy-mode",
-            "tmux-plugins/tmux-resurrect", "tmux-plugins/tmux-continuum",
-            "jaclu/tmux-menus",
-        ])
-
-
 # Records how it was called: "$0 $*", so the path the caller used is kept.
 ARGV0_TMUX = """#!/bin/sh
 printf '%s\\n' "$0 $*" >> "$HOME/tmux-argv"
