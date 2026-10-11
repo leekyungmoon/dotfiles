@@ -95,7 +95,7 @@ NOT_LOADED = (3, 113)        # bootout or print: no such service
 NO_GUI_DOMAIN = (112, 125)   # no GUI login session for this user here
 ALREADY_LOADED = (5, 17, 37)
 DISABLED = 119
-IN_PROGRESS = 36
+IN_PROGRESS = 36             # bootout: a run was still going; gone once it stops
 # `launchctl error <code>` for the codes these commands return in practice.
 ERROR_TEXT = {
     1: "Operation not permitted",
@@ -561,6 +561,19 @@ def _describe(info: ServiceInfo, details: dict) -> None:
         details["last_signal"] = info.last_signal
 
 
+def _wait_gone(runner, uid: int, label: str) -> str | None:
+    """After a bootout, wait (up to BOOTOUT_WAIT) until launchd has let the
+    service go; the problem, or None once print no longer finds it."""
+
+    deadline = _monotonic() + BOOTOUT_WAIT
+    while service_info(runner, uid, label) is not None:
+        if _monotonic() >= deadline:
+            return (f"{label} was still loaded {BOOTOUT_WAIT:g} s after launchctl "
+                    f"bootout; run: {bootout_command(label)}")
+        _sleep(POLL_INTERVAL)
+    return None
+
+
 def _bootout_and_wait(runner, uid: int, agent: Agent) -> str | None:
     """Unload the agent and wait until launchd has let it go; the problem,
     or None."""
@@ -571,13 +584,7 @@ def _bootout_and_wait(runner, uid: int, agent: Agent) -> str | None:
         return (f"launchctl bootout {service_target(uid, agent.label)} failed "
                 f"({error_text(code)}){': ' + _tail(done.stderr) if _tail(done.stderr) else ''}; "
                 f"run: {bootout_command(agent.label)}")
-    deadline = _monotonic() + BOOTOUT_WAIT
-    while service_info(runner, uid, agent.label) is not None:
-        if _monotonic() >= deadline:
-            return (f"{agent.label} was still loaded {BOOTOUT_WAIT:g} s after launchctl "
-                    f"bootout; run: {bootout_command(agent.label)}")
-        _sleep(POLL_INTERVAL)
-    return None
+    return _wait_gone(runner, uid, agent.label)
 
 
 def _bootstrap_failure(code: int, stderr, plist: Path) -> str:
@@ -600,9 +607,13 @@ def _await_tmux_agent(runner, uid: int, agent: Agent, env: dict,
 
     tmux-launchd-start: 0 restored, nothing to restore or a server was
     already running; 3 a snapshot exists but was not restored (the server
-    runs; the log says why and how to recover); 1 tmux missing; anything
-    else is new-session's failure. It may keep running for minutes while a
-    restore runs; that is not a failure.
+    runs; the log says why and how to recover); 1 tmux missing, HOME
+    unusable or `tmux new-session` failed (tmux exits 1 on every error);
+    anything else is new-session's own status: 126/127 when tmux could not
+    be executed, 128 + N when signal N killed it. launchd itself records 78
+    (EX_CONFIG) when it could not start the script at all (its log
+    directory or the script missing). It may keep running for minutes
+    while a restore runs; that is not a failure.
     """
 
     log = details["log"]
@@ -629,7 +640,8 @@ def _await_tmux_agent(runner, uid: int, agent: Agent, env: dict,
             return FAIL, [f"the tmux LaunchAgent was stopped ({info.last_signal}); see {log}"]
         if code == 1:
             return FAIL, [f"the tmux LaunchAgent could not start tmux (exit status 1: tmux "
-                          f"not found, or HOME unusable); see {log}"]
+                          f"not found, HOME unusable, or `tmux new-session` failed); "
+                          f"see {log}"]
         return FAIL, [f"the tmux LaunchAgent failed (exit status {code}); see {log}"]
     # Still running: restoring, or slow. Its server answering is the start.
     tmux = runner.which("tmux", path=env.get("PATH"))
@@ -746,7 +758,13 @@ def _register(target, runner, agent: Agent, changed: bool, env, details: dict
 def unload(target, runner, labels, *, outcomes: dict | None = None) -> list[str]:
     """``launchctl bootout`` each label; the problems (an empty list when
     all are gone). ``outcomes`` gets label -> unloaded | not-loaded |
-    no-gui-domain | failed."""
+    no-gui-domain | failed.
+
+    A bootout that answers 36 (a run was still going, such as an autosave
+    in the middle of its save) is waited out as a reload's is: unloaded
+    once launchd has let the job go, failed if it is still loaded after
+    BOOTOUT_WAIT.
+    """
 
     uid = target.uid
     problems: list[str] = []
@@ -759,7 +777,12 @@ def unload(target, runner, labels, *, outcomes: dict | None = None) -> list[str]
             outcome = "failed"
         else:
             code = done.returncode
-            if code == 0:
+            if code == IN_PROGRESS:
+                problem = _wait_gone(runner, uid, label)
+                if problem:
+                    problems.append(problem)
+                outcome = "failed" if problem else "unloaded"
+            elif code == 0:
                 outcome = "unloaded"
             elif code in NOT_LOADED:
                 outcome = "not-loaded"

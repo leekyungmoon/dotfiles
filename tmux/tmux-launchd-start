@@ -40,7 +40,9 @@
 # script when continuum skipped it), when there was nothing to restore (no
 # snapshot, or the ~/tmux_no_auto_restore halt file) and when a server was
 # already running; 3 when a snapshot exists but was not restored; 1 when
-# tmux is missing; otherwise the status of the failed new-session.
+# tmux is missing, HOME is unusable or `tmux new-session` failed (tmux exits
+# 1 on every error); any other status is new-session's own: 126 or 127 when
+# tmux cannot be executed, 128 + N when signal N killed it.
 #
 # Its output goes to the agent's log, $PERSONAL_DOTFILES_LAUNCHD_LOG, which
 # this script keeps near 1 MiB.  Test seams (the agent never sets them):

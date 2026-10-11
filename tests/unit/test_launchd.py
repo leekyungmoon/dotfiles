@@ -53,6 +53,9 @@ class LaunchdSim:
     ``codes[(verb, label)]`` forces return codes (a list, used in order);
     ``linger[label]`` keeps a booted-out service listed for that many more
     prints (launchd finishes a bootout asynchronously; -1: forever).
+    ``busy[label]``: a run is still going, so a bootout answers 36
+    (Operation now in progress) and the service stays listed for that many
+    more prints while launchd stops the run (-1: forever).
     """
 
     def __init__(self, uid: int, *, gui: bool = True, legacy_disabled: bool = False):
@@ -64,6 +67,7 @@ class LaunchdSim:
         self.codes: dict[tuple, list[int]] = {}
         self.linger: dict[str, int] = {}
         self.lingering: dict[str, dict] = {}
+        self.busy: dict[str, int] = {}
         self.exit_codes: dict[str, int | None] = {}
         # label -> exit code reached after that many prints while running
         self.finish_after: dict[str, tuple[int, int]] = {}
@@ -113,6 +117,11 @@ class LaunchdSim:
             if label not in self.loaded:
                 return completed(argv, 3, err="Boot-out failed: 3: No such process\n")
             fields = self.loaded.pop(label)
+            if label in self.busy:
+                self.linger[label] = self.busy.pop(label)
+                self.lingering[label] = fields
+                return completed(argv, 36,
+                                 err="Boot-out failed: 36: Operation now in progress\n")
             if self.linger.get(label):
                 self.lingering[label] = fields
             return completed(argv, 0)
@@ -667,6 +676,20 @@ class RegisterTests(TempHome):
                                  "print", "print", "bootstrap", "print"])
         self.assertEqual(self.slept, [launchd.POLL_INTERVAL] * 2)
 
+    def test_a_reload_waits_out_a_run_in_progress(self):
+        # A running job's bootout answers 36: launchd stops the run, then
+        # lets the job go; the reload waits for that before the bootstrap.
+        sim = self.sim()
+        self.loaded_as_installed(sim, state="running", pid=99, last_exit_code=None)
+        sim.busy[launchd.LABEL_AUTOSAVE] = 2
+        result, runner = self.register(sim, changed=True)
+        self.assertEqual(result.status, "PASS", result.reasons)
+        self.assertEqual(result.details["action"], "reloaded")
+        verbs = [c[1] for c in runner.launchctl()]
+        self.assertEqual(verbs, ["print", "print-disabled", "print", "bootout", "print",
+                                 "print", "print", "bootstrap", "print"])
+        self.assertEqual(self.slept, [launchd.POLL_INTERVAL] * 2)
+
     def test_bootout_that_never_finishes_fails(self):
         sim = self.sim()
         self.loaded_as_installed(sim)
@@ -896,6 +919,14 @@ class TmuxAgentTests(TempHome):
                 self.assertIn(words, result.reasons[0])
                 self.assertIn(self.log, result.reasons[0])
 
+    def test_exit_1_names_every_cause(self):
+        # tmux exits 1 on every error, so a failed new-session ends the
+        # script with 1 as well, not only a missing tmux or HOME.
+        result, _, _ = self.register(1)
+        self.assertEqual(result.reasons, [
+            "the tmux LaunchAgent could not start tmux (exit status 1: tmux not found, "
+            f"HOME unusable, or `tmux new-session` failed); see {self.log}"])
+
     def test_killed_is_a_failure(self):
         sim = LaunchdSim(self.target.uid)
         original = sim._bootstrap
@@ -975,6 +1006,37 @@ class UnloadAndStatusTests(TempHome):
         self.assertEqual(launchd.unload(self.target, SimRunner(self.sim(gui=False)), ["a"],
                                         outcomes=outcomes), [])
         self.assertEqual(outcomes, {"a": "no-gui-domain"})
+
+    def test_unload_waits_out_a_run_in_progress(self):
+        # The autosave job mid-save: bootout answers 36 (in progress), and
+        # launchd lets the job go once the run has stopped. Unloaded.
+        sim = self.sim()
+        sim.load(launchd.LABEL_AUTOSAVE, state="running", pid=99, last_exit_code=None)
+        sim.busy[launchd.LABEL_AUTOSAVE] = 2
+        runner = SimRunner(sim)
+        outcomes = {}
+        with fake_clock() as slept:
+            problems = launchd.unload(self.target, runner, [launchd.LABEL_AUTOSAVE],
+                                      outcomes=outcomes)
+        self.assertEqual((problems, outcomes), ([], {launchd.LABEL_AUTOSAVE: "unloaded"}))
+        self.assertEqual([c[1] for c in runner.launchctl()],
+                         ["bootout", "print", "print", "print"])
+        self.assertEqual(runner.read_only, [False, True, True, True])  # the wait only asks
+        self.assertEqual(slept, [launchd.POLL_INTERVAL] * 2)
+
+    def test_unload_of_a_job_that_never_leaves_fails(self):
+        sim = self.sim()
+        sim.load(launchd.LABEL_AUTOSAVE, state="running", pid=99, last_exit_code=None)
+        sim.busy[launchd.LABEL_AUTOSAVE] = -1
+        outcomes = {}
+        with fake_clock() as slept:
+            problems = launchd.unload(self.target, SimRunner(sim), [launchd.LABEL_AUTOSAVE],
+                                      outcomes=outcomes)
+        self.assertEqual(outcomes, {launchd.LABEL_AUTOSAVE: "failed"})
+        self.assertEqual(problems, [
+            f"{launchd.LABEL_AUTOSAVE} was still loaded 10 s after launchctl bootout; "
+            f"run: launchctl bootout gui/$(id -u)/{launchd.LABEL_AUTOSAVE}"])
+        self.assertAlmostEqual(sum(slept), launchd.BOOTOUT_WAIT, delta=0.5)
 
     def test_status(self):
         install_plists(self.target)

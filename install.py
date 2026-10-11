@@ -1657,6 +1657,14 @@ def cmd_services(ctx: Context, action: str, names: list[str]) -> int:
                 "session" if code in launchd.NO_GUI_DOMAIN else
                 f"launchctl enable failed ({launchd.error_text(code)})"))
             continue
+        try:
+            # launchd does not create the log directory the plist names, and
+            # cannot start the agent without it (78, EX_CONFIG).
+            launchd.prepare_log_dir(ctx.target)
+        except OSError as exc:
+            failed = True
+            ui.log_target(plist, ui.RED(f"cannot create the log directory: {exc}"))
+            continue
         result = launchd.register(ctx.target, ctx.runner, agent, changed=False, env=ctx.env)
         if result.status == FAIL:
             failed = True
@@ -1681,6 +1689,11 @@ def _systemd_services(action: str, names: list[str]) -> int:
     The autosave timer is stopped and started with --now; tmux.service is
     not (stopping it saves and ends the running server); it is only no
     longer (or again) started at the next graphical login.
+
+    Unlike macOS, a disable here does not last: the .wants links systemctl
+    removes are installer-managed entries, so the next update or repair
+    puts them back, and its post actions start the autosave timer whose
+    link exists. The output says so.
     """
 
     units = [SYSTEMD_UNITS[name] for name in names]
@@ -1692,6 +1705,11 @@ def _systemd_services(action: str, names: list[str]) -> int:
     for name in names:
         now = " --now" if name == "autosave" else ""
         print(f"    systemctl --user {action}{now} {SYSTEMD_UNITS[name]}")
+    if action == "disable":
+        timer = " and start the autosave timer again" if "autosave" in names else ""
+        print("On Linux this lasts only until the next 'dotfiles update' or 'dotfiles "
+              "repair', which re-create the links that systemctl disable removes "
+              f"(installer-managed entries){timer}.")
     return 0
 
 

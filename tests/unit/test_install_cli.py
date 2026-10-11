@@ -2807,8 +2807,9 @@ class MacosTmuxHelperTests(TempHome):
             self.assertFalse(phases._PTS_RE.match(tty), tty)
 
     def test_system_tmux_conf(self):
-        self.assertEqual(phases.system_tmux_conf({"HOMEBREW_PREFIX": "/x"}),
-                         Path("/etc/tmux.conf"))
+        with mock.patch.object(phases, "_darwin_host", return_value=False):
+            self.assertEqual(phases.system_tmux_conf({"HOMEBREW_PREFIX": "/x"}),
+                             Path("/etc/tmux.conf"))
         with mock.patch.object(phases, "_darwin_host", return_value=True):
             self.assertEqual(phases.system_tmux_conf({"HOMEBREW_PREFIX": "/custom/brew"}),
                              Path("/custom/brew/etc/tmux.conf"))
@@ -2864,8 +2865,10 @@ class MacosTmuxHelperTests(TempHome):
         self.assertFalse(str(darwin or "").startswith(str(link)), darwin)
         with mock.patch.object(phases, "_darwin_host", return_value=False):
             self.assertEqual(phases._measured(str(link)), str(link))
+        # Resolved all the way: on macOS the temporary directory is itself
+        # under a link (/var is /private/var).
         with mock.patch.object(phases, "_darwin_host", return_value=True):
-            self.assertEqual(phases._measured(str(link)), str(long_dir))
+            self.assertEqual(phases._measured(str(link)), os.path.realpath(long_dir))
 
 
 class MacosServicesTests(TempHome):
@@ -2932,6 +2935,25 @@ class MacosServicesTests(TempHome):
         self.assertEqual(runner.calls, [])
         self.assertEqual(list(self.home.iterdir()), [])
 
+    def test_linux_disable_says_the_next_update_undoes_it(self):
+        # systemctl disable removes the .wants links the installer manages:
+        # the next update or repair puts them back and starts the timer
+        # again, unlike the macOS disable. Said after the commands.
+        lasts = ("On Linux this lasts only until the next 'dotfiles update' or 'dotfiles "
+                 "repair', which re-create the links that systemctl disable removes "
+                 "(installer-managed entries)")
+        for argv, last in ((["services", "disable"],
+                            lasts + " and start the autosave timer again."),
+                           (["services", "disable", "autosave"],
+                            lasts + " and start the autosave timer again."),
+                           (["services", "disable", "tmux"], lasts + ".")):
+            rc, out, _ = self.main(argv, system="linux", runner=ScriptedRunner())
+            self.assertEqual(rc, 0)
+            self.assertEqual(out.splitlines()[-1], last, argv)
+        for argv in (["services"], ["services", "enable"]):
+            rc, out, _ = self.main(argv, system="linux", runner=ScriptedRunner())
+            self.assertNotIn("lasts only until", out, argv)
+
     def test_disable_then_enable(self):
         launchd_fakes.install_plists(self.target)
         for label in (LABEL_TMUX, LABEL_AUTOSAVE):
@@ -2955,6 +2977,16 @@ class MacosServicesTests(TempHome):
         self.assertIn("enabled and loaded", out)
         self.assertEqual([c[1] for c in self.runner.launchctl()][:2], ["enable", "print"])
 
+    def test_enable_recreates_the_log_directory(self):
+        # launchd cannot start an agent whose log directory is missing.
+        launchd_fakes.install_plists(self.target)
+        logs = launchd_fakes.launchd.log_dir(self.target)
+        self.assertFalse(logs.exists())
+        rc, out, _ = self.main(["services", "enable", "autosave"])
+        self.assertEqual(rc, 0, out)
+        self.assertTrue(logs.is_dir())
+        self.assertEqual(logs.stat().st_mode & 0o777, 0o700)
+
     def test_enable_needs_the_plist_and_a_desktop_session(self):
         rc, out, _ = self.main(["services", "enable", "autosave"])
         self.assertEqual(rc, 1)
@@ -2971,6 +3003,36 @@ class MacosServicesTests(TempHome):
         rc, out, _ = self.main(["services", "disable", "autosave"])
         self.assertEqual(rc, 1)
         self.assertIn("could not disable", out)
+
+    def test_disable_waits_out_a_save_in_progress(self):
+        # The autosave job mid-save: bootout answers 36 and launchd lets the
+        # job go once the run has stopped. That is a disable, not a failure.
+        launchd_fakes.install_plists(self.target)
+        self.sim.load(LABEL_AUTOSAVE, run_interval=60, state="running", pid=99,
+                      last_exit_code=None)
+        self.sim.busy[LABEL_AUTOSAVE] = 2
+        rc, out, _ = self.main(["services", "disable", "autosave"])
+        self.assertEqual(rc, 0, out)
+        self.assertIn("disabled (unloaded); stays off until: dotfiles services enable "
+                      "autosave", out)
+        self.assertEqual(self.sim.loaded, {})
+        self.assertEqual(self.sim.lingering, {})
+        self.assertEqual(self.sim.disabled, {LABEL_AUTOSAVE: True})
+        self.assertEqual([c[1] for c in self.runner.launchctl()],
+                         ["bootout", "print", "print", "print", "disable"])
+
+    def test_disable_of_a_job_that_never_leaves_fails(self):
+        launchd_fakes.install_plists(self.target)
+        self.sim.load(LABEL_AUTOSAVE, run_interval=60, state="running", pid=99,
+                      last_exit_code=None)
+        self.sim.busy[LABEL_AUTOSAVE] = -1
+        rc, out, _ = self.main(["services", "disable", "autosave"])
+        self.assertEqual(rc, 1)
+        self.assertIn(f"could not disable: {LABEL_AUTOSAVE} was still loaded 10 s after "
+                      f"launchctl bootout; run: launchctl bootout gui/$(id -u)/"
+                      f"{LABEL_AUTOSAVE}", out)
+        # launchctl disable still ran: it is off from the next login on.
+        self.assertTrue(self.sim.disabled[LABEL_AUTOSAVE])
 
     def test_a_launchctl_that_cannot_run_is_reported(self):
         from installer.runner import RunnerError
@@ -3019,6 +3081,7 @@ class MacosServicesTests(TempHome):
         result = {"restored": restored, "forced": [], "unchanged": [], "backup_dir": None}
         with mock.patch.object(install.plat, "current_system", return_value="darwin"), \
                 mock.patch("installer.transaction.restore", return_value=result), \
+                launchd_fakes.fake_clock(), \
                 redirect_stdout(io.StringIO()) as out, redirect_stderr(io.StringIO()) as err:
             rc = install.cmd_restore(ctx, args)
         text = out.getvalue()
@@ -3050,6 +3113,25 @@ class MacosServicesTests(TempHome):
         self.assertEqual(rc, 1)
         self.assertEqual(data["launchd"], {"tmux": "failed"})
         self.assertIn("launchctl bootout gui/", err)
+
+    def test_restore_waits_out_a_save_in_progress(self):
+        self.sim.load(LABEL_AUTOSAVE, run_interval=60, state="running", pid=99,
+                      last_exit_code=None)
+        self.sim.busy[LABEL_AUTOSAVE] = 2  # bootout answers 36, then it is gone
+        rc, data, text, err, _ = self.restore(["launchd-tmux-resurrect-autosave"])
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(data["launchd"], {"autosave": "unloaded"})
+        self.assertIn("unloaded (LaunchAgent removed)", text)
+        self.assertEqual(err, "")
+        # A job that never leaves: an error that names the command.
+        self.sim.load(LABEL_AUTOSAVE, run_interval=60, state="running", pid=99,
+                      last_exit_code=None)
+        self.sim.busy[LABEL_AUTOSAVE] = -1
+        rc, data, _, err, _ = self.restore(["launchd-tmux-resurrect-autosave"])
+        self.assertEqual(rc, 1)
+        self.assertEqual(data["launchd"], {"autosave": "failed"})
+        self.assertIn(f"{LABEL_AUTOSAVE} was still loaded 10 s after launchctl bootout; "
+                      f"run: launchctl bootout gui/$(id -u)/{LABEL_AUTOSAVE}", err)
 
 
 class MacosHintAndPackagesTests(TempHome):

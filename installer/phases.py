@@ -57,8 +57,10 @@ AUTOSAVE_TIMER = "tmux-resurrect-autosave.timer"
 # macOS the resolved path is what is measured.
 SOCKET_PATH_MAX = 100
 
-# Ubuntu's ncurses has it; macOS's (5.7) does not, so the installer compiles
-# the checkout's copy into ~/.terminfo there (tmux.conf's default-terminal).
+# tmux.conf's default-terminal. Ubuntu's ncurses has it, and so does macOS 14
+# and later (ncurses 6.0, with an entry from 2015, older than the checkout's);
+# on macOS the installer compiles the checkout's copy into ~/.terminfo only
+# when the system database lacks it.
 TMUX_TERMINFO = "tmux-256color"
 TERMINFO_SOURCE = "etc/terminfo/tmux-256color.terminfo"
 INFOCMP = "/usr/bin/infocmp"
@@ -1487,10 +1489,13 @@ def _macos_terminfo(target, runner, repo_root: Path, env: dict[str, str],
                     reasons: list[str], details: dict) -> None:
     """Compile tmux-256color into ~/.terminfo when the system lacks it.
 
-    tmux.conf makes every pane's TERM tmux-256color; macOS's ncurses 5.7
-    does not know it, so programs in panes would complain or fall back.
-    Done before the tmux agent can start a server. A failure is reported
-    with the exact command, never fatal.
+    tmux.conf makes every pane's TERM tmux-256color; without a description
+    of it programs in panes would complain or fall back. macOS 14 and later
+    ship one (ncurses 6.0's, from 2015, older than the checkout's
+    etc/terminfo/tmux-256color.terminfo), which ``infocmp -x`` finds, so
+    nothing is compiled there; only a system without one gets the
+    checkout's copy. Done before the tmux agent can start a server. A
+    failure is reported with the exact command, never fatal.
     """
 
     try:
