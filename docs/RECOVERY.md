@@ -13,20 +13,23 @@ Only the config transaction is rolled back, and only when **it** fails.
 
 | Step | On failure |
 | ---- | ---------- |
-| *Installing packages* (apt packages, pinned tools under `~/.local/share/personal-dotfiles/tools`) | Runs before the transaction and is **not** undone: whatever was installed stays installed, and the run stops before touching your configs. |
+| *Installing packages* (apt packages, or Homebrew formulae on macOS; pinned tools under `~/.local/share/personal-dotfiles/tools`) | Runs before the transaction and is **not** undone: whatever was installed stays installed, and the run stops before touching your configs. |
 | *Creating symbolic links* (every managed path) | **Rolled back**: all paths return to their state before the run. |
-| *Post actions* (tmux plugins, systemd user units and the autosave timer, zsh/tmux smoke checks, login shell, git identity, sign-in check) | **Not** undone: the new configs stay in place. The login shell is only changed after the smoke checks passed; replaced tmux plugin checkouts are kept under `backups/tmux-plugins/<RUN_ID>/`. |
-| *GNOME settings* | **Not** undone automatically; previous values are recorded (see [GNOME settings](#gnome-settings)) and returned by `restore --baseline`. |
+| *Post actions* (tmux plugins, systemd user units and the autosave timer or, on macOS, the two LaunchAgents, zsh/tmux smoke checks, login shell, git identity, sign-in check) | **Not** undone: the new configs stay in place. The login shell is only changed after the smoke checks passed; replaced tmux plugin checkouts are kept under `backups/tmux-plugins/<RUN_ID>/`. |
+| *GNOME settings* (not on macOS) | **Not** undone automatically; previous values are recorded (see [GNOME settings](#gnome-settings)) and returned by `restore --baseline`. |
 
 So after a failure in a later step, either fix the reported cause and run
 the install again, or undo that run's config changes yourself with
-`restore --run <RUN_ID>` (below). No restore uninstalls apt packages or
-pinned tools; remove those with `apt` or by deleting
-`~/.local/share/personal-dotfiles/tools` and the links in `~/.local/bin`.
+`restore --run <RUN_ID>` (below). No restore uninstalls apt packages,
+Homebrew formulae or pinned tools; remove those with `apt` or
+`brew uninstall`, or by deleting `~/.local/share/personal-dotfiles/tools`
+and the links in `~/.local/bin`.
 
 All commands run as your normal user (no `sudo`). `dotfiles status`,
 `dotfiles restore ...` and `dotfiles repair` are the same commands as
-`python3 ~/.dotfiles/install.py ...` below.
+`python3 ~/.dotfiles/install.py ...` below. On macOS, `python3` is usually
+the Command Line Tools' 3.9, which `install.py` refuses: use the `dotfiles`
+commands there, or `"$(brew --prefix)/bin/python3" ~/.dotfiles/install.py ...`.
 
 
 ## Where things live
@@ -42,6 +45,10 @@ All commands run as your normal user (no `sudo`). `dotfiles status`,
 | Per-run backups | `~/.local/state/personal-dotfiles/backups/runs/<RUN_ID>/<ID>/` |
 | A previous `~/.dotfiles` | `~/.local/state/personal-dotfiles/backups/pre-install-<TS>/dotfiles` |
 | GNOME settings state and backups | `~/.local/state/personal-dotfiles/gui/` |
+| LaunchAgents (macOS) | `~/Library/LaunchAgents/com.github.leekyungmoon.dotfiles.tmux.plist` and `…tmux-resurrect-autosave.plist` |
+| Their logs (macOS) | `~/.local/state/personal-dotfiles/launchd/<label>.log` (and one older `.log.1`) |
+| tmux-continuum's own launcher, set aside (macOS) | `~/.local/state/personal-dotfiles/backups/launchd/<RUN_ID>/Tmux.Start.plist` |
+| `tmux-256color` compiled by the installer (macOS) | `~/.terminfo/` (not a managed path; no restore removes it) |
 
 If you set `XDG_STATE_HOME`, substitute it for `~/.local/state`.
 
@@ -51,7 +58,8 @@ If you set `XDG_STATE_HOME`, substitute it for `~/.local/state`.
 - `<RUN_ID>` looks like `20260928T031500Z-1a2b3c4d` (UTC time + random).
 - `<TS>` is the UTC time the one-liner moved the old `~/.dotfiles` aside;
   it prints the exact path when it does.
-- Directories are `0700` and files `0600`.
+- Directories are `0700` and files `0600`. On macOS, launchd itself
+  creates the LaunchAgents' log files, inside their `0700` directory.
 
 > ⚠️ **Backups may contain sensitive originals** — whatever was at a
 > managed path before (an old `~/.zshrc` with tokens in it, for example).
@@ -92,7 +100,8 @@ the install.
 
 ## Copies you changed are kept
 
-`~/.gitconfig`, `~/.config/pudb/pudb.cfg` and the systemd user units are
+`~/.gitconfig`, `~/.config/pudb/pudb.cfg` and the systemd user units (on
+macOS, the two LaunchAgent plists, written for your home) are
 **copies**, not links. When one of them has
 drifted — `git config --global ...`, `gh auth setup-git`, an application
 saving its preferences, a hand edit — `dotfiles update`, `dotfiles repair`
@@ -126,6 +135,10 @@ ls ~/.local/state/personal-dotfiles/backups/runs
 ```bash
 python3 ~/.dotfiles/install.py restore --baseline
 ```
+
+On macOS (`dotfiles restore --baseline`) this also removes the two
+LaunchAgent plists and unloads them from launchd; a running tmux server
+keeps running.
 
 
 ## Restore to before a specific run
@@ -248,8 +261,65 @@ the fact that it was unset) is recorded under
 value ever seen, and each run keeps the values it replaced.
 
 
+## macOS: the LaunchAgents
+
+On a Mac, two LaunchAgents take the systemd units' place:
+`com.github.leekyungmoon.dotfiles.tmux` starts tmux at login and
+`com.github.leekyungmoon.dotfiles.tmux-resurrect-autosave` saves it every
+minute ([how they work](tmux-auto-restore.ko.md#macos), in Korean). Like
+everything on macOS here, these steps are pending verification on a real
+Mac.
+
+What launchd has loaded, each agent's log, and the age of the last save:
+
+```bash
+dotfiles services
+```
+
+| The install or repair says | What to do |
+| -------------------------- | ---------- |
+| post-install `RELOGIN_REQUIRED` (`launchd-gui-domain-unavailable`) | It ran over SSH, or without a desktop login. The plists are in place and load at your next desktop login; to load them now, run the `launchctl bootstrap gui/$(id -u) ...` commands it printed in a Terminal of that desktop session. |
+| `launchctl bootstrap failed (5: Input/output error)` | System Settings → General → Login Items & Extensions → *Allow in the Background*: turn it on for the agent (it may be listed as `sh` or by its script's name). Then run `dotfiles repair` in Terminal, not over SSH. |
+| `tmux: disabled (enable: dotfiles services enable tmux)` | You turned it off (`dotfiles services disable`); repairs leave it off. `dotfiles services enable tmux` turns it back on. |
+| `tmux started but did not restore the last snapshot (see <log>)` | The server runs without your snapshot; the log says why. Press prefix + C-r in tmux to restore it, or keep the current sessions and let saves go on: `tmux set-option -g @tmux-restore-complete on`. `tmux show-option -gqv @tmux-restore-status` shows the outcome. |
+| `process inspection unavailable: Codex/Claude resume commands will not be saved ...` | Saves still keep layouts, directories and pane contents; Codex and Claude panes come back as shells. `~/.dotfiles/tmux/resurrect-ai-session.py --self-test` says why. |
+| `could not compile the tmux-256color terminal description: ...; run: /usr/bin/tic ...` | Run the printed command. |
+| any other `launchctl ... failed (<code>: ...)` | The message ends with the command to run; `launchctl error <code>` explains the code. |
+
+Turning them off, or removing them:
+
+- `dotfiles services disable [tmux|autosave]` unloads an agent and marks
+  it disabled in launchd: installs, updates and repairs leave it off until
+  `dotfiles services enable [tmux|autosave]`. Without a name it acts on
+  both. A running tmux server is not stopped.
+- `dotfiles restore --baseline --id launchd-tmux --id
+  launchd-tmux-resurrect-autosave` removes both plists and unloads both
+  jobs, and nothing else; `dotfiles restore --baseline` does it together
+  with everything else. The next `dotfiles repair` installs them again.
+- When the installer cannot run at all: `launchctl bootout
+  gui/$(id -u)/com.github.leekyungmoon.dotfiles.tmux` (and the same for
+  `...tmux-resurrect-autosave`), then delete the two plists.
+
+A `restore --run <RUN_ID>` that puts back an older plist leaves launchd
+running the definition it had loaded until your next login or
+`dotfiles repair`.
+
+tmux-continuum's own launcher, `~/Library/LaunchAgents/Tmux.Start.plist`
+(left by an earlier `@continuum-boot on`; it opens a Terminal window at
+login and types `tmux`), is unloaded and moved to
+`~/.local/state/personal-dotfiles/backups/launchd/<RUN_ID>/` by every
+install and repair on macOS, never deleted.
+
+A failed Homebrew step stops the run before your configs are touched:
+run `brew doctor`, fix what it reports, then `dotfiles repair`. A formula
+that is installed but not linked fails with the `brew link <formula>`
+command to run.
+
+
 ## Credentials
 
 The installer never copies or restores SSH keys, GPG keys, git identity
 (`~/.gitconfig.secret`), Codex/Claude logins or browser data — they are
-not managed paths, so none of the commands above ever touch them.
+not managed paths, so none of the commands above ever touch them. On
+macOS, Apple's and Homebrew's git keep HTTPS credentials in your login
+Keychain (`osxkeychain`); no restore touches it either.

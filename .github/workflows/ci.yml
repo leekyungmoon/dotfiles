@@ -1,0 +1,569 @@
+# Tests for the Ubuntu and macOS setups.
+#
+# Every result here is a pre-release check, never a "pass" in
+# docs/SUPPORT.md: a hosted runner is a fresh VM whose user is logged in
+# automatically, not a real machine of that kind. Record a run's URL and date
+# under that page's pre-release checks instead.
+#
+# Ubuntu 22.04 and 24.04: the unit tests under the system python3 (3.10 and
+# 3.12), the shell and zsh tests, the integration tests (they clone the
+# pinned tmux plugins and the submodules from GitHub), lint, and a lane under
+# GNU bash 3.2.57, the version macOS ships as /bin/bash, built from source.
+#
+# macOS 15 and 26 on Apple silicon, and 15 and 26 on Intel, which are best
+# effort (Homebrew supports Intel at Tier 3 only), so those cells may fail
+# without failing the run: the unit tests file by file under Homebrew's
+# python3, the files the Command Line Tools' python3 (3.9) runs under that
+# one too, the shell tests, an integration subset, the bootstrap under the
+# real /bin/bash 3.2, and tests/macos/e2e.sh, the one-liner and the
+# LaunchAgents end to end in the runner's own account.
+#
+# Actions are pinned by commit; scripts in `run:` must work under macOS's
+# /bin/bash 3.2 in the macOS jobs (that is the `bash` they get).
+
+name: ci
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHONDONTWRITEBYTECODE: "1"
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  lint:
+    name: lint
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install ShellCheck 0.11.0, zsh and dash
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y --no-install-recommends zsh dash
+          cd "$RUNNER_TEMP" || exit 1
+          curl -fsSLO https://github.com/koalaman/shellcheck/releases/download/v0.11.0/shellcheck-v0.11.0.linux.x86_64.tar.xz
+          # The digest GitHub lists for this release asset.
+          echo "8c3be12b05d5c177a04c29e3c78ce89ac86f1595681cab149b65b97c4e227198  shellcheck-v0.11.0.linux.x86_64.tar.xz" | sha256sum -c -
+          tar -xJf shellcheck-v0.11.0.linux.x86_64.tar.xz
+          echo "$RUNNER_TEMP/shellcheck-v0.11.0" >> "$GITHUB_PATH"
+
+      - name: ShellCheck the scripts the macOS work touched
+        run: |
+          shellcheck --version
+          status=0
+          # Each script with the findings it already had (upstream style, left
+          # as it was); any other finding fails.
+          while read -r file known; do
+            [ -n "$file" ] || continue
+            args=(-x)
+            if [ "$known" != - ]; then args+=(-e "$known"); fi
+            if shellcheck "${args[@]}" "$file"; then
+              echo "ok: $file"
+            else
+              echo "::error file=$file::new ShellCheck findings"
+              status=1
+            fi
+          done <<'EOF'
+          install                          SC2088
+          etc/install                      SC2155,SC2015
+          bin/pbcopy                       -
+          bin/pbpaste                      -
+          bin/tmux-smart-paste             SC2163
+          tmux/resurrect-save              SC2016
+          tmux/resurrect-autosave          -
+          tmux/tmux-launchd-start          -
+          tmux/statusbar.tmux              SC2006,SC2034,SC2046,SC2059,SC2068,SC2069,SC2086,SC2154,SC2155,SC2181,SC2206
+          tmux/key_help.tmux               SC2034
+          tests/test-clipboard-helpers.sh  SC1007
+          tests/test-fzf-tmux-fallback.sh  SC2016
+          tests/test-mem-usage.sh          -
+          tests/test-tmux-smart-paste.sh   -
+          tests/macos/e2e.sh               -
+          EOF
+          exit "$status"
+
+      - name: Syntax of every POSIX sh and zsh script (dash -n, zsh -n)
+        run: |
+          status=0 count=0
+          while IFS= read -r -d '' file; do
+            [ -f "$file" ] && [ ! -L "$file" ] || continue
+            first=
+            IFS= read -r first < "$file" || [ -n "$first" ] || continue
+            check=
+            case $file in
+              *.zsh | zsh/zshenv | zsh/zshrc | zsh/zprofile | zsh/zlogin | zsh/zlogout | zsh/zpreztorc) check=zsh ;;
+              *)
+                case $first in
+                  '#!'*zsh*) check=zsh ;;
+                  '#!/bin/sh'* | '#!/usr/bin/env sh'*) check=dash ;;
+                esac
+                ;;
+            esac
+            [ -n "$check" ] || continue
+            count=$((count + 1))
+            "$check" -n "$file" || { echo "::error file=$file::$check -n failed"; status=1; }
+          done < <(git ls-files -z)
+          echo "checked $count files"
+          exit "$status"
+
+      - name: Python 3.9 grammar of what the Command Line Tools' python3 runs
+        run: |
+          python3 -B - <<'EOF'
+          import ast
+          import sys
+
+          # These run under /usr/bin/python3 (3.9) on a Mac without Homebrew's
+          # python3 first on PATH; everything else needs 3.10.
+          failed = False
+          for path in ("installer/darwin_proc.py", "tmux/resurrect-ai-session.py",
+                       "bin/dotfiles", "bin/mem-usage"):
+              try:
+                  with open(path, encoding="utf-8") as handle:
+                      ast.parse(handle.read(), filename=path, feature_version=(3, 9))
+              except SyntaxError as error:
+                  print(f"::error file={path}::not Python 3.9 syntax: {error}")
+                  failed = True
+              else:
+                  print(f"ok: {path}")
+          sys.exit(failed)
+          EOF
+
+  unit-linux:
+    name: unit (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Install zsh, tmux and strace
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y --no-install-recommends zsh tmux strace
+
+      - name: Unit tests (system python3)
+        run: |
+          /usr/bin/python3 --version
+          /usr/bin/python3 -B -m unittest discover -s tests/unit -p 'test_*.py' -v
+
+      - name: Shell and zsh tests
+        run: |
+          status=0
+          run() {
+            echo "::group::$*"
+            if ! "$@"; then
+              echo "::error::failed: $*"
+              status=1
+            fi
+            echo "::endgroup::"
+          }
+          run bash tests/test-clipboard-helpers.sh
+          run bash tests/test-tmux-smart-paste.sh
+          run bash tests/test-mem-usage.sh
+          run bash tests/test-tmux-rename.sh
+          run zsh zsh/tests/test-smart-paste.zsh
+          run zsh zsh/tests/test-macos-startup.zsh
+          run zsh zsh/tests/test-reload-platform.zsh
+          run zsh tests/test-fasd-preexec.zsh
+          exit "$status"
+
+      - name: zsh self-reload (fixture and noproc tiers)
+        env:
+          RELOAD_TEST_TIERS: fixture noproc
+        run: zsh tests/test-zsh-dotfiles-reload.zsh
+
+  integration-linux:
+    name: integration (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-22.04]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    env:
+      CELL: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Install zsh, tmux, strace and xauth
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y --no-install-recommends zsh tmux strace xauth
+          tmux -V
+
+      - name: Integration tests, one file at a time
+        run: |
+          status=0
+          for test in tests/integration/test_*.py; do
+            echo "::group::$test"
+            if ! /usr/bin/python3 -B -m unittest -v "$test"; then
+              echo "::error file=$test::failed on $CELL"
+              status=1
+            fi
+            echo "::endgroup::"
+          done
+          exit "$status"
+
+  bash32-linux:
+    name: bash 3.2.57 (ubuntu-24.04)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Build GNU bash 3.2.57, the version of macOS's /bin/bash
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y --no-install-recommends bison tmux zsh
+          cd "$RUNNER_TEMP" || exit 1
+          curl -fsSLO https://ftp.gnu.org/gnu/bash/bash-3.2.57.tar.gz
+          # This tarball's GNU signature (bash-3.2.57.tar.gz.sig) checks out
+          # against Chet Ramey's key in the GNU keyring.
+          echo "3fa9daf85ebf35068f090ce51283ddeeb3c75eb5bc70b1a4a7cb05868bfe06a4  bash-3.2.57.tar.gz" | sha256sum -c -
+          tar -xzf bash-3.2.57.tar.gz
+          cd bash-3.2.57 || exit 1
+          # The shipped y.tab.c predates parse.y's last patches and does not
+          # compile; configure picks bison, which makes it again.
+          rm -f y.tab.c y.tab.h
+          ./configure --prefix="$RUNNER_TEMP/bash32" --without-bash-malloc --disable-nls \
+            CFLAGS='-O2 -std=gnu89 -w -fcommon'
+          make
+          make install
+          version=$("$RUNNER_TEMP/bash32/bin/bash" -c 'echo "${BASH_VERSINFO[0]}.${BASH_VERSINFO[1]}.${BASH_VERSINFO[2]}"')
+          echo "built bash $version"
+          test "$version" = 3.2.57
+          echo "BASH32=$RUNNER_TEMP/bash32/bin/bash" >> "$GITHUB_ENV"
+
+      - name: Every bash script parses under bash 3.2, every sh script under its POSIX mode
+        run: |
+          status=0 count=0
+          while IFS= read -r -d '' file; do
+            [ -f "$file" ] && [ ! -L "$file" ] || continue
+            first=
+            IFS= read -r first < "$file" || [ -n "$first" ] || continue
+            case $first in
+              '#!'*bash*) set -- "$BASH32" -n ;;
+              '#!/bin/sh'* | '#!/usr/bin/env sh'*) set -- "$BASH32" --posix -n ;;
+              *) continue ;;
+            esac
+            count=$((count + 1))
+            "$@" "$file" || { echo "::error file=$file::bash 3.2 cannot parse it"; status=1; }
+          done < <(git ls-files -z)
+          echo "checked $count files"
+          exit "$status"
+
+      - name: etc/install and ./install under bash 3.2
+        run: |
+          status=0
+          for test in tests/integration/test_etc_install.py tests/integration/test_etc_install_darwin.py; do
+            echo "::group::$test"
+            if ! BASH_UNDER_TEST="$BASH32" /usr/bin/python3 -B -m unittest -v "$test"; then
+              echo "::error file=$test::failed under bash 3.2"
+              status=1
+            fi
+            echo "::endgroup::"
+          done
+          exit "$status"
+
+      - name: Shell tests under bash 3.2
+        run: |
+          status=0
+          for test in tests/test-tmux-smart-paste.sh tests/test-clipboard-helpers.sh tests/test-mem-usage.sh; do
+            echo "::group::$test"
+            if ! "$BASH32" "$test"; then
+              echo "::error file=$test::failed under bash 3.2"
+              status=1
+            fi
+            echo "::endgroup::"
+          done
+          exit "$status"
+
+      - name: The LaunchAgents' scripts under bash 3.2 and dash
+        run: TMUX_TEST_BASH32="$BASH32" /usr/bin/python3 -B -m unittest -v tests/integration/test_tmux_launchd_scripts.py
+
+  unit-macos:
+    name: unit (${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            best-effort: false
+            timeout: 60
+          - runner: macos-26
+            best-effort: false
+            timeout: 60
+          # Intel: best effort. Homebrew has no new x86_64 bottles, so tmux
+          # and python3 may build from source.
+          - runner: macos-15-intel
+            best-effort: true
+            timeout: 150
+          - runner: macos-26-intel
+            best-effort: true
+            timeout: 150
+    runs-on: ${{ matrix.runner }}
+    continue-on-error: ${{ matrix.best-effort }}
+    timeout-minutes: ${{ matrix.timeout }}
+    env:
+      CELL: ${{ matrix.runner }}
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+      HOMEBREW_NO_INSTALL_CLEANUP: "1"
+      HOMEBREW_NO_ENV_HINTS: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Homebrew tmux, fzf and python3
+        run: |
+          sw_vers
+          uname -m
+          /bin/bash -c 'echo "/bin/bash $BASH_VERSION"'
+          brew install tmux fzf
+          python=$(brew --prefix)/bin/python3
+          if ! "$python" -c 'import sys; sys.exit(sys.version_info < (3, 10))' 2> /dev/null; then
+            # A failed link over another python3 is not fatal: the keg's own
+            # python3 is checked and used below.
+            brew install python3 || echo "::warning::brew install python3 reported an error"
+            python=$(brew --prefix python3)/bin/python3
+          fi
+          "$python" -c 'import sys; print(sys.executable, sys.version); sys.exit(sys.version_info < (3, 10))'
+          echo "PY=$python" >> "$GITHUB_ENV"
+          tmux -V
+          fzf --version
+
+      - name: Unit tests, one file at a time (Homebrew python3)
+        run: |
+          status=0
+          for test in tests/unit/test_*.py; do
+            echo "::group::$test"
+            if ! "$PY" -B -m unittest -v "$test"; then
+              echo "::error file=$test::failed on $CELL"
+              status=1
+            fi
+            echo "::endgroup::"
+          done
+          exit "$status"
+
+      - name: darwin_proc and the AI hook under /usr/bin/python3 (3.9) and Homebrew python3
+        run: |
+          status=0
+          for python in /usr/bin/python3 "$PY"; do
+            for test in tests/unit/test_darwin_proc.py tests/unit/test_resurrect_ai_session.py; do
+              echo "::group::$python: $test"
+              "$python" --version
+              if ! "$python" -B -m unittest -v "$test"; then
+                echo "::error file=$test::failed under $python"
+                status=1
+              fi
+              echo "::endgroup::"
+            done
+            if "$python" -B tmux/resurrect-ai-session.py --self-test; then
+              echo "ok: --self-test under $python"
+            else
+              echo "::error file=tmux/resurrect-ai-session.py::--self-test failed under $python"
+              status=1
+            fi
+          done
+          exit "$status"
+
+      - name: Shell and zsh tests (/bin/bash 3.2, /bin/zsh)
+        run: |
+          status=0
+          run() {
+            echo "::group::$*"
+            if ! "$@"; then
+              echo "::error::failed: $*"
+              status=1
+            fi
+            echo "::endgroup::"
+          }
+          run /bin/bash tests/test-clipboard-helpers.sh
+          run /bin/bash tests/test-tmux-smart-paste.sh
+          run /bin/bash tests/test-mem-usage.sh
+          run /bin/bash tests/test-fzf-tmux-fallback.sh
+          run /bin/bash tests/test-tmux-rename.sh
+          run /bin/zsh zsh/tests/test-reload-platform.zsh
+          run /bin/zsh zsh/tests/test-macos-startup.zsh
+          run /bin/zsh zsh/tests/test-smart-paste.zsh
+          run /bin/zsh tests/test-fasd-preexec.zsh
+          exit "$status"
+
+      - name: Integration subset (bootstrap simulation, LaunchAgent scripts, tmux-resurrect)
+        env:
+          # Short tmux socket paths (macOS allows 103 bytes).
+          TMUX_LAUNCHD_TEST_SOCKET_DIR: /tmp
+        run: |
+          status=0
+          for test in tests/integration/test_etc_install_darwin.py \
+              tests/integration/test_tmux_launchd_scripts.py \
+              tests/integration/test_tmux_resurrect_integration.py; do
+            echo "::group::$test"
+            if ! "$PY" -B -m unittest -v "$test"; then
+              echo "::error file=$test::failed on $CELL"
+              status=1
+            fi
+            echo "::endgroup::"
+          done
+          exit "$status"
+
+  bash32-macos:
+    name: bootstrap under /bin/bash 3.2 (macos-15)
+    runs-on: macos-15
+    timeout-minutes: 30
+    env:
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+      HOMEBREW_NO_INSTALL_CLEANUP: "1"
+      HOMEBREW_NO_ENV_HINTS: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: /bin/bash is 3.2.57
+        run: |
+          version=$(/bin/bash -c 'echo "$BASH_VERSION"')
+          echo "/bin/bash $version"
+          case $version in
+            3.2.57*) ;;
+            *) echo "::error::/bin/bash is $version, not 3.2.57"; exit 1 ;;
+          esac
+
+      - name: Every bash script parses under /bin/bash, every sh script under /bin/sh
+        run: |
+          status=0 count=0
+          while IFS= read -r -d '' file; do
+            [ -f "$file" ] && [ ! -L "$file" ] || continue
+            first=
+            IFS= read -r first < "$file" || [ -n "$first" ] || continue
+            case $first in
+              '#!'*bash*) check=/bin/bash ;;
+              '#!/bin/sh'* | '#!/usr/bin/env sh'*) check=/bin/sh ;;
+              *) continue ;;
+            esac
+            count=$((count + 1))
+            "$check" -n "$file" || { echo "::error file=$file::$check -n failed"; status=1; }
+          done < <(git ls-files -z)
+          echo "checked $count files"
+          exit "$status"
+
+      - name: etc/install and ./install refuse, with their own words, before any change
+        run: |
+          # A scratch HOME keeps even a refusal that broke away from the
+          # runner's home; it must stay empty.
+          home=$(mktemp -d "$RUNNER_TEMP/refusal-home.XXXXXX")
+          status=0
+          expect() {  # expect STATUS TEXT COMMAND...: that exit status and TEXT in the output
+            local want=$1 text=$2 out rc=0
+            shift 2
+            out=$("$@" 2>&1) || rc=$?
+            printf '%s\n' "$out" | sed 's/^/    /'
+            if [ "$rc" != "$want" ]; then
+              echo "::error::exit status $rc instead of $want: $*"
+              status=1
+              return 0
+            fi
+            case $out in
+              *"$text"*) echo "ok ($rc): $text" ;;
+              *) echo "::error::'$text' missing from: $*"; status=1 ;;
+            esac
+          }
+          root="do not run this as root (or with sudo). Run it as your normal user; Homebrew refuses to run as root."
+          expect 1 "$root" sudo -n env HOME="$home" /bin/bash etc/install
+          # 'curl ... | sh' as root: /bin/sh is bash 3.2 in POSIX mode.
+          expect 1 "$root" sudo -n env HOME="$home" /bin/sh < etc/install
+          spoofed="BASH_SOURCE is set in the environment; unset it and rerun."
+          expect 1 "$spoofed" env HOME="$home" BASH_SOURCE=x /bin/bash etc/install
+          expect 2 "$spoofed" env HOME="$home" BASH_SOURCE=x /bin/bash install
+          # ./install anywhere but in the checkout, started by bash, sh or zsh.
+          expect 2 "Clone & install into" env HOME="$home" /bin/bash install
+          expect 2 "Clone & install into" env HOME="$home" /bin/sh install
+          expect 2 "Clone & install into" env HOME="$home" /bin/zsh install
+          # A release outside the policy (sw_vers says 14.7.1).
+          shim=$(mktemp -d "$RUNNER_TEMP/shim.XXXXXX")
+          printf '#!/bin/sh\necho 14.7.1\n' > "$shim/sw_vers"
+          chmod +x "$shim/sw_vers"
+          expect 1 "unsupported macOS release '14.7.1' on arm64; supported: 15, 26, 27 on Apple silicon; 15, 26 on Intel (best effort)." \
+            env HOME="$home" PATH="$shim:$PATH" /bin/bash etc/install
+          if arch -x86_64 /usr/bin/true 2> /dev/null; then
+            expect 1 "this terminal runs under Rosetta 2 (x86_64 emulation) on an Apple silicon Mac." \
+              env HOME="$home" arch -x86_64 /bin/bash etc/install
+          else
+            echo "::notice::Rosetta 2 is not installed on this runner, so the Rosetta refusal was not exercised"
+          fi
+          if [ -n "$(ls -A "$home")" ]; then
+            echo "::error::a refusal wrote into its HOME:"
+            ls -la "$home"
+            status=1
+          else
+            echo "ok: nothing was written into the scratch HOME"
+          fi
+          exit "$status"
+
+      - name: The darwin simulation of etc/install under /bin/bash (test_etc_install_darwin.py)
+        env:
+          BASH_UNDER_TEST: /bin/bash
+        run: |
+          python=$(brew --prefix)/bin/python3
+          if ! "$python" -c 'import sys; sys.exit(sys.version_info < (3, 10))' 2> /dev/null; then
+            brew install python3 || echo "::warning::brew install python3 reported an error"
+            python=$(brew --prefix python3)/bin/python3
+          fi
+          "$python" -B -m unittest -v tests/integration/test_etc_install_darwin.py
+
+  e2e-macos:
+    name: e2e (${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [macos-15, macos-26]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          submodules: recursive
+          persist-credentials: false
+
+      - name: One-liner, LaunchAgents, save and restore, repair, services, removal
+        env:
+          E2E_ARTIFACTS: ${{ runner.temp }}/e2e-artifacts
+        run: /bin/bash tests/macos/e2e.sh
+
+      - name: Upload the logs, launchctl answers and status (on failure)
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: e2e-${{ matrix.runner }}
+          path: ${{ runner.temp }}/e2e-artifacts
+          if-no-files-found: warn
+          retention-days: 14

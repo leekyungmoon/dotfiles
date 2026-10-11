@@ -6,6 +6,9 @@ PC 재부팅이나 예기치 않은 종료 이후에도 터미널 작업환경�
 사용할 수 있도록, 작업 구성을 주기적으로 저장하고 데스크톱 로그인 시 자동
 복구한다.
 
+아래 "적용 구성"부터 "확인한 내용"까지는 Ubuntu 기준이다. macOS에서는 systemd
+사용자 서비스 대신 LaunchAgent 두 개가 같은 일을 한다(맨 아래 "macOS").
+
 ## 적용 구성
 
 - **tmux-resurrect:** 세션·창·분할 화면 구성, 작업 디렉터리와 터미널 출력
@@ -274,3 +277,275 @@ tmux show-environment -g WAYLAND_DISPLAY DISPLAY
 실제 PC 재부팅, 데스크톱 로그인 시 서비스 시작 순서와 그래픽 환경 변수,
 systemd 타이머의 실제 동작은 이 시험들이 확인하지 않는다. 각 PC에서 위 상태
 확인 명령으로 확인한다.
+
+## macOS
+
+macOS에서는 launchd의 LaunchAgent(사용자 에이전트) 두 개가 Ubuntu의 systemd
+사용자 서비스를 대신한다. 저장과 복구 자체(tmux-resurrect, tmux-continuum,
+`tmux/resurrect-save`, AI hook, 복구 전 저장 보류)는 위와 같다. 이 절의 내용은
+아직 실제 Mac에서 확인하지 않았다(`docs/SUPPORT.md`의 macOS 항목은 모두
+pending verification이다).
+
+### 적용 구성 (macOS)
+
+| LaunchAgent | 실행하는 것 | 실행 시점 |
+| --- | --- | --- |
+| `com.github.leekyungmoon.dotfiles.tmux` | `tmux/tmux-launchd-start` | 데스크톱 로그인 때, 그리고 설치·repair·`dotfiles services enable`이 불러올 때 한 번(RunAtLoad) |
+| `com.github.leekyungmoon.dotfiles.tmux-resurrect-autosave` | `tmux/resurrect-autosave` | 60초마다(StartInterval), 접속한 화면이 없어도 |
+
+- plist는 `~/Library/LaunchAgents/<label>.plist`(0644)다. launchd는 `~`와
+  `$HOME`을 풀지 않으므로 설치기가 사용자마다 절대경로로 만들고, 다른 관리
+  파일처럼 백업·변경 확인·`restore` 대상으로 다룬다.
+- 두 agent 모두 데스크톱(Aqua) 로그인 세션에서만 불러온다. SSH로만 접속한
+  상태나 FileVault 잠금을 풀기 전에는 실행되지 않는다.
+- 환경: `PATH`는 설치기 도구 디렉터리(`~/.local/share/personal-dotfiles/bin`),
+  `~/.local/bin`, Homebrew의 `bin`·`sbin`, 시스템 디렉터리 순이다. launchd의
+  기본 PATH에는 Homebrew가 없어서 tmux와 hook의 python3를 찾지 못하기
+  때문이다. `LANG`은 설치한 셸의 UTF-8 locale(`locale -a`에 있을 때, 없으면
+  `en_US.UTF-8`)이다. UTF-8이 아니면 macOS `ps`가 한글 같은 인자를 다른 문자로
+  바꿔 보여 주므로 hook이 pane 명령을 확인하지 못하고 비운다. `TMUX`,
+  `TMUX_TMPDIR`는 넣지 않는다(터미널에서 실행한 tmux가 찾는 기본 서버여야
+  한다).
+- tmux agent는 한 번 실행하고 끝나며 다시 띄우지 않는다(KeepAlive 없음:
+  사용자가 일부러 끈 서버를 되살리지 않는다). agent가 끝나도 tmux 서버는
+  남고(AbandonProcessGroup), pane이 느려지지 않게 대화형 우선순위로
+  실행한다(ProcessType Interactive).
+- autosave agent는 낮은 우선순위(Background, 낮은 I/O 우선순위, nice 10),
+  umask 077로 실행한다.
+- `@continuum-boot`는 macOS에서 항상 off다. continuum의 on은 로그인할 때 터미널
+  창을 열어 tmux를 입력하는 자체 LaunchAgent(`~/Library/LaunchAgents/Tmux.Start.plist`)를
+  쓰기 때문이다. 예전 설정이 남긴 그 파일이 있으면 설치기가 launchd에서 내리고
+  `~/.local/state/personal-dotfiles/backups/launchd/<RUN_ID>/`로 옮긴다(지우지
+  않는다).
+
+파일 구성:
+
+| 파일 | 역할 |
+| --- | --- |
+| `tmux/tmux-launchd-start` | tmux agent: 서버가 없을 때만 tmux를 시작하고 복구 결과를 기록 |
+| `tmux/resurrect-autosave` | autosave agent: 서버가 있으면 `tmux/resurrect-save`로 저장, 50초 제한, 복구 전 저장 보류(75)는 성공으로 처리 |
+| `installer/launchd.py` | plist 생성, `launchctl`로 등록·확인·해제, `dotfiles services` |
+| `installer/darwin_proc.py` | `/proc` 대신 libproc과 sysctl로 pane 프로세스의 인자와 열린 파일 확인 |
+| `etc/terminfo/tmux-256color.terminfo` | macOS ncurses(5.7)에 없는 `tmux-256color` 터미널 정보 |
+
+macOS 쪽 차이:
+
+- 저장 lock: `flock`(Linux)이 없으므로 `tmux/resurrect-save`는 `/usr/bin/lockf -s -t 0 9`
+  (macOS 15 이상), 그것도 안 되면 python3의 `fcntl.flock`으로 같은
+  `operation.lock`을 잡는다. 다른 저장이 진행 중이면 조용히 끝내고(0), 잡을
+  도구가 하나도 없으면 저장하지 않고 실패로 알린다. 성공한 척하지 않는다.
+- macOS `tar`가 pane 내용 압축 파일에 확장 속성(`._*` 항목)을 넣지 않도록
+  `COPYFILE_DISABLE=1`로 저장한다.
+- AI hook은 `installer/darwin_proc.py`로 실행 중 프로세스의 인자와 열린 파일을
+  읽는다. 이것을 쓸 수 없으면 저장은 그대로 하되(배치, 작업 디렉터리, 출력
+  기록) pane 명령은 비우고, 저장할 때마다 로그에 경고를 한 줄 남긴다. 설치와
+  repair는 `tmux/resurrect-ai-session.py --self-test`를 agent와 같은 PATH로
+  실행해 미리 확인하고, 실패하면 "process inspection unavailable: Codex/Claude
+  resume commands will not be saved ..." 이유를 보여 준다(설치는 실패로 보지
+  않는다).
+- 설치기는 시스템에 `tmux-256color`가 없으면 `/usr/bin/tic -x -o ~/.terminfo
+  ~/.dotfiles/etc/terminfo/tmux-256color.terminfo`로 컴파일한다. 실패하면 이
+  명령을 이유로 보여 준다.
+
+### 사용자 입장에서의 동작 (macOS)
+
+1. 평소에는 별도 조작 없이 1분마다 현재 작업환경이 저장된다(접속한 화면이
+   없어도).
+2. Mac을 재시동한 뒤 데스크톱에 로그인한다.
+3. tmux agent가 백그라운드 tmux 서버를 시작하고 continuum이 마지막 저장본을
+   복구한다. 터미널을 열고 tmux에 접속하면 된다(`ta`, `tmux attach`).
+4. 이미 tmux 서버가 있으면(로그인 직후 터미널에서 먼저 tmux를 실행한 경우 등)
+   그 서버를 그대로 두고 끝난다.
+
+`tmux/tmux-launchd-start`의 순서:
+
+- 서버가 있으면 아무것도 하지 않는다("a tmux server is already running; left
+  untouched").
+- 없으면 `$HOME`에서 `tmux new-session -d -s __continuum_startup`으로 서버를
+  시작한다. 설정을 불러오면서 continuum이 복구를 시작한다. tmux는 절대경로로
+  실행한다(continuum은 `tmux`로 시작하는 다른 프로세스를 보면 복구를 건너뛴다).
+- 복구가 시작되기를 `@continuum-restore-max-delay` + 15초(기본 25초), 끝나기를
+  180초까지 기다리며 `@tmux-restore-complete`를 지켜본다.
+- continuum은 그 순간 다른 tmux 클라이언트를 보면(다른 plugin의 백그라운드
+  작업, 로그인 때 `tmux attach`를 실행한 터미널) 복구를 건너뛴다. 그때 저장본이
+  있고 `~/tmux_no_auto_restore`가 없으며 로그인용 임시 세션이 손대지 않은
+  상태(`__continuum_startup` 창 1개, pane 1개, 접속 없음, 다른 세션 없음)면,
+  스크립트가 continuum과 같은 복구 스크립트를 직접 실행한다. 이미 사용 중인
+  서버에는 자동으로 복구하지 않는다.
+- 결과는 서버 옵션 `@tmux-restore-status`와 agent 로그에 남긴다.
+
+| `@tmux-restore-status` | 뜻 |
+| --- | --- |
+| `restored <날짜 시각>` | 복구했다 |
+| `restored <날짜 시각> (continuum skipped; restored by tmux-launchd-start)` | continuum이 건너뛰어 스크립트가 직접 복구했다 |
+| `no snapshot` | 아직 저장본이 없다 |
+| `not restored: ~/tmux_no_auto_restore exists` | 자동 복구를 꺼 두었다 |
+| `not restored: tmux-resurrect is not loaded` | plugin을 불러오지 못했다(`dotfiles repair`) |
+| `not restored: @continuum-restore is off` | 설정에서 자동 복구가 꺼져 있다 |
+| `not restored: continuum did not start it within 25s` | continuum이 시작하지 않았고 스크립트도 복구하지 않았다(이유는 로그) |
+| `not restored: still restoring after 180s` | 복구가 180초 안에 끝나지 않았다 |
+
+복구하지 않은 서버도 "복구 전 저장 보류"는 같다. 로그에 이유와 함께 prefix +
+C-r, `~/tmux_no_auto_restore` 삭제, `tmux set-option -g @tmux-restore-complete on`
+중 할 일을 적는다.
+
+종료 코드(launchd의 `last exit code`):
+
+| agent | 코드 | 뜻 |
+| --- | --- | --- |
+| tmux | 0 | 복구했다, 복구할 것이 없다(저장본 없음, `~/tmux_no_auto_restore`), 또는 서버가 이미 있었다 |
+| tmux | 3 | 저장본이 있지만 복구하지 않았다. 서버는 실행 중이다. 설치기는 실패가 아니라 경고("press prefix + C-r in tmux to restore it")로 알린다 |
+| tmux | 1 | tmux가 없다(`brew install tmux && dotfiles repair`) 또는 HOME이 잘못되었다 |
+| tmux | 그 밖 | `tmux new-session`이 실패한 코드 |
+| autosave | 0 | 저장했다, 서버가 없다, 또는 복구 전 저장 보류(75를 0으로 바꾸고 서버마다 한 번만 로그) |
+| autosave | 그 밖 | 저장 실패. `tmux/resurrect-save`의 메시지가 로그에 남는다 |
+
+autosave는 50초가 넘도록 끝나지 않는 저장(응답하지 않는 서버 등)을 멈춘다(TERM,
+5초 뒤 KILL). launchd는 작업이 실행 중이면 다음 주기를 건너뛰기 때문이다. 멈춘
+저장은 이전 저장본을 그대로 둔다.
+
+로그: `${XDG_STATE_HOME:-~/.local/state}/personal-dotfiles/launchd/<label>.log`
+(디렉터리 0700). launchd는 로그를 정리하지 않으므로 두 스크립트가 시작할 때
+1 MiB를 넘으면 `<label>.log.1`로 옮긴다(이전 `.1`은 덮어써서 한 세대만
+남는다). 평소의 저장은 아무것도 쓰지 않는다.
+
+설치·repair·update 때:
+
+- plist가 바뀌었으면 agent를 내렸다가(bootout) 다시 불러오고(bootstrap), 그대로면
+  launchd에 아무것도 하지 않는다. tmux agent는 맨 마지막에 불러온다. 불러오면
+  바로 실행되지만 서버가 있으면 그대로 둔다.
+- 사용자가 `dotfiles services disable`로 끈 agent는 켜지 않는다. 단계 결과는
+  PASS로 두고 `tmux: disabled (enable: dotfiles services enable tmux)` 같은
+  이유만 보여 준다.
+- 결과는 `launchctl print`로 확인한 것만 PASS다. SSH로만 접속해 GUI 세션이
+  없으면 RELOGIN_REQUIRED(`launchd-gui-domain-unavailable`)다. plist는 이미
+  있으므로 다음 데스크톱 로그인 때 불러온다. 지금 불러오려면 데스크톱 세션의
+  터미널에서, 설치기가 보여 준 `launchctl bootstrap gui/$(id -u) ...` 명령을
+  실행한다.
+
+### 로그인 항목: 백그라운드에서 허용
+
+agent를 처음 불러오면 macOS가 백그라운드 항목이 추가되었다는 알림(Background
+Items Added)을 보이고, 시스템 설정 > 일반 > 로그인 항목 및 확장 프로그램(Login
+Items & Extensions)의 "백그라운드에서 허용"(Allow in the Background) 목록에
+올린다(이름은 `sh`나 스크립트 이름으로 보일 수 있다). 여기서 끄면 launchd가
+불러오기를 거부하고, 설치·repair는 `launchctl bootstrap failed (5: Input/output
+error)`와 이 설정을 확인하라는 안내로 실패한다. 다시 켠 뒤 터미널(SSH가 아닌
+데스크톱 세션)에서 `dotfiles repair`를 실행한다. 일부러 끄려면 이 토글보다
+`dotfiles services disable`을 쓴다(설치기가 상태를 알고 다시 켜지 않는다).
+
+### 로컬 네트워크와 파일 및 폴더 접근
+
+macOS 15부터 로컬 네트워크(같은 네트워크의 기기, `.local` 이름) 접근은 사용자의
+허락이 필요하다. Apple TN3179에 따르면 터미널이나 SSH에서 실행한 명령과 그
+자식 프로세스, launchd 데몬, root 프로세스는 자동으로 허용되지만 launchd
+에이전트는 그렇지 않다. 그래서 tmux agent가 시작한 tmux 서버의 pane에서
+실행한 프로그램은 터미널 앱의 허락을 받지 못한다.
+
+- 증상: pane에서 같은 네트워크의 기기로 `ssh`, `curl`, `git` 등을 실행하면
+  `No route to host`나 연결 시간 초과로 실패하거나, tmux(또는 `sh`)가 로컬
+  네트워크의 기기에 접근하려 한다는 알림이 뜬다. 알림에 답하기 전의 첫
+  시도는 실패할 수 있다. 바로 끝나는 프로세스에는 알림이 뜨지 않을 수도
+  있다(TN3179).
+- 허용: 시스템 설정 > 개인정보 보호 및 보안 > 로컬 네트워크(Privacy &
+  Security, Local Network)에서 해당 항목을 켠다.
+- 파일 및 폴더(TCC)도 비슷하다. pane의 프로그램이 데스크탑, 문서, 다운로드,
+  iCloud Drive, 외장·네트워크 볼륨에 접근하면 터미널 앱이 아니라 tmux 쪽 이름으로
+  권한을 묻거나 `Operation not permitted`로 실패할 수 있다. 시스템 설정 >
+  개인정보 보호 및 보안 > 파일 및 폴더(Files & Folders) 또는 전체 디스크 접근
+  권한(Full Disk Access)에서 허용한다.
+- 피하는 방법: `dotfiles services disable tmux`로 tmux agent만 끈다. 1분 자동
+  저장은 계속된다. 로그인 후 터미널에서 처음 tmux를 실행하면 그 서버가
+  continuum으로 마지막 저장본을 복구하고, 그 pane들은 터미널 앱의 권한을 따른다.
+
+이 동작은 아직 실제 Mac에서 확인하지 않았다.
+
+### 복구 범위와 제한 (macOS)
+
+- 복구하는 것: 세션·창·분할 화면 배치, 작업 디렉터리, 터미널 출력
+  기록(scrollback), 실행 중 프로세스에서 확인한 Codex·Claude 재개 명령
+  (`codex resume <ID>`, `<claude 경로> --resume <ID>`), resurrect 기본 목록의
+  프로그램(vi, less 등).
+- 복구하지 않는 것: 프로세스의 메모리 상태, 그 밖에 실행 중이던 명령(다시
+  실행하지 않고 빈 shell로 복구), 살아 있던 네트워크 연결(SSH 접속 등),
+  마지막 저장 이후의 변경.
+- 저장은 1분마다다. 예기치 않은 종료 때 최대 약 1분의 변경이 빠질 수 있다.
+- 로그아웃·재시동·종료할 때 저장하지 않는다(Ubuntu의 `tmux.service` 종료 때
+  저장에 해당하는 것이 없다). 마지막 1분 저장이 기준이다.
+- 잠자기 중에는 저장하지 않는다. 그동안의 주기는 건너뛰고(launchd.plist의
+  StartInterval), 깨어난 뒤 다음 주기부터 다시 저장한다.
+- Codex·Claude 명령은 프로세스 확인(`installer/darwin_proc.py`)이 동작할 때만
+  저장한다. 다른 사용자의 프로세스(`sudo` 등)는 확인할 수 없어 비운다.
+
+### 사용법 (macOS)
+
+- 상태 확인(두 agent의 상태, 로그 경로, 마지막 저장 후 경과 시간):
+
+```sh
+dotfiles services
+```
+
+- 끄기·켜기. 이름을 빼면 둘 다다. 끈 상태는 launchd에 남아 이후의 설치,
+  `dotfiles update`, `dotfiles repair`도 켜지 않는다. 끄더라도 실행 중인 tmux
+  서버는 끝나지 않는다:
+
+```sh
+# 로그인 때 tmux 자동 시작만 끈다(1분 자동 저장은 계속)
+dotfiles services disable tmux
+# 1분 자동 저장을 끈다
+dotfiles services disable autosave
+# 둘 다 다시 켠다
+dotfiles services enable
+```
+
+- launchd의 상태와 로그, 복구 결과:
+
+```sh
+launchctl print gui/$(id -u)/com.github.leekyungmoon.dotfiles.tmux
+tail -n 50 ~/.local/state/personal-dotfiles/launchd/com.github.leekyungmoon.dotfiles.tmux.log
+tmux show-option -gqv @tmux-restore-status
+```
+
+- 제거: `dotfiles restore --baseline`은 다른 관리 파일과 함께 두 plist를 지우고
+  launchd에서 내린다. agent만 지우려면:
+
+```sh
+dotfiles restore --baseline --id launchd-tmux --id launchd-tmux-resurrect-autosave
+```
+
+- 수동 저장(prefix + C-s), 수동 복구(prefix + C-r), `~/tmux_no_auto_restore`,
+  "복구 전 저장 보류"의 해제는 Ubuntu와 같다.
+
+### 확인한 내용 (macOS)
+
+이 저장소의 시험이 확인하는 내용만 적는다. `tests/macos/e2e.sh`를 뺀 시험은
+Linux에서도 실행된다(launchd와 macOS 도구는 가짜나 시뮬레이션). 실제 macOS가
+필요한 시험은 macOS에서만 실행된다.
+
+- `tests/unit/test_launchd.py` (launchd는 시뮬레이션)
+  - plist가 절대경로, 정해진 키, PATH·LANG을 갖고 0644로 써지는지, 같은
+    사용자에게 같은 바이트인지.
+  - GUI 세션이 없으면 RELOGIN_REQUIRED, 사용자가 끈 agent는 SKIPPED, bootstrap
+    거부 코드는 이유와 실행할 명령이 붙은 FAIL인지. `launchctl print`로 확인하지
+    못하면 PASS가 아닌지.
+  - 바뀌지 않은 plist의 repair는 bootout·bootstrap을 하지 않는지, 바뀐 plist는
+    내렸다 다시 불러오는지, tmux agent의 종료 코드 0·3·1을 구분하는지.
+- `tests/integration/test_tmux_launchd_scripts.py` (가짜 tmux와 별도 socket의
+  실제 tmux, bash 3.2와 dash)
+  - `tmux-launchd-start`가 있는 서버를 그대로 두는지, 복구 결과를
+    `@tmux-restore-status`와 로그에 남기는지, continuum이 건너뛴 복구를 손대지
+    않은 로그인 세션에서만 직접 하는지.
+  - `resurrect-autosave`의 로그 회전, 50초 제한, 75 처리, 저장 lock의 대체
+    경로(flock, lockf, python3)와 도구가 없을 때의 실패, 저장 중 중단 시
+    이전 저장본 유지.
+- `tests/unit/test_darwin_proc.py`, `tests/unit/test_resurrect_ai_session.py`:
+  macOS 프로세스 확인 경로(실제 libproc 시험은 macOS에서만).
+- `tests/macos/e2e.sh` (CI의 macOS runner): one-liner 설치, 두 agent와 plist
+  확인, 접속 없이 1분 저장, 설정 다시 불러오기 후 저장, kill-server 뒤
+  `launchctl kickstart -k`로 세션·작업 디렉터리·출력 기록 복구, 서버가 있을 때의
+  kickstart와 bootout·bootstrap에 같은 서버 유지, 바꿀 것이 없는 repair, `services
+  disable`·`enable`, `restore --baseline`.
+
+실제 Mac의 데스크톱 로그인과 재시동, 잠자기, 로그인 항목 토글, 로컬 네트워크와
+파일 및 폴더 알림은 이 시험들이 확인하지 않는다. CI runner의 결과도 출시 전
+점검일 뿐 실제 기기에서의 확인이 아니다(`docs/SUPPORT.md`).
