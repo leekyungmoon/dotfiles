@@ -634,6 +634,19 @@ class ToolTests(unittest.TestCase):
                 self.assertIn(fx.tools["tools"]["fzf"]["artifacts"][arch]["url"], fx.fetch.calls)
                 self.assertNotIn(fx.tools["tools"]["fzf"]["artifacts"][other]["url"], fx.fetch.calls)
 
+    def test_darwin_entries_never_change_the_linux_selection(self):
+        # tools.json also carries darwin-arm64/darwin-amd64 builds; Ubuntu
+        # keeps selecting by bare dpkg architecture and never fetches them.
+        for tool_id in ("node", "fzf"):
+            arts = self.fx.tools["tools"][tool_id]["artifacts"]
+            for key in ("darwin-arm64", "darwin-amd64"):
+                arts[key] = dict(arts["amd64"], url=f"{BASE}/darwin/{tool_id}-{key}.tar.gz")
+        self.fx.write_manifests()
+        result = self.fx.run(only=["node", "fzf"])
+        self.assertEqual(result["status"], "PASS", result["reasons"])
+        self.assertFalse([url for url in self.fx.fetch.calls if "/darwin/" in url])
+        self.assertNotIn("homebrew", result["details"])
+
     def test_missing_artifact_for_architecture_fails(self):
         result = self.fx.run(arch="arm64", only=["neovim"])
         self.assertEqual(result["status"], "FAIL")

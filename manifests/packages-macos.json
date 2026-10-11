@@ -1,0 +1,253 @@
+{
+  "schema": 1,
+  "description": "macOS Homebrew formula profile for the personal-dotfiles bootstrap; manifests/packages.json is the Ubuntu counterpart. Formulae are installed from Homebrew bottles by the user who owns the Homebrew prefix, never through sudo. Tools that must stay pinned (node, neovim, fzf, codex, claude-code, oh-my-codex) come from manifests/tools.json and must not be installed from Homebrew.",
+  "keys": {
+    "targets": "Supported macOS major release -> Homebrew bottle codename, per architecture. installer/platform.py holds the same lists (SUPPORTED_MACOS_RELEASES, MACOS_INTEL_RELEASES) and refuses anything else before any change.",
+    "homebrew": "How the installer finds and runs brew: the prefix per architecture, the read-only queries, the install command and the environment it passes. All of it runs as the installing user.",
+    "forbidden": "Regular expressions matched against the missing formulae and their whole runtime closure ('brew deps --union --full-name --formula <missing>'; a tap prefix is ignored). Any match is a hard failure before installing anything.",
+    "groups": "Ordered formula groups with the same ids as manifests/packages.json. default=true groups are part of the one-line install. Each formula names why the reviewed configuration needs it and the executables it provides; after installing, each one must exist in <prefix>/bin. satisfied_by replaces the 'brew list' check with an executable and a minimum version.",
+    "not_from_homebrew": "What the Ubuntu profile installs that macOS ships itself, that comes from elsewhere or that does not apply, and why.",
+    "release_notes": "Per-architecture differences that change behaviour, including known degraded features.",
+    "evidence": "Where and how this profile was last checked."
+  },
+  "targets": {
+    "arm64": {
+      "15": "sequoia",
+      "26": "tahoe",
+      "27": "golden_gate"
+    },
+    "amd64": {
+      "15": "sequoia",
+      "26": "tahoe"
+    }
+  },
+  "support": {
+    "arm64": "Apple silicon: Homebrew Tier 1 on macOS 15, 26 and 27. Every formula of the closure is bottled for arm64_sequoia, arm64_tahoe and arm64_golden_gate (see evidence).",
+    "amd64": "Intel: best effort. Homebrew supports Intel only at Tier 3 (no new bottles, formulae may build from source with the Command Line Tools), its official installer refuses Intel, and Intel Macs stop at macOS 26. The installer needs an existing Homebrew in /usr/local and warns before installing."
+  },
+  "homebrew": {
+    "prefixes": {
+      "arm64": "/opt/homebrew",
+      "amd64": "/usr/local"
+    },
+    "prefix_override": "An absolute HOMEBREW_PREFIX in the installer's environment replaces the default (installer/platform.homebrew_prefix). <prefix>/bin/brew must exist and be executable; the installer never installs Homebrew itself (the bootstrap offers that before install.py runs).",
+    "sudo": "Never. Homebrew refuses to run as root and must run as the user who owns the prefix; the packages phase refuses to run brew as root.",
+    "queries": [
+      "brew list --formula --versions <formulae>",
+      "brew deps --union --full-name --formula <missing>"
+    ],
+    "install_command": "brew install --formula <missing>",
+    "environment": {
+      "passed_through": "HOME, USER, LOGNAME, TMPDIR, every HOMEBREW_* variable (mirrors, API tokens, HOMEBREW_NO_AUTO_UPDATE) and the http(s)/ftp/all/no proxy variables in both spellings.",
+      "set": {
+        "HOMEBREW_NO_INSTALL_UPGRADE": "1",
+        "HOMEBREW_NO_INSTALL_CLEANUP": "1",
+        "HOMEBREW_NO_ENV_HINTS": "1",
+        "HOMEBREW_NO_ASK": "1",
+        "PATH": "<prefix>/bin:<prefix>/sbin:/usr/bin:/bin:/usr/sbin:/sbin",
+        "LANG": "en_US.UTF-8"
+      },
+      "reason": "Install only what is missing: never upgrade an installed formula (and through it unrelated dependents), never clean up old versions, never stop at a confirmation prompt. The closure is checked against the formula data brew has before installing; 'brew install' may auto-update that data first unless the user set HOMEBREW_NO_AUTO_UPDATE."
+    },
+    "on_failure": "A failed 'brew install' stops the phase with brew's error; run 'brew doctor', fix what it reports, then rerun. A formula that is installed but not linked into <prefix>/bin fails the phase with the 'brew link' command to run."
+  },
+  "forbidden": {
+    "patterns": [
+      "^(node|node@[0-9]+|nodejs|npm|corepack|yarn|pnpm|nvm)$",
+      "^(fzf|neovim)$",
+      "^(codex|claude-code|oh-my-codex)$",
+      "^(gcc|llvm|lld|binutils|make|cmake|rust|go)(@[0-9.]+)?$",
+      "^docker.*$",
+      "^(colima|lima|podman|containerd|runc|nerdctl)$",
+      "^ros-.*$",
+      "^(gh|glab)$",
+      "^pyenv.*$"
+    ],
+    "reason": "Homebrew's floating Node.js, fzf, neovim, codex and Claude Code builds would shadow the pinned, verified ones from manifests/tools.json. Container stacks, ROS, forge CLIs, compiler toolchains and nvm/pyenv are out of scope, as in manifests/packages.json."
+  },
+  "groups": [
+    {
+      "id": "shell-core",
+      "default": true,
+      "requires_graphical_session": false,
+      "packages": [
+        {
+          "name": "tmux",
+          "provides": [
+            "tmux"
+          ],
+          "reason": "tmux/tmux.conf, bin/tmux-attach, bin/tmux-smart-paste and the login LaunchAgent. macOS ships no tmux."
+        },
+        {
+          "name": "git",
+          "provides": [
+            "git"
+          ],
+          "reason": "Repository clone/update, antidote plugin clones, TPM, fzf-git.sh widgets. Without the Command Line Tools, /usr/bin/git is only a stub that asks to install them."
+        },
+        {
+          "name": "gnupg",
+          "provides": [
+            "gpgv"
+          ],
+          "reason": "gpgv for the detached-signature checks of Node.js SHASUMS256.txt and the Claude Code manifest (manifests/tools.json); signature checks stay fail-closed. macOS ships no OpenPGP tool and gnupg is the Homebrew formula that provides gpgv."
+        },
+        {
+          "name": "python3",
+          "provides": [
+            "python3"
+          ],
+          "satisfied_by": {
+            "executable": "python3",
+            "min_version": "3.10"
+          },
+          "reason": "Installer runtime and user Python. python3 is Homebrew's alias for its current default python@3.x (python@3.15 in October 2026), so no minor version is pinned: any <prefix>/bin/python3 of 3.10 or newer satisfies it, and the bootstrap installs it before install.py runs. 'brew list --versions python3' only answers for the formula the alias points to today, so an older python@3.x that provides python3 would look missing; hence satisfied_by. pip and venv are included."
+        },
+        {
+          "name": "ripgrep",
+          "provides": [
+            "rg"
+          ],
+          "reason": "zsh/zsh.d/envs.zsh FZF_CTRL_T_COMMAND, bin/rg.fzf, neovim fzf-lua grep."
+        },
+        {
+          "name": "fd",
+          "provides": [
+            "fd"
+          ],
+          "reason": "tmux prefix-@ file picker calls fd. Homebrew installs it as fd, so Ubuntu's fdfind shim does not apply."
+        },
+        {
+          "name": "tree",
+          "provides": [
+            "tree"
+          ],
+          "reason": "fzf Alt-C preview in zsh/zsh.d/envs.zsh."
+        }
+      ]
+    },
+    {
+      "id": "gui",
+      "default": true,
+      "requires_graphical_session": false,
+      "note": "No formulae: the Ubuntu gui group is GNOME/X11 only. The id stays so the default groups resolve on both systems; its tool, the nerd font, is skipped on macOS (manifests/tools.json nerd-font platforms.darwin).",
+      "packages": []
+    }
+  ],
+  "not_from_homebrew": {
+    "zsh": "/bin/zsh ships with macOS and is the default login shell since 10.15. A Homebrew zsh as login shell would need sudo to add it to /etc/shells.",
+    "curl, ca-certificates": "The bootstrap uses the system curl and trust store. Artifact downloads use Python's urllib; Homebrew python links Homebrew's openssl and ca-certificates.",
+    "xz-utils": "Python's lzma module extracts the .tar.xz artifacts (Homebrew python depends on xz); no xz executable is needed.",
+    "gpgv": "No Homebrew formula of that name; gnupg in shell-core provides it.",
+    "locales": "en_US.UTF-8 ships with macOS and there is no locale-gen, so the Ubuntu locale system step does not apply; zsh/zshenv's en_US.UTF-8 fallback works as is.",
+    "wl-clipboard, xclip": "macOS has /usr/bin/pbcopy and /usr/bin/pbpaste; bin/pbcopy and bin/pbpaste call them directly.",
+    "python3-pip, python3-venv, python-is-python3": "Part of Homebrew python3 (pip3 and the venv module). The unversioned python and pip names live in the formula's libexec/bin and are not linked; python3 and pip3 are.",
+    "python3-pynvim": "Not installed: Homebrew has no pynvim formula, Homebrew python is externally managed (PEP 668), and by the no-venv decision nothing is pip-installed. Neovim's python3 provider stays unavailable unless PYTHON3_HOST_PROG points at a virtualenv python that has pynvim (nvim/lua/config/pynvim.lua).",
+    "fd-find": "Homebrew's formula is fd and installs fd.",
+    "flock, coreutils": "Not needed: tmux/resurrect-save uses flock(1) when present and otherwise /usr/bin/lockf or Python's fcntl, and the clipboard helpers use the native pbcopy/pbpaste.",
+    "nodejs, fzf, neovim, codex, claude-code, oh-my-codex": "Pinned in manifests/tools.json with darwin-arm64/darwin-amd64 artifacts; Homebrew's floating versions are forbidden here.",
+    "xauth, libglib2.0-bin, dconf-cli, gnome-terminal, input-remapper, google-chrome-stable": "GNOME/X11 only; the GUI phase is skipped on macOS.",
+    "JetBrainsMono Nerd Font": "manifests/tools.json nerd-font is skipped on macOS: Core Text (Terminal, iTerm2, Ghostty) does not read fontconfig directories. Install it with 'brew install --cask font-jetbrains-mono-nerd-font'."
+  },
+  "release_notes": {
+    "arm64": {
+      "tmux": {
+        "version": "3.8",
+        "degraded": []
+      },
+      "python3": "Homebrew's default python (3.15 in October 2026). pip outside a venv is blocked by PEP 668, which matches the venv-only policy."
+    },
+    "amd64": {
+      "bottles": "No x86_64 macOS bottles for tmux, git, gnupg, python and openssl (checked 2026-10-11): 'brew install' builds them from source with the Command Line Tools, which can take an hour or more. The installer warns first.",
+      "tools": "Every pinned tool in manifests/tools.json has a darwin-amd64 build; none needs a compiler."
+    }
+  },
+  "evidence": {
+    "date": "2026-10-11",
+    "method": "Offline closure check against the formulae.brew.sh JSON API (read-only, no Mac and no brew involved): the runtime dependencies of the default groups (required and recommended, with each bottle tag's variations applied, as 'brew deps' resolves them), python3 resolved through Homebrew's alias, matched against the forbidden patterns and checked for a bottle per tag. An older macOS bottle counts, because Homebrew pours it on newer releases.",
+    "aliases": {
+      "python3": "python@3.15"
+    },
+    "root_versions": {
+      "fd": "10.5.0",
+      "git": "2.56.0",
+      "gnupg": "2.5.24",
+      "python@3.15": "3.15.0",
+      "ripgrep": "15.2.0",
+      "tmux": "3.8",
+      "tree": "2.3.2"
+    },
+    "closure_count": {
+      "arm64_sequoia": 36,
+      "arm64_tahoe": 36,
+      "arm64_golden_gate": 36,
+      "sequoia": 36,
+      "tahoe": 36
+    },
+    "closure": [
+      "ca-certificates",
+      "fd",
+      "gettext",
+      "git",
+      "gmp",
+      "gnupg",
+      "gnutls",
+      "jemalloc",
+      "json-c",
+      "libassuan",
+      "libevent",
+      "libgcrypt",
+      "libgpg-error",
+      "libidn2",
+      "libksba",
+      "libtasn1",
+      "libunistring",
+      "libusb",
+      "lz4",
+      "mpdecimal",
+      "ncurses",
+      "nettle",
+      "npth",
+      "openssl@4",
+      "p11-kit",
+      "pcre2",
+      "pinentry",
+      "python@3.15",
+      "readline",
+      "ripgrep",
+      "sqlite",
+      "tmux",
+      "tree",
+      "utf8proc",
+      "xz",
+      "zstd"
+    ],
+    "forbidden_hits": [],
+    "without_bottle": {
+      "arm64_sequoia, arm64_tahoe, arm64_golden_gate": [],
+      "sequoia, tahoe (x86_64)": [
+        "gettext",
+        "git",
+        "gmp",
+        "gnupg",
+        "jemalloc",
+        "json-c",
+        "libevent",
+        "libgcrypt",
+        "libunistring",
+        "lz4",
+        "mpdecimal",
+        "openssl@4",
+        "p11-kit",
+        "pcre2",
+        "python@3.15",
+        "readline",
+        "sqlite",
+        "tmux",
+        "utf8proc",
+        "xz"
+      ]
+    },
+    "not_proven": "Installation, linking and execution on a Mac. macOS stays live-pending until 'install.py packages --dry-run' and a real run pass on an Apple silicon Mac."
+  }
+}

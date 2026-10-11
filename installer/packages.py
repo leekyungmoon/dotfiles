@@ -6,6 +6,13 @@ is installed, the exact install is simulated with ``apt-get --simulate`` and
 the whole resolved closure is checked against the manifest's forbidden
 patterns; a match aborts before any package changes.
 
+On macOS the system phase is Homebrew instead (``manifests/packages-macos.json``).
+brew runs as the installing user and never through sudo. The runtime closure of
+the missing formulae (``brew deps``) is checked against the forbidden patterns
+before anything is installed, and afterwards every formula's executables must
+be linked into the Homebrew prefix. Like apt, it is not recorded by the
+transaction.
+
 Tool artifacts from ``manifests/tools.json`` are downloaded to a private
 temporary directory, verified (digest, checksum file, and signature where the
 publisher signs), extracted into a versioned prefix under the installer-owned
@@ -21,12 +28,15 @@ lifecycle script runs; what a reviewed postinstall would have fetched is
 fetched here from pinned, verified inputs instead.
 
 No Python virtualenv is created: python3, pip, python-is-python3 and pynvim
-come from apt (user decision), so there is nothing to pin with pip here.
+come from apt (user decision), so there is nothing to pin with pip here. On
+macOS python3 comes from Homebrew and pynvim is not installed at all: Homebrew
+has no pynvim formula and its python is externally managed (PEP 668).
 """
 
 from __future__ import annotations
 
 import hashlib
+import importlib
 import json
 import os
 import re
@@ -36,11 +46,11 @@ import sys
 import tarfile
 import tempfile
 from pathlib import Path
-from typing import Callable, Iterable
+from typing import Callable, Iterable, Mapping
 
 from installer import downloads
 from installer.downloads import DownloadError, VerificationError
-from installer.platform import PlatformError, require_supported_platform
+from installer.platform import PlatformError, homebrew_prefix, require_supported_platform
 
 PHASE = "packages"
 PASS = "PASS"
@@ -64,6 +74,13 @@ PIP_TIMEOUT = 900.0
 
 DEFAULT_GROUPS = ("shell-core", "gui")
 SYSTEM_PATH = "/usr/bin:/bin"
+# macOS: the system directories of launchd's and the login shell's default
+# PATH, sbin included (/usr/sbin/sysctl lives there).
+DARWIN_SYSTEM_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
+
+# The system package profile per platform; tools.json is shared.
+PACKAGES_MANIFEST = "packages.json"
+PACKAGES_MACOS_MANIFEST = "packages-macos.json"
 
 FetchFn = Callable[..., object]
 
@@ -74,9 +91,16 @@ class PackagesError(Exception):
 
 # --- manifests and placeholders -----------------------------------------------
 
-def load_manifests(manifest_dir: Path | None = None) -> tuple[dict, dict]:
+def package_manifest_name(platform=None) -> str:
+    """The system package profile for ``platform``: the Homebrew formulae on
+    macOS, the apt packages otherwise (and when no platform is given)."""
+
+    return PACKAGES_MACOS_MANIFEST if getattr(platform, "is_darwin", False) else PACKAGES_MANIFEST
+
+
+def load_manifests(manifest_dir: Path | None = None, platform=None) -> tuple[dict, dict]:
     root = Path(manifest_dir) if manifest_dir is not None else MANIFEST_DIR
-    packages = json.loads((root / "packages.json").read_text(encoding="utf-8"))
+    packages = json.loads((root / package_manifest_name(platform)).read_text(encoding="utf-8"))
     tools = json.loads((root / "tools.json").read_text(encoding="utf-8"))
     return packages, tools
 
@@ -95,13 +119,15 @@ def expand(value: str, mapping: dict[str, str]) -> str:
 
 
 class _Ctx:
-    def __init__(self, target, platform, runner, fetch, dry_run, tools_manifest, log):
+    def __init__(self, target, platform, runner, fetch, dry_run, tools_manifest, log,
+                 environ: Mapping[str, str] | None = None):
         self.target = target
         self.platform = platform
         self.runner = runner
         self.fetch = fetch
         self.dry_run = dry_run
         self.log = log
+        self.environ = os.environ if environ is None else environ
         self.base = {
             "home": str(target.home),
             "data_home": str(target.data_home),
@@ -112,6 +138,16 @@ class _Ctx:
         self.bin_dir = Path(expand(tools_manifest["bin_dir"], self.base))
         self.base.update(prefix_root=str(self.prefix_root), bin_dir=str(self.bin_dir))
         self.work_root = target.cache_home / "personal-dotfiles" / "downloads"
+        # macOS: the Homebrew prefix (None elsewhere), and the directories a
+        # bare command name is resolved in before it runs. The installer's
+        # own PATH is not used for that: right after Homebrew was installed
+        # it often lacks <prefix>/bin, and a name found there would not be
+        # found again by a child whose PATH is set by env() below.
+        self.brew_prefix = homebrew_prefix(platform, self.environ)
+        self.system_path = DARWIN_SYSTEM_PATH if platform.is_darwin else SYSTEM_PATH
+        self.lang = "en_US.UTF-8" if platform.is_darwin else "C.UTF-8"
+        self.tool_path = (f"{self.bin_dir}:{self.brew_prefix}/bin:{self.brew_prefix}/sbin:"
+                          f"{DARWIN_SYSTEM_PATH}" if self.brew_prefix is not None else None)
 
     def env(self, path: str | None = None, **extra: str) -> dict[str, str]:
         t = self.target
@@ -119,8 +155,10 @@ class _Ctx:
             "HOME": str(t.home),
             "USER": t.username,
             "LOGNAME": t.username,
-            "PATH": path or f"{self.bin_dir}:{SYSTEM_PATH}",
-            "LANG": "C.UTF-8",
+            "PATH": path or f"{self.bin_dir}:{self.system_path}",
+            # macOS spells its UTF-8 locale en_US.UTF-8; C.UTF-8 is not
+            # there on every release.
+            "LANG": self.lang,
             "XDG_DATA_HOME": str(t.data_home),
             "XDG_STATE_HOME": str(t.state_home),
             "XDG_CONFIG_HOME": str(t.config_home),
@@ -471,6 +509,241 @@ def shim_step(ctx: _Ctx, manifest: dict, groups: list[str]) -> dict:
     return results
 
 
+# --- Homebrew (macOS) ----------------------------------------------------------
+
+# brew gets a fresh environment: the target's identity, the user's own
+# Homebrew settings (mirrors, API tokens, HOMEBREW_NO_AUTO_UPDATE) and proxies,
+# then the settings below. Anything else the installer inherited (LC_ALL, a
+# PATH with other toolchains) could change what brew builds or links.
+BREW_PROXY_VARIABLES = ("http_proxy", "https_proxy", "ftp_proxy", "all_proxy", "no_proxy",
+                        "HTTP_PROXY", "HTTPS_PROXY", "FTP_PROXY", "ALL_PROXY", "NO_PROXY")
+BREW_SETTINGS = {
+    # Install what is missing, nothing more: an installed but outdated
+    # formula is not upgraded (and does not drag its dependents along).
+    "HOMEBREW_NO_INSTALL_UPGRADE": "1",
+    # Older versions the user may still run are never deleted.
+    "HOMEBREW_NO_INSTALL_CLEANUP": "1",
+    "HOMEBREW_NO_ENV_HINTS": "1",
+    # Ask mode is brew's default; it skips its prompt without a terminal,
+    # but a prompt must never be what the install waits on.
+    "HOMEBREW_NO_ASK": "1",
+}
+BREW_LANG = "en_US.UTF-8"
+_VERSION = re.compile(r"(\d+)\.(\d+)")
+
+
+def brew_env(ctx: _Ctx) -> dict[str, str]:
+    prefix = ctx.brew_prefix
+    t = ctx.target
+    env = {"HOME": str(t.home), "USER": t.username, "LOGNAME": t.username}
+    for key, value in ctx.environ.items():
+        if key.startswith("HOMEBREW_") or key in BREW_PROXY_VARIABLES or key == "TMPDIR":
+            env[key] = value
+    env.update(BREW_SETTINGS)
+    env["PATH"] = f"{prefix}/bin:{prefix}/sbin:{DARWIN_SYSTEM_PATH}"
+    env["LANG"] = BREW_LANG
+    return env
+
+
+def query_formulae(ctx: _Ctx, brew: Path, names: Iterable[str], env: dict) -> dict[str, str]:
+    """Installed formulae among ``names`` -> their installed versions.
+
+    'brew list --versions' exits 1 when some are not installed, which is the
+    point of asking. It prints the rack (canonical) name, so an alias would
+    not come back under the name asked for; aliases use satisfied_by.
+    """
+
+    names = list(names)
+    if not names:
+        return {}
+    completed = _run(ctx, [brew, "list", "--formula", "--versions", *names],
+                     timeout=APT_SIMULATE_TIMEOUT, read_only=True, env=env)
+    installed: dict[str, str] = {}
+    for line in _out(completed).splitlines():
+        parts = line.split()
+        if len(parts) >= 2:
+            installed[parts[0]] = " ".join(parts[1:])
+    return installed
+
+
+def _version_tuple(text: str) -> tuple[int, int] | None:
+    match = _VERSION.search(text)
+    return (int(match.group(1)), int(match.group(2))) if match else None
+
+
+def _executable_version(ctx: _Ctx, path: Path, env: dict) -> tuple[int, int] | None:
+    if not (path.is_file() and os.access(path, os.X_OK)):
+        return None
+    try:
+        completed = _run(ctx, [path, "--version"], timeout=QUERY_TIMEOUT, read_only=True, env=env)
+    except PackagesError:
+        return None
+    if completed.returncode != 0:
+        return None
+    return _version_tuple(_out(completed)) or _version_tuple(_err_tail(completed))
+
+
+def _brew_installed(ctx: _Ctx, brew: Path, packages: list[dict],
+                    env: dict) -> tuple[dict[str, str], dict[str, str]]:
+    """(present, problems): name -> installed version for what is there,
+    name -> what is wrong for what is not."""
+
+    prefix = ctx.brew_prefix
+    versions = query_formulae(ctx, brew, [p["name"] for p in packages if not p.get("satisfied_by")],
+                              env)
+    present: dict[str, str] = {}
+    problems: dict[str, str] = {}
+    for pkg in packages:
+        name, rule = pkg["name"], pkg.get("satisfied_by")
+        if not rule:
+            if name in versions:
+                present[name] = versions[name]
+            else:
+                problems[name] = "not installed"
+            continue
+        # e.g. python3: Homebrew's alias for whichever python@3.x is its
+        # default today. Any linked python3 new enough is what is needed,
+        # whichever formula provides it.
+        minimum = _version_tuple(str(rule.get("min_version", "")))
+        if minimum is None:
+            raise PackagesError(f"{name}: satisfied_by.min_version must look like 3.10")
+        path = prefix / "bin" / rule["executable"]
+        found = _executable_version(ctx, path, env)
+        if found is None:
+            problems[name] = f"{path} is missing"
+        elif found < minimum:
+            problems[name] = f"{path} is {found[0]}.{found[1]}, older than {rule['min_version']}"
+        else:
+            present[name] = f"{rule['executable']} {found[0]}.{found[1]}"
+    return present, problems
+
+
+def _unlinked(prefix: Path, packages: list[dict]) -> list[tuple[str, str]]:
+    """(formula, executable) pairs whose executable is not in <prefix>/bin.
+
+    A formula can be installed but not linked (a link conflict with a file
+    already in <prefix>/bin), and it then still shows up in 'brew list'.
+    """
+
+    missing = []
+    for pkg in packages:
+        for exe in pkg.get("provides", []):
+            path = prefix / "bin" / exe
+            if not (path.is_file() and os.access(path, os.X_OK)):
+                missing.append((pkg["name"], exe))
+    return missing
+
+
+def _unlinked_reason(prefix: Path, unlinked: list[tuple[str, str]]) -> str:
+    formulae = sorted({name for name, _ in unlinked})
+    pairs = ", ".join(f"{name} ({exe})" for name, exe in unlinked)
+    return (f"homebrew: installed but not linked into {prefix}/bin: {pairs}; run "
+            f"'brew link {' '.join(formulae)}' (or 'brew doctor' to see what blocks it), then rerun")
+
+
+def brew_step(ctx: _Ctx, manifest: dict, groups: list[str]) -> dict:
+    """Return {"status", "reasons", ...details} for the Homebrew part (macOS)."""
+
+    packages: list[dict] = []
+    for group in manifest["groups"]:
+        if group["id"] in groups:
+            for pkg in group["packages"]:
+                if pkg["name"] not in [p["name"] for p in packages]:
+                    packages.append(pkg)
+    wanted = [p["name"] for p in packages]
+    prefix = ctx.brew_prefix
+    brew = prefix / "bin" / "brew"
+    info: dict = {
+        "transactional": False,
+        "note": "System phase through Homebrew as the installing user, never sudo; not "
+                "recorded by the dotfiles transaction and not undone by restore.",
+        "groups": groups,
+        "requested": wanted,
+        "prefix": str(prefix),
+    }
+    if not wanted:
+        info.update(status=PASS, reasons=[], versions={}, executables={})
+        return info
+    warnings: list[str] = []
+    if ctx.platform.best_effort:
+        warnings.append("homebrew: Intel Mac: Homebrew supports Intel only at Tier 3 (no new "
+                        "bottles), so formulae may build from source and take long")
+    if os.geteuid() == 0:
+        info.update(status=FAIL, reasons=[f"homebrew: refusing to run brew as root; run the "
+                                          f"installer as the user who owns {prefix}"])
+        return info
+    if not (brew.is_file() and os.access(brew, os.X_OK)):
+        how = ("install Homebrew (https://brew.sh)" if not ctx.platform.best_effort else
+               "install Homebrew in /usr/local (its official installer refuses Intel Macs)")
+        info.update(status=FAIL, reasons=[f"homebrew: {brew} not found; {how} as the user who "
+                                          f"will own {prefix}, then rerun"])
+        return info
+    info["brew"] = str(brew)
+    env = brew_env(ctx)
+    reasons: list[str] = []
+    present, problems = _brew_installed(ctx, brew, packages, env)
+    missing = [n for n in wanted if n not in present]
+    info["already_installed"] = {n: present[n] for n in wanted if n in present}
+    info["missing"] = missing
+    closure: list[str] = []
+    if missing:
+        # The runtime dependencies of the missing formulae, plus the formulae
+        # themselves. No --missing: a forbidden dependency that happens to be
+        # installed already is still something the profile would depend on.
+        deps = _run(ctx, [brew, "deps", "--union", "--full-name", "--formula", *missing],
+                    timeout=APT_SIMULATE_TIMEOUT, read_only=True, env=env)
+        if deps.returncode != 0:
+            reasons.append(f"homebrew: brew deps failed: {_err_tail(deps)}")
+            info.update(status=FAIL, reasons=reasons + warnings)
+            return info
+        closure = sorted(set(missing) | {line.strip() for line in _out(deps).splitlines()
+                                         if line.strip()})
+        # --full-name spells a tap formula owner/tap/name; match its name too.
+        patterns = manifest["forbidden"]["patterns"]
+        hits = [n for n in closure if forbidden_matches([n, n.rsplit("/", 1)[-1]], patterns)]
+        info["closure"] = {"count": len(closure), "formulae": closure, "forbidden": hits}
+        if hits:
+            reasons.append(f"homebrew: forbidden formulae in the closure: {', '.join(hits)}"
+                           + ("" if ctx.dry_run else "; nothing was installed"))
+            info.update(status=FAIL, reasons=reasons + warnings)
+            return info
+
+    if ctx.dry_run:
+        info["plan"] = [" ".join([str(brew), "install", "--formula", *missing])] if missing else []
+        unlinked = _unlinked(prefix, [p for p in packages if p["name"] in present])
+        if unlinked:
+            reasons.append(_unlinked_reason(prefix, unlinked))
+        info.update(status=FAIL if reasons else SKIPPED,
+                    reasons=(reasons + warnings) or ["dry-run: plan only"])
+        return info
+
+    if missing:
+        for warning in warnings:
+            ctx.log(f"packages: {warning}")
+        ctx.log(f"packages: brew install --formula {' '.join(missing)} "
+                f"({len(closure)} formulae with dependencies)")
+        done = _run(ctx, [brew, "install", "--formula", *missing], timeout=APT_INSTALL_TIMEOUT,
+                    env=env)
+        if done.returncode != 0:
+            raise PackagesError(f"brew install failed: {_err_tail(done)}; run 'brew doctor', "
+                                "fix what it reports, then rerun")
+        present, problems = _brew_installed(ctx, brew, packages, env)
+    still = [n for n in wanted if n not in present]
+    if still:
+        reasons.append("homebrew: still missing after 'brew install': "
+                       + "; ".join(f"{n} ({problems.get(n, 'not installed')})" for n in still)
+                       + "; run 'brew doctor', fix what it reports, then rerun")
+    unlinked = _unlinked(prefix, [p for p in packages if p["name"] in present])
+    if unlinked:
+        reasons.append(_unlinked_reason(prefix, unlinked))
+    info["versions"] = {n: present[n] for n in wanted if n in present}
+    info["executables"] = {exe: str(prefix / "bin" / exe) for p in packages
+                           for exe in p.get("provides", [])
+                           if (prefix / "bin" / exe).is_file()}
+    info.update(status=FAIL if reasons else PASS, reasons=reasons + warnings)
+    return info
+
+
 # --- tool installation -------------------------------------------------------
 
 def switch_link(link: Path, target: Path) -> bool:
@@ -616,13 +889,33 @@ def check_integrity(ctx: _Ctx, spec: dict, artifact: dict, work: Path) -> str:
 
 def _verify_signature(ctx: _Ctx, integrity: dict, signature_url: str, data: Path, work: Path) -> str:
     fingerprints = integrity["signer_fingerprints"]
+    gpgv = None
+    if ctx.platform.is_darwin:
+        # macOS ships no gpgv; Homebrew's gnupg provides it, in a prefix the
+        # installer's own PATH may not contain yet. Checked before the key
+        # and signature are fetched. Still fail-closed: no gpgv, no install.
+        gpgv = shutil.which("gpgv", path=ctx.tool_path)
+        if gpgv is None:
+            raise VerificationError("gpgv not found: brew install gnupg, then rerun")
     key = ctx.download(integrity["signer_key_url"], work / "signer-key.asc")
     keyring = downloads.write_keyring(work / "signer.gpg", key.read_bytes(), fingerprints)
     sig = ctx.download(signature_url, work / (data.name + ".sig"))
-    gpgv = ctx.runner.which("gpgv")
     if gpgv is None:
-        raise VerificationError("gpgv is not installed; cannot verify the signature")
+        gpgv = ctx.runner.which("gpgv")
+        if gpgv is None:
+            raise VerificationError("gpgv is not installed; cannot verify the signature")
     return downloads.verify_detached(ctx.runner, keyring, sig, data, fingerprints, gpgv=gpgv)
+
+
+def _darwin_which(ctx: _Ctx, name: str, what: str) -> str:
+    """macOS: the absolute path of the command ``name``, looked up in the
+    installer bin directory, the Homebrew prefix and the system directories,
+    so that the child runs exactly what was checked."""
+
+    found = shutil.which(name, path=ctx.tool_path)
+    if found is None:
+        raise PackagesError(f"{what}: {name} is not installed (looked in {ctx.tool_path})")
+    return found
 
 
 def _verify_commands(ctx: _Ctx, spec: dict, mapping: dict[str, str], *, substitute: dict[str, Path],
@@ -632,6 +925,8 @@ def _verify_commands(ctx: _Ctx, spec: dict, mapping: dict[str, str], *, substitu
         argv = [expand(a, mapping) for a in check["argv"]]
         if argv[0] in substitute:
             argv[0] = str(substitute[argv[0]])
+        if ctx.platform.is_darwin and "/" not in argv[0]:
+            argv[0] = _darwin_which(ctx, argv[0], f"verify {' '.join(check['argv'])}")
         completed = _run(ctx, argv, timeout=VERIFY_TIMEOUT, read_only=True, env=env)
         text = _out(completed).strip()
         if completed.returncode != 0 or not re.search(check["stdout"], text, re.M):
@@ -641,12 +936,44 @@ def _verify_commands(ctx: _Ctx, spec: dict, mapping: dict[str, str], *, substitu
     return outputs
 
 
-def _select_artifact(spec: dict, architecture: str) -> dict:
+def _select_artifact(spec: dict, key: str) -> dict:
+    """The artifact for ``key`` (Platform.artifact_key: the bare dpkg
+    architecture on Linux, darwin-<arch> on macOS) or the 'any' one. A
+    macOS lookup never falls back to a Linux build: those would pass every
+    digest check and fail only when executed."""
+
     artifacts = spec["artifacts"]
-    artifact = artifacts.get(architecture) or artifacts.get("any")
+    artifact = artifacts.get(key) or artifacts.get("any")
     if artifact is None:
-        raise PackagesError(f"no artifact for architecture {architecture!r}")
+        raise PackagesError(f"no artifact for architecture {key!r}")
     return artifact
+
+
+def _platform_skip(spec: dict, platform) -> dict | None:
+    """macOS: the tool's ``platforms.darwin`` entry when it says skip."""
+
+    if not platform.is_darwin:
+        return None
+    entry = (spec.get("platforms") or {}).get(platform.system)
+    return entry if isinstance(entry, dict) and entry.get("skip") else None
+
+
+def _lzma_available() -> bool:
+    try:
+        importlib.import_module("lzma")  # needs the _lzma extension, not just lzma.py
+    except ImportError:
+        return False
+    return True
+
+
+def _require_archive_support(ctx: _Ctx, tool_id: str, kind: str | None) -> None:
+    """macOS: a Python built without lzma (pyenv or a source build without
+    xz) cannot open .tar.xz; say so before anything is downloaded."""
+
+    if ctx.platform.is_darwin and kind == "tar.xz" and not _lzma_available():
+        raise PackagesError(f"{tool_id}: {sys.executable} has no lzma module and cannot extract "
+                            ".tar.xz archives; run the installer with Homebrew's python3 "
+                            "('brew install python3'), then rerun")
 
 
 def _mapping(ctx: _Ctx, spec: dict, artifact: dict) -> dict[str, str]:
@@ -658,13 +985,15 @@ def _mapping(ctx: _Ctx, spec: dict, artifact: dict) -> dict[str, str]:
 
 
 def install_extract(ctx: _Ctx, tool_id: str, spec: dict) -> dict:
-    artifact = _select_artifact(spec, ctx.platform.architecture)
+    artifact = _select_artifact(spec, ctx.platform.artifact_key)
     mapping = _mapping(ctx, spec, artifact)
     prefix = Path(mapping["prefix"])
     links = {name: prefix / rel for name, rel in spec.get("links", {}).items()}
     result = {"version": spec["version"], "prefix": str(prefix), "url": artifact["url"]}
     fresh = not _marker_valid(prefix, tool_id, spec["version"], artifact["sha256"])
     result["downloaded"] = fresh and not ctx.dry_run
+    if fresh:
+        _require_archive_support(ctx, tool_id, artifact.get("archive"))
     if ctx.dry_run:
         result.update(status=SKIPPED, plan="download+verify+extract" if fresh else "present (verified marker)")
         return result
@@ -706,13 +1035,15 @@ def install_extract(ctx: _Ctx, tool_id: str, spec: dict) -> dict:
     post = spec.get("install", {}).get("post")
     if post:
         argv = [expand(a, mapping) for a in post]
-        if ctx.runner.which(argv[0]) is None:
+        if ctx.platform.is_darwin:
+            argv[0] = _darwin_which(ctx, argv[0], tool_id)
+        elif ctx.runner.which(argv[0]) is None:
             raise PackagesError(f"{tool_id}: {argv[0]} is not installed")
         done = _run(ctx, argv, timeout=VERIFY_TIMEOUT, env=ctx.env())
         if done.returncode != 0:
             raise PackagesError(f"{tool_id}: {' '.join(argv)} failed: {_err_tail(done)}")
     substitute = {str(ctx.bin_dir / name): path for name, path in links.items()}
-    env = ctx.env(path=f"{prefix / 'bin'}:{ctx.bin_dir}:{SYSTEM_PATH}")
+    env = ctx.env(path=f"{prefix / 'bin'}:{ctx.bin_dir}:{ctx.system_path}")
     try:
         result["verify"] = _verify_commands(ctx, spec, mapping, substitute=substitute, env=env)
     except PackagesError:
@@ -806,15 +1137,19 @@ def install_native_runtime(ctx: _Ctx, tool_id: str, spec: dict, mapping: dict[st
     """
 
     native = spec["native_runtime"]
-    art = native["artifacts"].get(ctx.platform.architecture)
+    # No 'any' fallback: the runtime is a native binary for exactly one
+    # platform (on macOS its platform_key has no libc suffix).
+    art = native["artifacts"].get(ctx.platform.artifact_key)
     if art is None:
-        raise PackagesError(f"{tool_id}: no {native['product']} artifact for {ctx.platform.architecture!r}")
+        raise PackagesError(f"{tool_id}: no {native['product']} artifact for {ctx.platform.artifact_key!r}")
     binary = Path(expand(native["cache_path"], dict(mapping, platform_key=art["platform_key"])))
     sidecar = binary.with_name(binary.name + ".sha256")
     digest = art["binary_sha256"].lower()
     result = {"product": native["product"], "path": str(binary), "url": art["url"]}
     present = _native_ok(binary, sidecar, digest)
     result["downloaded"] = not present and not ctx.dry_run
+    if not present:
+        _require_archive_support(ctx, tool_id, art.get("archive"))
     if ctx.dry_run:
         result["plan"] = "present (sha256 verified)" if present else "download+verify+publish"
         return result
@@ -847,14 +1182,14 @@ def install_native_runtime(ctx: _Ctx, tool_id: str, spec: dict, mapping: dict[st
         if not _native_ok(binary, sidecar, digest):
             raise VerificationError(f"{tool_id}: {binary} does not match the pinned sha256")
     result["verify"] = _verify_commands(ctx, native, dict(mapping, native=str(binary)), substitute={},
-                                        env=ctx.env(path=SYSTEM_PATH))
+                                        env=ctx.env(path=ctx.system_path))
     return result
 
 
 def install_npm(ctx: _Ctx, tool_id: str, spec: dict, tools: dict) -> dict:
     """npm ci --ignore-scripts into the versioned prefix from the embedded lock."""
 
-    artifact = _select_artifact(spec, ctx.platform.architecture)
+    artifact = _select_artifact(spec, ctx.platform.artifact_key)
     mapping = _mapping(ctx, spec, artifact)
     install = spec["install"]
     prefix = Path(mapping["prefix"])
@@ -874,7 +1209,7 @@ def install_npm(ctx: _Ctx, tool_id: str, spec: dict, tools: dict) -> dict:
     npm_link = ctx.bin_dir / "npm"
     if not os.path.exists(npm_link):
         raise PackagesError(f"{tool_id}: requires the pinned node/npm in {ctx.bin_dir}")
-    npm_env = ctx.env(path=f"{ctx.bin_dir}:{SYSTEM_PATH}")
+    npm_env = ctx.env(path=f"{ctx.bin_dir}:{ctx.system_path}")
     for key, value in install.get("env", {}).items():
         npm_env[key] = value
     npm_env["npm_config_cache"] = str(ctx.target.cache_home / "personal-dotfiles" / "npm")
@@ -909,7 +1244,7 @@ def install_npm(ctx: _Ctx, tool_id: str, spec: dict, tools: dict) -> dict:
     substitute = {str(ctx.bin_dir / name): path for name, path in links.items()}
     try:
         result["verify"] = _verify_commands(ctx, spec, mapping, substitute=substitute,
-                                            env=ctx.env(path=f"{ctx.bin_dir}:{SYSTEM_PATH}"))
+                                            env=ctx.env(path=f"{ctx.bin_dir}:{ctx.system_path}"))
     except PackagesError:
         if fresh:
             _remove_tree(prefix)
@@ -934,7 +1269,7 @@ def _claude_file_ok(path: Path, artifact: dict) -> bool:
 
 
 def install_claude(ctx: _Ctx, tool_id: str, spec: dict) -> dict:
-    artifact = _select_artifact(spec, ctx.platform.architecture)
+    artifact = _select_artifact(spec, ctx.platform.artifact_key)
     mapping = _mapping(ctx, spec, artifact)
     layout = spec["vendor_layout"]
     binary = Path(expand(layout["binary"], mapping))
@@ -974,7 +1309,8 @@ def install_claude(ctx: _Ctx, tool_id: str, spec: dict) -> dict:
             argv = [expand(a, dict(mapping, download=str(downloaded))) for a in spec["install"]["argv"]]
             ctx.log(f"packages: {Path(argv[0]).name} install {spec['version']}")
             done = _run(ctx, argv, timeout=VENDOR_INSTALL_TIMEOUT,
-                        env=ctx.env(path=f"{launcher.parent}:{ctx.bin_dir}:{SYSTEM_PATH}"), cwd=work)
+                        env=ctx.env(path=f"{launcher.parent}:{ctx.bin_dir}:{ctx.system_path}"),
+                        cwd=work)
             if done.returncode != 0:
                 raise PackagesError(f"claude-code: vendor install failed: {_err_tail(done)}")
         if not _claude_file_ok(binary, artifact):
@@ -990,7 +1326,7 @@ def install_claude(ctx: _Ctx, tool_id: str, spec: dict) -> dict:
             raise PackagesError(f"claude-code: {launcher} resolves to {target}, not {binary}")
     substitute = {} if target == binary.resolve() else {str(launcher): binary}
     result["verify"] = _verify_commands(ctx, spec, mapping, substitute=substitute,
-                                        env=ctx.env(path=f"{launcher.parent}:{SYSTEM_PATH}"))
+                                        env=ctx.env(path=f"{launcher.parent}:{ctx.system_path}"))
     result["status"] = PASS
     return result
 
@@ -1080,7 +1416,14 @@ def run_packages_phase(
     exclude: Iterable[str] | None = None,
     manifest_dir: Path | None = None,
     log: Callable[[str], None] | None = None,
+    env: Mapping[str, str] | None = None,
 ) -> dict:
+    """Install the system packages and the pinned tools for ``platform``.
+
+    ``env`` is the installer's environment (default ``os.environ``). It is
+    read on macOS only: HOMEBREW_PREFIX and the variables passed to brew.
+    """
+
     log = log or _default_log
     reasons: list[str] = []
     details: dict = {"dry_run": dry_run}
@@ -1089,16 +1432,27 @@ def run_packages_phase(
     except PlatformError as exc:
         return {"phase": PHASE, "status": FAIL, "reasons": [str(exc)], "details": details}
     try:
-        pkg_manifest, tools_manifest = load_manifests(manifest_dir)
+        pkg_manifest, tools_manifest = load_manifests(manifest_dir, platform)
         sel_groups, sel_tools = _select(pkg_manifest, tools_manifest, groups, only, exclude)
     except (OSError, ValueError, KeyError, PackagesError) as exc:
         return {"phase": PHASE, "status": FAIL, "reasons": [f"manifests: {exc}"], "details": details}
-    ctx = _Ctx(target, platform, runner, fetch or downloads.fetch, dry_run, tools_manifest, log)
+    ctx = _Ctx(target, platform, runner, fetch or downloads.fetch, dry_run, tools_manifest, log,
+               environ=env)
     details.update(groups=sel_groups, tools_selected=sel_tools, bin_dir=str(ctx.bin_dir))
     statuses: list[str] = []
 
-    # 1. apt (system, non-transactional)
-    if sel_groups:
+    # 1. system packages (non-transactional): Homebrew on macOS, else apt.
+    # macOS has no shims: Homebrew's fd is called fd.
+    if sel_groups and platform.is_darwin:
+        try:
+            brew = brew_step(ctx, pkg_manifest, sel_groups)
+        except (PackagesError, DownloadError, VerificationError, OSError) as exc:
+            brew = {"status": FAIL, "reasons": [f"homebrew: {exc}"], "transactional": False}
+        details["homebrew"] = brew
+        statuses.append(brew["status"])
+        reasons.extend(brew.get("reasons", []) if brew["status"] == FAIL else
+                       [r for r in brew.get("reasons", []) if r != "dry-run: plan only"])
+    elif sel_groups:
         try:
             apt = apt_step(ctx, pkg_manifest, sel_groups)
         except (PackagesError, DownloadError, VerificationError, OSError) as exc:
@@ -1115,10 +1469,21 @@ def run_packages_phase(
 
     # 2-3. pinned tools
     tool_results: dict[str, dict] = {}
+    not_here: set[str] = set()
     for tool_id in sel_tools:
         spec = tools_manifest["tools"][tool_id]
         dep = spec.get("install", {}).get("requires_tool")
-        if dep and tool_results.get(dep, {}).get("status") == FAIL:
+        skip = _platform_skip(spec, platform)
+        if skip is not None:
+            # e.g. the nerd font on macOS: reported with what to do instead,
+            # not a failure.
+            not_here.add(tool_id)
+            tool_results[tool_id] = {"status": SKIPPED, "version": spec.get("version"),
+                                     "reason": skip.get("reason", "not installed on this system"),
+                                     "hint": skip.get("hint")}
+            reasons.append(f"{tool_id}: not installed on macOS"
+                           + (f"; install it with '{skip['hint']}'" if skip.get("hint") else ""))
+        elif dep and tool_results.get(dep, {}).get("status") == FAIL:
             tool_results[tool_id] = {"status": FAIL, "reason": f"requires {dep}, which failed"}
         else:
             try:
@@ -1137,7 +1502,7 @@ def run_packages_phase(
     for name in tools_manifest.get("home_links", []):
         source = ctx.bin_dir / name
         owner = next((t for t in sel_tools if name in tools_manifest["tools"][t].get("links", {})), None)
-        if owner is None or tool_results.get(owner, {}).get("status") == FAIL:
+        if owner is None or owner in not_here or tool_results.get(owner, {}).get("status") == FAIL:
             continue
         links.append({"id": f"tool-link-{name}", "dest": str(target.home / ".local" / "bin" / name),
                       "kind": "symlink", "link_text": str(source)})
@@ -1170,6 +1535,16 @@ def _print_plan(log, details: dict) -> None:
                 f"removals: {', '.join(closure['removals']) or 'none'}")
         for step in apt.get("plan", []):
             log(f"packages (dry-run): {step}")
+    brew = details.get("homebrew", {})
+    if brew:
+        closure = brew.get("closure")
+        log(f"packages (dry-run): homebrew missing {len(brew.get('missing', []))}: "
+            f"{' '.join(brew.get('missing', [])) or '-'}")
+        if closure:
+            log(f"packages (dry-run): formula closure {closure['count']} formulae, "
+                f"forbidden: {', '.join(closure['forbidden']) or 'none'}")
+        for step in brew.get("plan", []):
+            log(f"packages (dry-run): {step}")
     for tool_id, result in details.get("tools", {}).items():
         log(f"packages (dry-run): {tool_id} {result.get('version', '')}: "
             f"{result.get('plan') or result.get('reason') or result.get('status')}")
@@ -1187,11 +1562,19 @@ def _save_state(target, status: str, details: dict) -> None:
                           "prefix": v.get("prefix")} for k, v in details.get("tools", {}).items()},
             "python3_host_prog": details.get("python", {}).get("python3_host_prog"),
         }
+        brew = details.get("homebrew")
+        if brew:
+            # LaunchAgents expand neither ~ nor $HOME and launchd's PATH has
+            # no Homebrew: later phases read the absolute paths from here.
+            summary["homebrew"] = {"prefix": brew.get("prefix"),
+                                   "versions": brew.get("versions", {}),
+                                   "executables": brew.get("executables", {})}
         _atomic_write(root / "last-run.json",
                       (json.dumps(summary, indent=2, sort_keys=True) + "\n").encode("utf-8"))
     except OSError:
         pass
 
 
-__all__ = ["PackagesError", "apt_step", "forbidden_matches", "link_requests", "load_manifests",
-           "parse_simulation", "run_packages_phase", "safe_extract", "switch_link"]
+__all__ = ["PackagesError", "apt_step", "brew_step", "forbidden_matches", "link_requests",
+           "load_manifests", "package_manifest_name", "parse_simulation", "run_packages_phase",
+           "safe_extract", "switch_link"]

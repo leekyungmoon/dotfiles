@@ -1,19 +1,20 @@
 {
   "schema": 1,
-  "description": "Pinned tool artifacts for the personal-dotfiles bootstrap on Ubuntu 22.04/24.04 x amd64/arm64. Every download is checked against the recorded sha256 (or sha512 for npm) before anything is extracted, and a mismatch fails the install. Versions change only by editing this file.",
+  "description": "Pinned tool artifacts for the personal-dotfiles bootstrap on Ubuntu 22.04/24.04 x amd64/arm64 and macOS (Apple silicon; Intel best effort). Every download is checked against the recorded sha256 (or sha512 for npm) before anything is extracted, and a mismatch fails the install. Versions change only by editing this file.",
   "keys": {
     "placeholders": "{home}, {data_home}, {cache_home}, {codex_home} come from installer/platform.Target and $CODEX_HOME (default {home}/.codex). {prefix_root} and {bin_dir} are the top-level values below. {version} is the entry's version, {target} the selected artifact's target, {prefix} the entry's resolved prefix, {download} the verified local download, {keyring} a private keyring built from the pinned signer key. Nothing here is a host path.",
     "prefix_root": "Installer-owned root. Each tool lives in its own versioned directory beneath it, so an upgrade is a new directory plus a link switch.",
     "bin_dir": "Installer-owned directory of symlinks into the tool prefixes. The shell configuration adds it to PATH explicitly.",
-    "tools.<id>.artifacts": "Keyed by dpkg architecture (amd64, arm64). url is the exact download, sha256 the expected digest, archive the format, strip_components how many leading directories to drop on extraction.",
+    "tools.<id>.artifacts": "Keyed by installer/platform.Platform.artifact_key: the dpkg architecture on Linux (amd64, arm64), darwin-arm64 or darwin-amd64 on macOS. 'any' serves every platform without a key of its own; a Linux key never serves macOS. url is the exact download, sha256 the expected digest, archive the format, strip_components how many leading directories to drop on extraction. requires.macos is the artifact's minimum macOS (Mach-O build version); tests/unit/test_packages_macos.py checks it against the releases installer/platform.py accepts.",
     "tools.<id>.integrity": "Where the recorded digests came from and what, if anything, authenticates that source. checksum_source.type is one of: signed-checksum-file, signed-manifest, checksum-file, github-release-asset-digest, npm-registry-integrity.",
     "tools.<id>.install": "method is one of: extract (unpack into prefix), vendor-self-install (run the verified binary's own install subcommand), npm-ci-lockfile (write install.project and install.lockfile into the prefix, copy the verified tarball to install.tarball, then 'npm ci --ignore-scripts'; the lockfile pins every package of the closure with registry sha512 integrity, and no lifecycle script runs).",
     "tools.<id>.links": "Link name in bin_dir -> path relative to the prefix.",
     "tools.<id>.verify": "argv to run after installation, and a regular expression its stdout must match. Runs with a clean HOME in tests; must not need authentication or network.",
-    "tools.<id>.verification": "What was actually checked on 2026-09-28 and where. arm64 artifacts were never executed on this amd64 host.",
+    "tools.<id>.verification": "What was actually checked on 2026-09-28 and where. arm64 artifacts were never executed on this amd64 host. darwin-* entries record what was checked on 2026-10-11 from an amd64 Linux host (checksum sources and signatures, archive layout, Mach-O headers); no darwin artifact was executed.",
     "home_links": "bin_dir link names that must also resolve outside zsh (systemd, GUI launchers, non-login shells). The packages phase returns them as symlink requests for {home}/.local/bin -> {bin_dir}/<name>; the dotfiles transaction owns those links.",
     "tools.<id>.group": "packages.json group the tool belongs to; default shell-core.",
-    "tools.<id>.native_runtime": "A native helper that the package's postinstall would download. The installer fetches the pinned archive, checks archive and binary sha256, and publishes the binary where the package looks for it."
+    "tools.<id>.native_runtime": "A native helper that the package's postinstall would download. The installer fetches the pinned archive, checks archive and binary sha256, and publishes the binary where the package looks for it.",
+    "tools.<id>.platforms": "Per-system exceptions keyed by system (darwin). skip=true: the tool is not installed there and the packages phase reports SKIPPED with reason and hint instead of failing."
   },
   "prefix_root": "{data_home}/personal-dotfiles/tools",
   "bin_dir": "{data_home}/personal-dotfiles/bin",
@@ -47,6 +48,26 @@
           "sha256": "6ad1325edbdb5649c379b75a237147a666c95d4f9ae8d340fef2d1575d289ad2",
           "archive": "tar.xz",
           "strip_components": 1
+        },
+        "darwin-arm64": {
+          "url": "https://nodejs.org/dist/v24.21.0/node-v24.21.0-darwin-arm64.tar.xz",
+          "sha256": "6239d4cf92d864487ec8cd3615038f7b67e7f58b77b21cd2f09ea9fbd68065fe",
+          "size": 27386080,
+          "archive": "tar.xz",
+          "strip_components": 1,
+          "requires": {
+            "macos": "13.5"
+          }
+        },
+        "darwin-amd64": {
+          "url": "https://nodejs.org/dist/v24.21.0/node-v24.21.0-darwin-x64.tar.xz",
+          "sha256": "0ae5a24c24bb7d015cd816c5036b3f90f2945aa872fcf54e58da054753b3a299",
+          "size": 29175680,
+          "archive": "tar.xz",
+          "strip_components": 1,
+          "requires": {
+            "macos": "13.5"
+          }
         }
       },
       "integrity": {
@@ -70,7 +91,7 @@
           "SHASUMS256.txt.sig",
           "SHASUMS256.txt"
         ],
-        "note": "The signer is the Node.js releaser who built v24.21.0 and is listed in the nodejs/node README release keys. gpgv (always present with apt) is enough; gnupg is not required."
+        "note": "The signer is the Node.js releaser who built v24.21.0 and is listed in the nodejs/node README release keys. gpgv is enough: on Ubuntu it is always present with apt and gnupg is not required; macOS ships no gpgv, so manifests/packages-macos.json installs Homebrew's gnupg for it."
       },
       "install": {
         "method": "extract"
@@ -103,7 +124,9 @@
       ],
       "verification": {
         "amd64": "PASS: downloaded, sha256 matched SHASUMS256.txt, SHASUMS256.txt.sig verified with gpgv against the pinned key, node --version = v24.21.0 and bundled npm 11.19.0 ran on an amd64 host.",
-        "arm64": "Checksum entry present in the signed SHASUMS256.txt; URL answered HTTP 200. Execution UNVERIFIED."
+        "arm64": "Checksum entry present in the signed SHASUMS256.txt; URL answered HTTP 200. Execution UNVERIFIED.",
+        "darwin-arm64": "Checksum entry in the signed SHASUMS256.txt (gpgv VALIDSIG 5BE8A3F6C8A5C01D106C0AD820B1A390B168D356, signed 2026-09-08). Archive downloaded on an amd64 Linux host 2026-10-11: sha256 and size matched; one top-level dir node-v24.21.0-darwin-arm64/ (strip 1); bin/node is a thin arm64 Mach-O, LC_BUILD_VERSION minos 13.5, signed 'Developer ID Application: Node.js Foundation (HX7739G8FX)'; bin/npm and bin/npx are relative symlinks into lib/node_modules; bundled npm 11.19.0 per dist/index.json. Execution UNVERIFIED.",
+        "darwin-amd64": "Same source and checks as darwin-arm64 for node-v24.21.0-darwin-x64.tar.xz: thin x86_64 Mach-O, minos 13.5, same Developer ID. Execution UNVERIFIED."
       }
     },
     "neovim": {
@@ -125,6 +148,26 @@
           "sha256": "1aa5ca085249580ae0f91eb14f27ec0919773ff2d99a163d03f3d6c21ac29725",
           "archive": "tar.gz",
           "strip_components": 1
+        },
+        "darwin-arm64": {
+          "url": "https://github.com/neovim/neovim/releases/download/v0.12.5/nvim-macos-arm64.tar.gz",
+          "sha256": "65fb000099e47ca1b762584c484cc833f40e30851a0ec450d4174e16317c1f9b",
+          "size": 9634538,
+          "archive": "tar.gz",
+          "strip_components": 1,
+          "requires": {
+            "macos": "11.0"
+          }
+        },
+        "darwin-amd64": {
+          "url": "https://github.com/neovim/neovim/releases/download/v0.12.5/nvim-macos-x86_64.tar.gz",
+          "sha256": "81f4518622cb059b450ee2e498c6a1082a222f6bd89589de5bbcf0c6a68aa3fd",
+          "size": 9843608,
+          "archive": "tar.gz",
+          "strip_components": 1,
+          "requires": {
+            "macos": "11.0"
+          }
         }
       },
       "integrity": {
@@ -168,7 +211,9 @@
       ],
       "verification": {
         "amd64": "PASS: downloaded, sha256 matched the recorded asset digest, nvim --version = v0.12.5 and a headless run with a temporary HOME reported has('nvim-0.12') = 1.",
-        "arm64": "Asset digest recorded from the GitHub release API; URL answered HTTP 200. Execution UNVERIFIED."
+        "arm64": "Asset digest recorded from the GitHub release API; URL answered HTTP 200. Execution UNVERIFIED.",
+        "darwin-arm64": "GitHub release asset digest equals the archive downloaded 2026-10-11; top-level nvim-macos-arm64/ (strip 1) with bin/nvim, the same 7 bundled parsers under lib/nvim/parser/*.so, and share/. bin/nvim is thin arm64, minos 11.0, ad-hoc linker signature only (not notarized; it runs because the installer's urllib download never sets com.apple.quarantine). Execution UNVERIFIED.",
+        "darwin-amd64": "Same checks for nvim-macos-x86_64.tar.gz: thin x86_64, minos 11.0, no code signature. Execution UNVERIFIED."
       }
     },
     "fzf": {
@@ -190,6 +235,26 @@
           "sha256": "5d673b849f494f0d64ec471d8640b153ca8849e3846a31da17abdcfce8df6b46",
           "archive": "tar.gz",
           "strip_components": 0
+        },
+        "darwin-arm64": {
+          "url": "https://github.com/junegunn/fzf/releases/download/v0.74.4/fzf-0.74.4-darwin_arm64.tar.gz",
+          "sha256": "4f6a113bfc0c7959e0005c78d566a51afc4fcefc956f43735c62a9deb19e92ae",
+          "size": 2148967,
+          "archive": "tar.gz",
+          "strip_components": 0,
+          "requires": {
+            "macos": "13.0"
+          }
+        },
+        "darwin-amd64": {
+          "url": "https://github.com/junegunn/fzf/releases/download/v0.74.4/fzf-0.74.4-darwin_amd64.tar.gz",
+          "sha256": "2d392b50be66e2ab104ccd52a6072df692b1f9b9c5b449a9c098de885f32c4c5",
+          "size": 2358031,
+          "archive": "tar.gz",
+          "strip_components": 0,
+          "requires": {
+            "macos": "13.0"
+          }
         }
       },
       "extra_files": {
@@ -232,7 +297,9 @@
       ],
       "verification": {
         "amd64": "PASS: downloaded, sha256 matched the checksum file, fzf --version = 0.74.4, fzf --zsh produced integration code, --accept-nth and --raw were accepted. On a tmux 3.2a server fzf --tmux failed (display-popup usage error); on tmux 3.4 the options were accepted but no popup was rendered because no client was attached (UNVERIFIED rendering).",
-        "arm64": "Checksum entry present in the checksum file; URL answered HTTP 200. Execution UNVERIFIED."
+        "arm64": "Checksum entry present in the checksum file; URL answered HTTP 200. Execution UNVERIFIED.",
+        "darwin-arm64": "Entry in fzf_0.74.4_checksums.txt (the pinned file) equals the GitHub digest and the archive downloaded 2026-10-11; single member 'fzf' (strip 0); thin arm64 Mach-O, minos 13.0, Go 1.27.1, signed 'Developer ID Application: Junegunn Choi (Y254DRW44Z)'. fzf-preview.sh is platform independent and bash 3.2 compatible. Execution UNVERIFIED.",
+        "darwin-amd64": "Same checks for fzf-0.74.4-darwin_amd64.tar.gz: thin x86_64, minos 13.0, same Developer ID. Execution UNVERIFIED."
       }
     },
     "codex": {
@@ -256,6 +323,28 @@
           "archive": "tar.gz",
           "strip_components": 0,
           "target": "aarch64-unknown-linux-musl"
+        },
+        "darwin-arm64": {
+          "url": "https://github.com/openai/codex/releases/download/rust-v0.157.1/codex-package-aarch64-apple-darwin.tar.gz",
+          "sha256": "6cda538d19c2f4d9dce965369aa22011afa9dce8c7a73c234b66eb3611ea4aab",
+          "size": 128695848,
+          "archive": "tar.gz",
+          "strip_components": 0,
+          "target": "aarch64-apple-darwin",
+          "requires": {
+            "macos": "11.0"
+          }
+        },
+        "darwin-amd64": {
+          "url": "https://github.com/openai/codex/releases/download/rust-v0.157.1/codex-package-x86_64-apple-darwin.tar.gz",
+          "sha256": "d2285a56c7d1f74923e708b18308870e367479a4423784ed488578af89d6af77",
+          "size": 139612079,
+          "archive": "tar.gz",
+          "strip_components": 0,
+          "target": "x86_64-apple-darwin",
+          "requires": {
+            "macos": "10.12"
+          }
         }
       },
       "integrity": {
@@ -279,6 +368,17 @@
           "codex-resources/voice"
         ]
       },
+      "archive_layout_darwin": {
+        "manifest": "codex-package.json (layoutVersion 1, entrypoint bin/codex)",
+        "entries": [
+          "bin/codex",
+          "bin/codex-code-mode-host",
+          "codex-path/rg",
+          "codex-resources/zsh/bin/zsh",
+          "codex-resources/voice"
+        ],
+        "source": "scripts/codex_package/layout.py and .github/scripts/build-codex-package-archive.sh at rust-v0.157.1; bwrap is Linux-only. Only bin/ and bin/codex were observed directly (first 4 MiB range read)."
+      },
       "install": {
         "method": "extract"
       },
@@ -298,7 +398,9 @@
       ],
       "verification": {
         "amd64": "PASS: downloaded, sha256 matched codex-package_SHA256SUMS, codex --version = codex-cli 0.157.1 with an empty temporary HOME and CODEX_HOME (it warned that CODEX_HOME did not exist, and wrote nothing else).",
-        "arm64": "Checksum entry present in codex-package_SHA256SUMS; URL answered HTTP 200. Execution UNVERIFIED."
+        "arm64": "Checksum entry present in codex-package_SHA256SUMS; URL answered HTTP 200. Execution UNVERIFIED.",
+        "darwin-arm64": "Entry in codex-package_SHA256SUMS (the pinned file; the releases.openai.com mirror is byte-identical) equals the GitHub asset digest. Archive NOT downloaded (128.7 MB, over the research limit). A 4 MiB range read showed members at the archive root (bin/, then bin/codex, 238223808 bytes; strip 0); bin/codex is thin arm64, minos 11.0. The release workflow signs with hardened runtime and notarizes; codex-responses-api-proxy from the same signing job is 'Developer ID Application: OpenAI OpCo, LLC (2DC432GLL2)'. No .sigstore bundle is published for darwin. Execution UNVERIFIED.",
+        "darwin-amd64": "Same source for codex-package-x86_64-apple-darwin.tar.gz (139.6 MB, not downloaded); range read: bin/codex 256878784 bytes, thin x86_64, LC_VERSION_MIN_MACOSX 10.12. Execution UNVERIFIED."
       }
     },
     "claude-code": {
@@ -320,6 +422,26 @@
           "size": 230482160,
           "archive": "none",
           "platform": "linux-arm64"
+        },
+        "darwin-arm64": {
+          "url": "https://downloads.claude.ai/claude-code-releases/2.1.274/darwin-arm64/claude",
+          "sha256": "3509913f9d1576316c8845b88837f8fd3bbbcf26625833ac82cfb6b8985da94a",
+          "size": 214149552,
+          "archive": "none",
+          "platform": "darwin-arm64",
+          "requires": {
+            "macos": "13.0"
+          }
+        },
+        "darwin-amd64": {
+          "url": "https://downloads.claude.ai/claude-code-releases/2.1.274/darwin-x64/claude",
+          "sha256": "b18e8c9d7666d8987a174ac65e0019f4ba6befa73d2f75c05cbe92e5093431eb",
+          "size": 222955360,
+          "archive": "none",
+          "platform": "darwin-x64",
+          "requires": {
+            "macos": "13.0"
+          }
         }
       },
       "integrity": {
@@ -381,7 +503,9 @@
       ],
       "verification": {
         "amd64": "PASS: manifest.json.sig verified with gpgv against key 31DDDE24DDFAB679F42D7BD2BAA929FF1A7ECACE (fingerprint matches the setup documentation), binary sha256 matched the manifest, claude --version = 2.1.274, and 'claude install 2.1.274' in a temporary HOME created only the vendor_layout paths and left sentinel .zshrc, .bashrc and .profile byte-identical.",
-        "arm64": "Checksum present in the signed manifest; URL answered HTTP 200 with the manifest's size. Execution UNVERIFIED."
+        "arm64": "Checksum present in the signed manifest; URL answered HTTP 200 with the manifest's size. Execution UNVERIFIED.",
+        "darwin-arm64": "Checksum and size from the signed manifest.json (the pinned file; gpgv VALIDSIG 31DDDE24DDFAB679F42D7BD2BAA929FF1A7ECACE, signed 2026-09-16). Binary NOT downloaded (214 MB); HEAD returned 200 with Content-Length equal to the manifest size. Range-read Mach-O header: thin arm64, minos 13.0 (docs: macOS 13.0+); code signature 'Developer ID Application: Anthropic PBC (Q6L2SF6YDW)' (docs: signed and notarized). Execution and the macOS side effects of 'claude install' (shell_files_modified) UNVERIFIED.",
+        "darwin-amd64": "Same source for platform darwin-x64 (223 MB, not downloaded): HEAD 200 with matching size; thin x86_64, minos 13.0, same Developer ID. Execution UNVERIFIED."
       }
     },
     "oh-my-codex": {
@@ -427,6 +551,14 @@
           "@napi-rs/lzma-linux-arm64-gnu": {
             "version": "1.4.1",
             "integrity": "sha512-1XdFGKyTS9m+VrRQYs9uz+ToHf4Jwm0ejHU48k9lT9MPl8jSqzKdVtFzZBPzronHteSynBfKmUq0+HeWmjrsOQ=="
+          },
+          "@napi-rs/lzma-darwin-arm64": {
+            "version": "1.4.1",
+            "integrity": "sha512-sDfOhQQFqV8lGbpgJN9DqNLBPR7QOfYjcWUv8FOGPaVP1LPJDnrc5uCpRWWEa2zIKmTiO8P9xzIl0TDzrYmghg=="
+          },
+          "@napi-rs/lzma-darwin-x64": {
+            "version": "1.4.1",
+            "integrity": "sha512-S5/RbC6EP4QkYy2xhxbfm48ZD9FkysfpWY4Slve0nj5RGGsHvcJBg2Pi69jrTPB/zLKz2SUa0i+RfUt9zvZNaw=="
           },
           "note": "Prebuilt N-API binaries selected by npm through optionalDependencies (os/cpu/libc). No node-gyp and no compiler."
         },
@@ -2293,6 +2425,24 @@
             "member": "omx-runtime-aarch64-unknown-linux-musl/omx-runtime",
             "binary_sha256": "6a00c44f462e1ca65190129f028a180d5b5a46563bc3b1b3c02dbeda5cdeb76c",
             "platform_key": "linux-arm64-musl"
+          },
+          "darwin-arm64": {
+            "url": "https://github.com/Yeachan-Heo/oh-my-codex/releases/download/v0.21.6/omx-runtime-aarch64-apple-darwin.tar.xz",
+            "sha256": "55a427d1a76d64f2d05f5de5902a20a0de632b8b6376fa95e05d05f8e5590722",
+            "size": 382692,
+            "archive": "tar.xz",
+            "member": "omx-runtime-aarch64-apple-darwin/omx-runtime",
+            "binary_sha256": "dd51a218f60b6ec2c7fb751c79f21a933e83b04282a40c6809c325f2a2f191d2",
+            "platform_key": "darwin-arm64"
+          },
+          "darwin-amd64": {
+            "url": "https://github.com/Yeachan-Heo/oh-my-codex/releases/download/v0.21.6/omx-runtime-x86_64-apple-darwin.tar.xz",
+            "sha256": "4c6fd7210f6b76ab2d7434f013f506f8047b1725281c76b6e8909b205f401614",
+            "size": 420016,
+            "archive": "tar.xz",
+            "member": "omx-runtime-x86_64-apple-darwin/omx-runtime",
+            "binary_sha256": "b710142802277bd94e470d4d45f373b48aa26bc7fcb1cfcbb9ac3e01f52b2178",
+            "platform_key": "darwin-x64"
           }
         },
         "cache_path": "{cache_home}/oh-my-codex/native/{version}/{platform_key}/omx-runtime/omx-runtime",
@@ -2308,7 +2458,9 @@
         ],
         "verification": {
           "amd64": "PASS: archive sha256 matched the pinned value and the release manifest, the extracted binary (static-pie) ran 'schema' with an empty HOME.",
-          "arm64": "Archive downloaded and matched the release manifest; binary sha256 recorded from the extracted member. Execution UNVERIFIED."
+          "arm64": "Archive downloaded and matched the release manifest; binary sha256 recorded from the extracted member. Execution UNVERIFIED.",
+          "darwin-arm64": "Archive sha256 and size equal native-release-manifest.json (the pinned file), the GitHub asset digest and the .sha256 sidecar asset; downloaded 2026-10-11. Member omx-runtime-aarch64-apple-darwin/omx-runtime is thin arm64, minos 11.0, ad-hoc signed. platform_key follows dist/cli/native-assets.js:70-73 (darwin has no libc suffix). Execution UNVERIFIED.",
+          "darwin-amd64": "Same checks for omx-runtime-x86_64-apple-darwin.tar.xz: thin x86_64, minos 10.12, unsigned. Execution UNVERIFIED."
         }
       }
     },
@@ -2353,6 +2505,14 @@
           "stdout": "JetBrainsMono Nerd Font Mono"
         }
       ],
+      "platforms": {
+        "darwin": {
+          "skip": true,
+          "reason": "Not installed on macOS: Core Text (Terminal, iTerm2, Ghostty) does not read fontconfig directories such as the prefix above, and macOS has no fc-cache. Fonts in ~/Library/Fonts are left to the user or a Homebrew cask.",
+          "hint": "brew install --cask font-jetbrains-mono-nerd-font",
+          "hint_note": "On 2026-10-11 that cask was 3.5.1 with the same archive URL and sha256 as artifacts.any and put each TTF directly into ~/Library/Fonts. Cask versions float, so it is a hint, not a pin."
+        }
+      },
       "verification": {
         "any": "Archive downloaded and sha256 matched SHA-256.txt; it contains 96 TTF files plus OFL.txt and README.md. Font installation and rendering in GNOME Terminal UNVERIFIED."
       }
