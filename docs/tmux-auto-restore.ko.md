@@ -221,8 +221,13 @@ touch ~/tmux_no_auto_restore
 tmux show-environment -g WAYLAND_DISPLAY DISPLAY
 ```
 
-설치기로 켠 unit을 직접 끄면 설치기 상태 확인에서 변경된 항목으로 보일 수
-있다.
+위의 `systemctl --user disable`로 끈 것은 다음 설치, `dotfiles update`,
+`dotfiles repair`까지만 유지된다. 이 명령이 지우는 `.wants` 링크는 설치기가
+관리하는 항목이라 다음 실행이 다시 만들고, 1분 자동 저장 타이머도 바로 다시
+시작한다(`tmux.service`는 다음 데스크톱 로그인부터 다시 시작된다). 그때까지는
+설치기 상태 확인에서 변경된 항목으로 보인다. Linux에서
+`dotfiles services disable`은 이 명령들을 출력하고 이 점을 알릴 뿐 아무것도
+바꾸지 않는다.
 
 ## 확인한 내용
 
@@ -326,7 +331,7 @@ pending verification이다).
 | `tmux/resurrect-autosave` | autosave agent: 서버가 있으면 `tmux/resurrect-save`로 저장, 50초 제한, 복구 전 저장 보류(75)는 성공으로 처리 |
 | `installer/launchd.py` | plist 생성, `launchctl`로 등록·확인·해제, `dotfiles services` |
 | `installer/darwin_proc.py` | `/proc` 대신 libproc과 sysctl로 pane 프로세스의 인자와 열린 파일 확인 |
-| `etc/terminfo/tmux-256color.terminfo` | macOS ncurses(5.7)에 없는 `tmux-256color` 터미널 정보 |
+| `etc/terminfo/tmux-256color.terminfo` | `tmux-256color` 터미널 정보. macOS 14 이상에는 ncurses 6.0의 더 오래된(2015년) 항목이 있어, 설치기는 시스템에 이 항목이 없을 때만 `~/.terminfo`로 컴파일한다 |
 
 macOS 쪽 차이:
 
@@ -345,7 +350,12 @@ macOS 쪽 차이:
   않는다).
 - 설치기는 시스템에 `tmux-256color`가 없으면 `/usr/bin/tic -x -o ~/.terminfo
   ~/.dotfiles/etc/terminfo/tmux-256color.terminfo`로 컴파일한다. 실패하면 이
-  명령을 이유로 보여 준다.
+  명령을 이유로 보여 준다. Apple이 공개한 ncurses 소스로는 macOS 14 이상에
+  ncurses 6.0의 2015년 항목이 있으므로(`/usr/bin/infocmp -x tmux-256color`가
+  찾는다) 이때는 아무것도 컴파일하지 않는다. 그 항목에는 이 저장소의 항목이
+  더한 취소선(`smxx`, `rmxx`), 밑줄 모양(`Smulx`), 밑줄 색(`Setulc`)이 없다.
+  저장소의 항목을 쓰려면 직접 설치한다:
+  `~/.dotfiles/etc/terminfo.sh tmux-256color`.
 
 ### 사용자 입장에서의 동작 (macOS)
 
@@ -395,8 +405,10 @@ C-r, `~/tmux_no_auto_restore` 삭제, `tmux set-option -g @tmux-restore-complete
 | --- | --- | --- |
 | tmux | 0 | 복구했다, 복구할 것이 없다(저장본 없음, `~/tmux_no_auto_restore`), 또는 서버가 이미 있었다 |
 | tmux | 3 | 저장본이 있지만 복구하지 않았다. 서버는 실행 중이다. 설치기는 실패가 아니라 경고("press prefix + C-r in tmux to restore it")로 알린다 |
-| tmux | 1 | tmux가 없다(`brew install tmux && dotfiles repair`) 또는 HOME이 잘못되었다 |
-| tmux | 그 밖 | `tmux new-session`이 실패한 코드 |
+| tmux | 1 | tmux가 없다(`brew install tmux && dotfiles repair`), HOME이 잘못되었다, 또는 `tmux new-session`이 실패했다(tmux는 모든 오류에 1로 끝난다). 어느 쪽인지는 로그에 있다 |
+| tmux | 126, 127 | tmux를 찾았지만 실행하지 못했다(다른 아키텍처용 바이너리 등). 이유는 로그에 있다. `brew reinstall tmux && dotfiles repair` |
+| tmux | 128 초과 | `tmux new-session`이 신호로 종료되었다(128 + 신호 번호) |
+| tmux | 78 | launchd가 스크립트를 시작하지 못했다(EX_CONFIG: 로그 디렉터리나 스크립트가 없을 때 등). 로그가 없을 수 있다. `dotfiles repair` |
 | autosave | 0 | 저장했다, 서버가 없다, 또는 복구 전 저장 보류(75를 0으로 바꾸고 서버마다 한 번만 로그) |
 | autosave | 그 밖 | 저장 실패. `tmux/resurrect-save`의 메시지가 로그에 남는다 |
 
@@ -476,6 +488,10 @@ macOS 15부터 로컬 네트워크(같은 네트워크의 기기, `.local` 이�
   StartInterval), 깨어난 뒤 다음 주기부터 다시 저장한다.
 - Codex·Claude 명령은 프로세스 확인(`installer/darwin_proc.py`)이 동작할 때만
   저장한다. 다른 사용자의 프로세스(`sudo` 등)는 확인할 수 없어 비운다.
+  Codex 프로세스가 열어 둔 파일을 하나라도 읽지 못하면(접근 거부 등) 지금
+  쓰는 대화를 확인할 수 없으므로, 명령줄 ID로 대신하지 않고 그 pane의 명령을
+  비운다. Ubuntu는 읽지 못한 파일을 건너뛰고, 실행 중 증거가 없으면 명령줄
+  ID를 쓴다.
 
 ### 사용법 (macOS)
 
@@ -487,7 +503,9 @@ dotfiles services
 
 - 끄기·켜기. 이름을 빼면 둘 다다. 끈 상태는 launchd에 남아 이후의 설치,
   `dotfiles update`, `dotfiles repair`도 켜지 않는다. 끄더라도 실행 중인 tmux
-  서버는 끝나지 않는다:
+  서버는 끝나지 않는다. agent가 실행 중이면(autosave agent가 저장하는 중 등)
+  launchd가 내릴 때까지 최대 10초 기다리고, 그래도 남아 있으면 실행할
+  `launchctl bootout` 명령과 함께 실패로 알린다(끈 상태는 그대로 기록된다):
 
 ```sh
 # 로그인 때 tmux 자동 시작만 끈다(1분 자동 저장은 계속)
@@ -529,7 +547,11 @@ Linux에서도 실행된다(launchd와 macOS 도구는 가짜나 시뮬레이션
     거부 코드는 이유와 실행할 명령이 붙은 FAIL인지. `launchctl print`로 확인하지
     못하면 PASS가 아닌지.
   - 바뀌지 않은 plist의 repair는 bootout·bootstrap을 하지 않는지, 바뀐 plist는
-    내렸다 다시 불러오는지, tmux agent의 종료 코드 0·3·1을 구분하는지.
+    내렸다 다시 불러오는지, tmux agent의 종료 코드 0·3·1을 구분하는지(1이면
+    세 가지 원인을 모두 알리는지).
+  - 실행 중인 agent의 bootout이 36(진행 중)으로 답하면, 다시 불러올 때와
+    내릴 때(`dotfiles services disable`, `restore`) 모두 agent가 내려갈 때까지
+    기다리고, 10초 뒤에도 남아 있으면 실행할 명령과 함께 실패로 알리는지.
 - `tests/integration/test_tmux_launchd_scripts.py` (가짜 tmux와 별도 socket의
   실제 tmux, bash 3.2와 dash)
   - `tmux-launchd-start`가 있는 서버를 그대로 두는지, 복구 결과를
@@ -539,7 +561,8 @@ Linux에서도 실행된다(launchd와 macOS 도구는 가짜나 시뮬레이션
     경로(flock, lockf, python3)와 도구가 없을 때의 실패, 저장 중 중단 시
     이전 저장본 유지.
 - `tests/unit/test_darwin_proc.py`, `tests/unit/test_resurrect_ai_session.py`:
-  macOS 프로세스 확인 경로(실제 libproc 시험은 macOS에서만).
+  macOS 프로세스 확인 경로(실제 libproc 시험은 macOS에서만). Codex가 연
+  파일을 읽지 못하면 명령줄 ID로 대신하지 않고 비우는지.
 - `tests/macos/e2e.sh` (CI의 macOS runner): one-liner 설치, 두 agent와 plist
   확인, 접속 없이 1분 저장, 설정 다시 불러오기 후 저장, kill-server 뒤
   `launchctl kickstart -k`로 세션·작업 디렉터리·출력 기록 복구, 서버가 있을 때의

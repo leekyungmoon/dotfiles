@@ -282,6 +282,10 @@ dotfiles services
 | `launchctl bootstrap failed (5: Input/output error)` | System Settings → General → Login Items & Extensions → *Allow in the Background*: turn it on for the agent (it may be listed as `sh` or by its script's name). Then run `dotfiles repair` in Terminal, not over SSH. |
 | `tmux: disabled (enable: dotfiles services enable tmux)` | You turned it off (`dotfiles services disable`); repairs leave it off. `dotfiles services enable tmux` turns it back on. |
 | `tmux started but did not restore the last snapshot (see <log>)` | The server runs without your snapshot; the log says why. Press prefix + C-r in tmux to restore it, or keep the current sessions and let saves go on: `tmux set-option -g @tmux-restore-complete on`. `tmux show-option -gqv @tmux-restore-status` shows the outcome. |
+| `` the tmux LaunchAgent could not start tmux (exit status 1: tmux not found, HOME unusable, or `tmux new-session` failed); see <log> `` | The log's last lines say which: `tmux not found on PATH; run: brew install tmux && dotfiles repair`, `HOME is not an absolute path: ...`, the shell's own `cd: ...` error (HOME names a directory that cannot be entered), or `tmux new-session failed (exit status 1); nothing was restored`, usually with tmux's own error just above it. Once the cause is fixed, a tmux started in Terminal restores the last snapshot. |
+| `the tmux LaunchAgent failed (exit status <N>)` | 126 or 127: tmux was found but could not be executed (the log says why); `brew reinstall tmux`, then `dotfiles repair`. Above 128: tmux was killed by a signal (128 + the signal's number); the log has the details. 78 (EX_CONFIG): launchd could not start the agent's script at all (its log directory or the script is missing), so there may be no log; run `dotfiles repair`. |
+| `the tmux LaunchAgent was stopped (<signal>)` | The agent's script was killed by a signal; the log has the details. |
+| `<label> was still loaded 10 s after launchctl bootout; run: launchctl bootout gui/$(id -u)/<label>` | launchd had not let the agent go yet (also from `dotfiles services disable`, whose disable is recorded anyway, and from `restore`). Run the printed command; `launchctl print gui/$(id -u)/<label>` fails once the agent is gone. |
 | `process inspection unavailable: Codex/Claude resume commands will not be saved ...` | Saves still keep layouts, directories and pane contents; Codex and Claude panes come back as shells. `~/.dotfiles/tmux/resurrect-ai-session.py --self-test` says why. |
 | `could not compile the tmux-256color terminal description: ...; run: /usr/bin/tic ...` | Run the printed command. |
 | any other `launchctl ... failed (<code>: ...)` | The message ends with the command to run; `launchctl error <code>` explains the code. |
@@ -291,7 +295,9 @@ Turning them off, or removing them:
 - `dotfiles services disable [tmux|autosave]` unloads an agent and marks
   it disabled in launchd: installs, updates and repairs leave it off until
   `dotfiles services enable [tmux|autosave]`. Without a name it acts on
-  both. A running tmux server is not stopped.
+  both. A running tmux server is not stopped. An agent in the middle of a
+  run (the autosave saving) is given up to 10 s to leave launchd; one still
+  loaded then is reported with the `launchctl bootout` command to run.
 - `dotfiles restore --baseline --id launchd-tmux --id
   launchd-tmux-resurrect-autosave` removes both plists and unloads both
   jobs, and nothing else; `dotfiles restore --baseline` does it together

@@ -51,8 +51,12 @@ On a Mac, two LaunchAgents start tmux at login and save it every minute
 ([how it works](docs/tmux-auto-restore.ko.md#macos)); `dotfiles services`
 shows, disables and enables them. If Homebrew's installer suggests adding
 `eval "$(brew shellenv)"` to `~/.zprofile`, skip that: `~/.zprofile` is a
-link into `~/.dotfiles`, and the zsh setup already does it. What else
-differs from Ubuntu: [docs/SUPPORT.md](docs/SUPPORT.md#macos-differences).
+link into `~/.dotfiles`, and for Homebrew in `/opt/homebrew` (or
+`/usr/local` on Intel) the zsh setup already does it. For Homebrew in
+another prefix, add the two lines the installer prints,
+`export HOMEBREW_PREFIX=<prefix>` and `path+=(<prefix>/bin <prefix>/sbin)`,
+to `~/.zshenv.local`. What else differs from Ubuntu:
+[docs/SUPPORT.md](docs/SUPPORT.md#macos-differences).
 
 
 ## `$ dotfiles`
@@ -71,7 +75,7 @@ $ dotfiles install neovim         # -> ~/.local/bin/nvim
 $ dotfiles install fzf            # -> ~/.local/bin/fzf
 ```
 
-**tmux at login and the one-minute autosave** (macOS LaunchAgents; on Linux this prints the `systemctl` commands instead):
+**tmux at login and the one-minute autosave** (macOS LaunchAgents; on Linux this prints the `systemctl` commands instead, and the next `dotfiles update` or `dotfiles repair` turns the units back on):
 
 ```bash
 $ dotfiles services                     # status of both, and the last save
@@ -96,7 +100,7 @@ $ dotfiles services enable              # both back on
     - Please carefully READ the error/warning message printed by the installation script.
 
 - Q: I see some weird icons like `⍰` in (neo)vim statusline, or in tmux statusbar.
-  - A: Install [Nerd fonts](https://github.com/ryanoasis/nerd-fonts), e.g., `JetBrainsMono Nerd Font Mono` (`dotfiles install nerd-font`; on macOS `brew install --cask font-jetbrains-mono-nerd-font`).
+  - A: Install [Nerd fonts](https://github.com/ryanoasis/nerd-fonts), e.g., `JetBrainsMono Nerd Font Mono` (`dotfiles install nerd-font`; on macOS that command changes nothing and names the cask instead: `brew install --cask font-jetbrains-mono-nerd-font`).
 
 - On macOS, if tmux does not start at login or stops saving:
     - `dotfiles services` shows both LaunchAgents; their logs are in `~/.local/state/personal-dotfiles/launchd/`.

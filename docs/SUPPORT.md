@@ -80,8 +80,10 @@ Checked before publishing, all on an Ubuntu 24.04 amd64 host, none on a Mac:
   Claude Code ones checked by size, digest and a read of their headers
   only. None of them was run.
 - The Homebrew formula closure per architecture, read from formulae.brew.sh:
-  no forbidden formula; every one bottled for Apple silicon on 15, 26 and
-  27; 20 without an Intel bottle.
+  no forbidden formula among the runtime dependencies; every one bottled
+  for Apple silicon on 15, 26 and 27; 20 without an Intel bottle, whose
+  source builds also install build-only formulae, `cmake` among them
+  (2026-10-12; see Intel Macs below).
 
 ### Pre-release checks on GitHub's runners
 
@@ -94,7 +96,7 @@ record each run here with its URL and date.
 | Unit tests, file by file, Homebrew `python3` (`unit-macos`) | not run yet | not run yet | not run yet (best effort) | not run yet (best effort) |
 | `darwin_proc` tests and the AI hook `--self-test` under `/usr/bin/python3` (3.9) and Homebrew `python3` (`unit-macos`) | not run yet | not run yet | not run yet (best effort) | not run yet (best effort) |
 | Shell and zsh tests under `/bin/bash` 3.2 and `/bin/zsh` (`unit-macos`) | not run yet | not run yet | not run yet (best effort) | not run yet (best effort) |
-| Bootstrap simulation, LaunchAgent scripts, tmux-resurrect on Homebrew tmux (`unit-macos`) | not run yet | not run yet | not run yet (best effort) | not run yet (best effort) |
+| Bootstrap simulation, LaunchAgent scripts, tmux-resurrect, and the converge of a running tmux server with its pane processes read through the real libproc (`test_tmux_converge.py`), on Homebrew tmux (`unit-macos`) | not run yet | not run yet | not run yet (best effort) | not run yet (best effort) |
 | `etc/install` and `./install` refusals under the real `/bin/bash` and `/bin/sh` (`bash32-macos`) | not run yet | — | — | — |
 | One-liner, both LaunchAgents, save without a client, restore after kill-server, repair, `services disable`/`enable`, `restore --baseline` (`e2e-macos`, [`tests/macos/e2e.sh`](../tests/macos/e2e.sh)) | not run yet | not run yet | — | — |
 
@@ -102,7 +104,7 @@ record each run here with its URL and date.
 | ----------- | ------------ | ------------ |
 | Unit tests, system `python3` (`unit-linux`) | not run yet | not run yet |
 | Shell and zsh tests, zsh self-reload (`unit-linux`) | not run yet | not run yet |
-| Integration tests, file by file (`integration-linux`) | not run yet | not run yet |
+| Integration tests, file by file, on the full history; without it or the pinned plugins, the tmux converge tests on a running server fail instead of skipping (`integration-linux`) | not run yet | not run yet |
 | Bootstrap and shell tests under GNU bash 3.2.57 (`bash32-linux`) | — | not run yet |
 | ShellCheck 0.11.0, `dash -n`, `zsh -n`, Python 3.9 grammar (`lint`) | — | not run yet |
 
@@ -156,12 +158,12 @@ pending verification.
 | tmux at login, autosave every minute | systemd user units (`tmux.service`, `tmux-resurrect-autosave.timer`) | two LaunchAgents in your GUI login ([details](tmux-auto-restore.ko.md#macos)); they load only in a desktop login, not over SSH, and not before FileVault is unlocked |
 | Save when you log out or shut down | `tmux.service` saves as it stops | none: changes since the last minute's save are lost; nothing is saved while the Mac sleeps |
 | Privacy permissions of programs in tmux panes | — | in the tmux the LaunchAgent starts at login, Terminal's Local Network and Files & Folders permissions do not apply ([details](tmux-auto-restore.ko.md#로컬-네트워크와-파일-및-폴더-접근)) |
-| Codex / Claude resume commands | read from `/proc` | read with libproc and `sysctl` (`installer/darwin_proc.py`); if that does not work, saves go on without them, with one warning per save |
-| `tmux-256color` terminal description | from ncurses | compiled into `~/.terminfo` when the system lacks it |
+| Codex / Claude resume commands | read from `/proc` | read with libproc and `sysctl` (`installer/darwin_proc.py`); if that does not work, saves go on without them, with one warning per save; a Codex pane whose open files cannot all be read is saved without its command, where Ubuntu skips the files it cannot read and, with no other live evidence, uses the ID on its command line |
+| `tmux-256color` terminal description | from ncurses | the system's own (on macOS 14 and later, ncurses 6.0's from 2015, older than the checkout's `etc/terminfo/tmux-256color.terminfo`); the installer compiles the checkout's into `~/.terminfo` only when the system has none, and `~/.dotfiles/etc/terminfo.sh tmux-256color` installs it by hand |
 | GNOME settings, input-remapper, the gtk/X11/terminator configs | managed | not applicable: no desktop phase, files not installed |
 | `pbcopy` / `pbpaste` | Wayland, X11 or OSC52 helpers | the system `/usr/bin/pbcopy` and `pbpaste` (with their own options); over SSH, `pbcopy` writes OSC52 and `pbpaste` fails with an explanation |
 | `Ctrl+V` in tmux | smart paste (images to Codex/Claude, text to shells) | passed through to the program (Codex and Claude read images on `Ctrl+V`); `Cmd+V` pastes text |
-| JetBrainsMono Nerd Font | installed into `~/.local/share/fonts` | not installed (Terminal and iTerm2 do not read that folder); `brew install --cask font-jetbrains-mono-nerd-font` |
+| JetBrainsMono Nerd Font | installed into `~/.local/share/fonts` | not installed (Terminal and iTerm2 do not read that folder); `dotfiles install nerd-font` changes nothing and names the cask: `brew install --cask font-jetbrains-mono-nerd-font` |
 | Neovim's python3 provider (`pynvim`) | apt `python3-pynvim` | not installed: Homebrew's Python is externally managed, and nothing is `pip`-installed; point `PYTHON3_HOST_PROG` at a virtualenv's python that has `pynvim` |
 | git credentials over HTTPS | `credential.helper cache --timeout 60` | Apple's and Homebrew's git also use `osxkeychain`, so credentials persist in the Keychain |
 | Login shell | `chsh`, through `sudo` when the account has no usable password | zsh already is the default; otherwise `chsh -s /bin/zsh` in a terminal (it asks for your password), or the command is printed |
@@ -179,16 +181,39 @@ Intel Mac, it stops before any change and prints what to run.
 
 Homebrew's own setup: do not add `eval "$(brew shellenv)"` to
 `~/.zprofile`, as Homebrew's installer suggests. `~/.zprofile` is a link
-into `~/.dotfiles`, so that would edit the checkout, and `zsh/zshenv`
-already exports what `brew shellenv` does, with Homebrew's `bin` and `sbin`
-behind `~/.local/bin` and the pinned tools. Put local additions in
-`~/.zprofile.local` or `~/.zshrc.local`.
+into `~/.dotfiles`, so that would edit the checkout. With Homebrew in its
+default prefix (`/opt/homebrew` on Apple silicon, `/usr/local` on Intel),
+`zsh/zshenv` already covers it, with Homebrew's `bin` and `sbin` behind
+`~/.local/bin` and the pinned tools. With Homebrew in any other prefix (an
+absolute `HOMEBREW_PREFIX`, `~/.homebrew` included), the `packages` line of
+the installer's summary asks for these two lines in `~/.zshenv.local`,
+which `zsh/zshenv` sources:
+
+```zsh
+export HOMEBREW_PREFIX=<prefix>
+path+=(<prefix>/bin <prefix>/sbin)
+```
+
+They keep Homebrew behind `~/.local/bin` and the pinned tools and in front
+of `/usr/local/bin`, `/usr/bin` and `/bin`. Without them, later
+`dotfiles update` and `dotfiles repair` runs look for Homebrew in the
+default prefix; and unless the prefix is `~/.homebrew`, which `zsh/zshenv`
+puts on `PATH`, new terminals miss `brew` and Homebrew's `tmux` and
+`python3`, so `dotfiles update` stops under the Command Line Tools' python
+3.9. The summary stops asking once `~/.zshenv.local` has both lines as
+printed. Put other local additions in `~/.zprofile.local` or
+`~/.zshrc.local`.
 
 Intel Macs: the installer warns first. Homebrew has no x86_64 bottles for
 `tmux`, `git`, `gnupg`, `python` and `openssl` any more, so `brew install`
-builds them with the Command Line Tools, which can take an hour or more and
-may pull in build-only dependencies; a run that timed out continues where
-it stopped on the next one. Every pinned tool has an Intel build.
+builds them with the Command Line Tools, which can take an hour or more,
+and also installs their build-only dependencies (in the formula data of
+2026-10-12: `cmake`, `pkgconf`, `autoconf`, `automake`, `libtool`, `meson`
+and `ninja`; the one-liner's `brew install python3`, when it runs, already
+brings in `cmake`). The forbidden-formula check covers runtime dependencies
+only, so it does not stop these, `cmake` included; the packages step's
+Intel warning names them. A run that timed out continues where it stopped
+on the next one. Every pinned tool has an Intel build.
 
 If a Homebrew step fails: `brew doctor`, fix what it reports, rerun
 `dotfiles repair`. A formula that is installed but not linked fails with
@@ -198,19 +223,23 @@ the `brew link <formula>` command to run.
 ## What is never installed
 
 On every cell: no Docker/containers, ROS, `gh`/`glab`, nvm/conda/pyenv,
-apt Node.js, C/C++ toolchain, GNOME Shell/`ubuntu-desktop` or display
-manager. The apt plan is simulated first and the install stops if any of
-these would be pulled in.
+apt Node.js, C/C++ toolchain (Intel Macs: see below),
+GNOME Shell/`ubuntu-desktop` or display manager. The apt plan is simulated
+first and the install stops if any of these would be pulled in.
 
 On macOS the same holds for Homebrew: before installing, the formulae and
-all their dependencies are checked, and the install stops if any of them
-is Node.js/npm/nvm, Homebrew's own fzf, neovim, Codex or Claude Code (they
-would shadow the pinned ones), a compiler toolchain (gcc, llvm, make,
-cmake, rust, go), Docker, colima/lima/podman, ROS, `gh`/`glab` or pyenv.
-Homebrew itself and the Command Line Tools are prerequisites: the
-one-liner installs Homebrew (and through it the Command Line Tools) only
-after you say yes, and never on an Intel Mac. Nothing is installed with
-`sudo`, and no cask is installed.
+all their runtime dependencies are checked, and the install stops if any
+of them is Node.js/npm/nvm, Homebrew's own fzf, neovim, Codex or Claude
+Code (they would shadow the pinned ones), a compiler toolchain (gcc, llvm,
+make, cmake, rust, go), Docker, colima/lima/podman, ROS, `gh`/`glab` or
+pyenv. Build-only dependencies are not checked: on Apple silicon, with
+Homebrew in `/opt/homebrew`, every formula of the closure has a bottle and
+needs none, but where Homebrew builds from source, as on an Intel Mac, it
+also installs their build-only dependencies, `cmake` among them (see Intel
+Macs above). Homebrew itself and the Command Line Tools are prerequisites:
+the one-liner installs Homebrew (and through it the Command Line Tools)
+only after you say yes, and never on an Intel Mac. Nothing is installed
+with `sudo`, and no cask is installed.
 
 
 ## Reporting a result
@@ -221,7 +250,8 @@ hostnames, usernames and device names out of the report.
 
 On a Mac, run `dotfiles status` and `dotfiles services` instead (the
 system `python3` there is the Command Line Tools' 3.9), and add
-`sw_vers -productVersion`, `sw_vers -buildVersion`, `uname -m` and
-`brew --prefix`. Write your home directory as `~`. Never include serial
-numbers, hardware UUIDs or the computer's name (`system_profiler` prints
-all three).
+`SYSTEM_VERSION_COMPAT=0 sw_vers -productVersion` (as `etc/install` asks
+it: a shell that exports `SYSTEM_VERSION_COMPAT=1` gets 10.16 or 16.0
+otherwise), `sw_vers -buildVersion`, `uname -m` and `brew --prefix`.
+Write your home directory as `~`. Never include serial numbers, hardware
+UUIDs or the computer's name (`system_profiler` prints all three).
