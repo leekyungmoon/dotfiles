@@ -10,7 +10,9 @@ On macOS the system phase is Homebrew instead (``manifests/packages-macos.json``
 brew runs as the installing user and never through sudo. The runtime closure of
 the missing formulae (``brew deps``) is checked against the forbidden patterns
 before anything is installed, and afterwards every formula's executables must
-be linked into the Homebrew prefix. Like apt, it is not recorded by the
+be linked into the Homebrew prefix. Build-only dependencies are outside that
+check: where brew builds from source (Intel Macs) it installs them too, which
+the phase says but does not stop. Like apt, it is not recorded by the
 transaction.
 
 Tool artifacts from ``manifests/tools.json`` are downloaded to a private
@@ -41,6 +43,7 @@ import json
 import os
 import re
 import secrets
+import shlex
 import shutil
 import sys
 import tarfile
@@ -530,6 +533,13 @@ BREW_SETTINGS = {
 }
 BREW_LANG = "en_US.UTF-8"
 _VERSION = re.compile(r"(\d+)\.(\d+)")
+# Intel: the build-only formulae a source build of the profile installs. brew
+# keeps a formula's build dependencies when it has no bottle to pour, and on
+# Intel it then builds without asking; 'brew deps' (runtime only) never lists
+# them. From the formula data of 2026-10-12 (manifests/packages-macos.json
+# evidence.build_only_x86_64, which a unit test keeps equal to this).
+INTEL_BUILD_ONLY_FORMULAE = ("cmake", "pkgconf", "autoconf", "automake", "libtool", "meson",
+                             "ninja")
 
 
 def brew_env(ctx: _Ctx) -> dict[str, str]:
@@ -641,6 +651,41 @@ def _unlinked_reason(prefix: Path, unlinked: list[tuple[str, str]]) -> str:
             f"'brew link {' '.join(formulae)}' (or 'brew doctor' to see what blocks it), then rerun")
 
 
+# Homebrew outside the architecture's default prefix. zsh/zshenv exports
+# HOMEBREW_PREFIX for /opt/homebrew only, and puts no other prefix on PATH but
+# ~/.homebrew (Intel's /usr/local is on the system PATH). Later runs of
+# install.py and bin/dotfiles take the prefix from HOMEBREW_PREFIX, else the
+# default, so they look in the default one; and where the prefix is not on
+# PATH either, new terminals miss brew, tmux and Homebrew's python3
+# (bin/dotfiles then stops under the Command Line Tools' python 3.9). Two
+# lines in ~/.zshenv.local fix both: zshenv sources it once ~/.local/bin and
+# the pinned tools are in front, and moves the system directories behind it
+# afterwards.
+
+def _zshenv_local_lines(prefix: Path) -> list[str]:
+    return [f"export HOMEBREW_PREFIX={shlex.quote(str(prefix))}",
+            f"path+=({shlex.quote(str(prefix / 'bin'))} {shlex.quote(str(prefix / 'sbin'))})"]
+
+
+def _shell_setup_reason(ctx: _Ctx) -> str | None:
+    """What to add to ~/.zshenv.local for a prefix other than the default;
+    None for the default prefix, and once ~/.zshenv.local has both lines."""
+
+    prefix, default = ctx.brew_prefix, homebrew_prefix(ctx.platform, {})
+    if prefix is None or prefix == default:
+        return None
+    lines = _zshenv_local_lines(prefix)
+    try:
+        text = (ctx.target.home / ".zshenv.local").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        text = ""
+    if set(lines) <= {line.strip() for line in text.splitlines()}:
+        return None
+    return (f"homebrew: Homebrew is in {prefix}, not in the default {default}; for new terminals "
+            f"and later 'dotfiles update' or 'dotfiles repair' runs to use it, add these two "
+            f"lines to ~/.zshenv.local: '{lines[0]}' and '{lines[1]}'")
+
+
 def brew_step(ctx: _Ctx, manifest: dict, groups: list[str]) -> dict:
     """Return {"status", "reasons", ...details} for the Homebrew part (macOS)."""
 
@@ -666,8 +711,19 @@ def brew_step(ctx: _Ctx, manifest: dict, groups: list[str]) -> dict:
         return info
     warnings: list[str] = []
     if ctx.platform.best_effort:
+        # Said, not enforced: refusing the build-only formulae would stop
+        # every Intel install, and Intel is best effort.
+        build_only = list(INTEL_BUILD_ONLY_FORMULAE)
+        forbidden = forbidden_matches(build_only, manifest["forbidden"]["patterns"])
         warnings.append("homebrew: Intel Mac: Homebrew supports Intel only at Tier 3 (no new "
-                        "bottles), so formulae may build from source and take long")
+                        "bottles), so formulae may build from source and take long, and a source "
+                        f"build also installs build-only formulae (today: {', '.join(build_only)}) "
+                        "that the forbidden-formula check, which covers the runtime closure only, "
+                        "does not see" + (f"; forbidden among them: {', '.join(forbidden)}"
+                                          if forbidden else ""))
+    shell_setup = _shell_setup_reason(ctx)
+    if shell_setup:
+        warnings.append(shell_setup)
     if os.geteuid() == 0:
         info.update(status=FAIL, reasons=[f"homebrew: refusing to run brew as root; run the "
                                           f"installer as the user who owns {prefix}"])
@@ -690,6 +746,9 @@ def brew_step(ctx: _Ctx, manifest: dict, groups: list[str]) -> dict:
         # The runtime dependencies of the missing formulae, plus the formulae
         # themselves. No --missing: a forbidden dependency that happens to be
         # installed already is still something the profile would depend on.
+        # No --include-build: it lists build dependencies whether or not brew
+        # pours a bottle, so it would refuse Apple silicon, where every
+        # formula is poured (the Intel warning above names what is missed).
         deps = _run(ctx, [brew, "deps", "--union", "--full-name", "--formula", *missing],
                     timeout=APT_SIMULATE_TIMEOUT, read_only=True, env=env)
         if deps.returncode != 0:
@@ -1513,6 +1572,10 @@ def run_packages_phase(
     elif dry_run:
         status = SKIPPED
         reasons.insert(0, "dry-run: plan only")
+    elif sel_tools and not sel_groups and not_here.issuperset(sel_tools):
+        # Only tools this system does not get ('--only nerd-font' on macOS):
+        # nothing was installed, which is no PASS.
+        status = SKIPPED
     else:
         status = PASS
 

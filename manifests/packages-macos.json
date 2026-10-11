@@ -4,7 +4,7 @@
   "keys": {
     "targets": "Supported macOS major release -> Homebrew bottle codename, per architecture. installer/platform.py holds the same lists (SUPPORTED_MACOS_RELEASES, MACOS_INTEL_RELEASES) and refuses anything else before any change.",
     "homebrew": "How the installer finds and runs brew: the prefix per architecture, the read-only queries, the install command and the environment it passes. All of it runs as the installing user.",
-    "forbidden": "Regular expressions matched against the missing formulae and their whole runtime closure ('brew deps --union --full-name --formula <missing>'; a tap prefix is ignored). Any match is a hard failure before installing anything.",
+    "forbidden": "Regular expressions matched against the missing formulae and their whole runtime closure ('brew deps --union --full-name --formula <missing>'; a tap prefix is ignored). Any match is a hard failure before installing anything. The check covers that runtime closure only: build-only dependencies are not in it, and where brew builds a formula from source (Intel, see support.amd64) it installs them unchecked; the installer's Intel warning names them.",
     "groups": "Ordered formula groups with the same ids as manifests/packages.json. default=true groups are part of the one-line install. Each formula names why the reviewed configuration needs it and the executables it provides; after installing, each one must exist in <prefix>/bin. satisfied_by replaces the 'brew list' check with an executable and a minimum version.",
     "not_from_homebrew": "What the Ubuntu profile installs that macOS ships itself, that comes from elsewhere or that does not apply, and why.",
     "release_notes": "Per-architecture differences that change behaviour, including known degraded features.",
@@ -23,7 +23,7 @@
   },
   "support": {
     "arm64": "Apple silicon: Homebrew Tier 1 on macOS 15, 26 and 27. Every formula of the closure is bottled for arm64_sequoia, arm64_tahoe and arm64_golden_gate (see evidence).",
-    "amd64": "Intel: best effort. Homebrew supports Intel only at Tier 3 (no new bottles, formulae may build from source with the Command Line Tools), its official installer refuses Intel, and Intel Macs stop at macOS 26. The installer needs an existing Homebrew in /usr/local and warns before installing."
+    "amd64": "Intel: best effort. Homebrew supports Intel only at Tier 3 (no new bottles, formulae may build from source with the Command Line Tools), its official installer refuses Intel, and Intel Macs stop at macOS 26. The installer needs an existing Homebrew in /usr/local and warns before installing. A source build also installs the build-only dependencies of what it builds, which the forbidden check (runtime closure only) does not cover and the installer does not stop: cmake, pkgconf, autoconf, automake, libtool, meson and ninja on 2026-10-12 (evidence.build_only_x86_64), cmake among them matching a forbidden pattern. The bootstrap's 'brew install python3', when it runs, already brings cmake in: python@3.15 needs zstd, which needs lz4, which has no x86_64 bottle and builds with cmake."
   },
   "homebrew": {
     "prefixes": {
@@ -158,7 +158,7 @@
       "python3": "Homebrew's default python (3.15 in October 2026). pip outside a venv is blocked by PEP 668, which matches the venv-only policy."
     },
     "amd64": {
-      "bottles": "No x86_64 macOS bottles for tmux, git, gnupg, python and openssl (checked 2026-10-11): 'brew install' builds them from source with the Command Line Tools, which can take an hour or more. The installer warns first.",
+      "bottles": "No x86_64 macOS bottles for tmux, git, gnupg, python and openssl (checked 2026-10-11): 'brew install' builds them from source with the Command Line Tools, which can take an hour or more, and installs their build-only dependencies too (support.amd64). The installer warns first.",
       "tools": "Every pinned tool in manifests/tools.json has a darwin-amd64 build; none needs a compiler."
     }
   },
@@ -246,6 +246,43 @@
         "tmux",
         "utf8proc",
         "xz"
+      ]
+    },
+    "build_only_x86_64": {
+      "date": "2026-10-12",
+      "method": "The same formula data, followed the way brew installs on Intel: a formula without a pourable x86_64 bottle is built from source, and brew then also installs its build dependencies (FormulaInstaller keeps them for a dependent it cannot pour, and on Intel brew builds without asking). From an empty Homebrew on sequoia and tahoe that is 44 formulae; these are the build-only ones, each with the formulae that need it. installer/packages.py INTEL_BUILD_ONLY_FORMULAE names the same ones in its Intel warning.",
+      "formulae": {
+        "autoconf": [
+          "gmp"
+        ],
+        "automake": [
+          "gmp"
+        ],
+        "cmake": [
+          "json-c",
+          "lz4",
+          "utf8proc"
+        ],
+        "libtool": [
+          "gmp"
+        ],
+        "meson": [
+          "p11-kit"
+        ],
+        "ninja": [
+          "p11-kit"
+        ],
+        "pkgconf": [
+          "git",
+          "gnupg",
+          "libevent",
+          "p11-kit",
+          "python@3.15",
+          "tmux"
+        ]
+      },
+      "forbidden_hits": [
+        "cmake"
       ]
     },
     "not_proven": "Installation, linking and execution on a Mac. macOS stays live-pending until 'install.py packages --dry-run' and a real run pass on an Apple silicon Mac."

@@ -6,7 +6,8 @@ environment) and brew itself is scripted by :class:`BrewRunner`, which extends
 test_packages.FakeRunner. The macOS system directories are replaced by an
 empty sandbox directory, so a gpgv or python3 of the host never stands in for
 Homebrew's. Nothing here runs a real brew, sudo or launchctl, or touches the
-real home; only fixture shell scripts inside the sandbox are executed.
+real home; only fixture shell scripts inside the sandbox are executed, and
+zsh (when installed) on a copy of zsh/zshenv with the sandbox as HOME.
 
 RealMacTests run only on macOS (CI) and only make brew's read-only queries.
 """
@@ -16,6 +17,8 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
+import subprocess
 import sys
 import unittest
 from pathlib import Path
@@ -509,6 +512,20 @@ class BrewStepTests(unittest.TestCase):
         result = self.fx.run_brew()
         self.assertFalse([r for r in result["reasons"] if "Tier 3" in r])
 
+    def test_intel_warning_names_the_unchecked_build_only_formulae(self):
+        """'brew deps' lists the runtime closure only; a source build also
+        installs build-only formulae (cmake among them), which the check
+        does not see and the phase does not stop."""
+        result = self.fx.run_brew(MAC_INTEL)
+        self.assertEqual(result["status"], "PASS", result["reasons"])
+        warning = next(r for r in result["reasons"] if "Tier 3" in r)
+        self.assertIn("a source build also installs build-only formulae (today: cmake, pkgconf, "
+                      "autoconf, automake, libtool, meson, ninja) that the forbidden-formula "
+                      "check, which covers the runtime closure only, does not see; forbidden "
+                      "among them: cmake", warning)
+        deps = next(argv for argv, _ in self.runner.brew_calls() if argv[1] == "deps")
+        self.assertNotIn("--include-build", deps)
+
     def test_gui_group_needs_no_homebrew(self):
         self.runner.brew.unlink()
         result = self.fx.run_darwin(only=["gui"])
@@ -539,6 +556,104 @@ class BrewStepTests(unittest.TestCase):
         result = fx.run(only=["shell-core"], exclude=list(fx.tools["tools"]))
         self.assertIn("apt", result["details"])
         self.assertNotIn("homebrew", result["details"])
+
+
+class ShellSetupTests(unittest.TestCase):
+    """Homebrew outside the architecture's default prefix: zsh/zshenv exports
+    HOMEBREW_PREFIX for /opt/homebrew only (and puts no other prefix on PATH
+    but ~/.homebrew), so the phase says what to add to ~/.zshenv.local and
+    stays PASS. The fixture's prefix is a sandbox directory: such a prefix."""
+
+    def setUp(self):
+        self.fx = DarwinFixture(self)
+        self.runner = self.fx.runner
+        self.prefix = self.runner.prefix
+
+    @staticmethod
+    def hints(result):
+        return [r for r in result["reasons"] if "~/.zshenv.local" in r]
+
+    def test_a_custom_prefix_gets_the_two_lines(self):
+        for platform, default in ((MAC_ARM, "/opt/homebrew"), (MAC_INTEL, "/usr/local")):
+            with self.subTest(platform=platform.artifact_key):
+                fx = DarwinFixture(self)
+                result = fx.run_brew(platform)
+                self.assertEqual(result["status"], "PASS", result["reasons"])
+                self.assertEqual(result["details"]["homebrew"]["status"], "PASS")
+                prefix = fx.runner.prefix
+                self.assertEqual(self.hints(result), [
+                    f"homebrew: Homebrew is in {prefix}, not in the default {default}; for new "
+                    f"terminals and later 'dotfiles update' or 'dotfiles repair' runs to use it, "
+                    f"add these two lines to ~/.zshenv.local: 'export HOMEBREW_PREFIX={prefix}' "
+                    f"and 'path+=({prefix}/bin {prefix}/sbin)'"])
+
+    def test_the_default_prefix_gets_none(self):
+        with mock.patch.dict(plat.HOMEBREW_PREFIXES, {"arm64": str(self.prefix)}):
+            result = self.fx.run_brew()
+        self.assertEqual(result["status"], "PASS", result["reasons"])
+        self.assertEqual(self.hints(result), [])
+
+    def test_none_once_zshenv_local_has_the_lines(self):
+        local = self.fx.target.home / ".zshenv.local"
+        export, path = pk._zshenv_local_lines(self.prefix)
+        self.assertEqual(export, f"export HOMEBREW_PREFIX={self.prefix}")
+        local.write_text(f"# mine\n{export}\n  {path}\n")
+        self.assertEqual(self.hints(self.fx.run_brew()), [])
+        local.write_text(f"{export}\n")  # one line is not both
+        self.assertEqual(len(self.hints(self.fx.run_brew())), 1)
+
+    def test_a_dry_run_says_it_too(self):
+        result = self.fx.run_darwin(dry_run=True)
+        self.assertEqual(result["status"], "SKIPPED", result["reasons"])
+        self.assertEqual(len(self.hints(result)), 1)
+
+    def test_a_prefix_that_needs_quoting_is_quoted(self):
+        lines = pk._zshenv_local_lines(Path("/opt/my brew"))
+        self.assertEqual(lines, ["export HOMEBREW_PREFIX='/opt/my brew'",
+                                 "path+=('/opt/my brew/bin' '/opt/my brew/sbin')"])
+
+    @unittest.skipUnless(shutil.which("zsh"), "needs zsh")
+    def test_zsh_zshenv_with_the_lines_finds_this_homebrew(self):
+        """The two lines in ~/.zshenv.local, read by the real zsh/zshenv (a
+        copy whose path_helper is a stub printing the system PATH; uname
+        answers Darwin arm64): Homebrew's bin and sbin come after the pinned
+        tools and ~/.local/bin and before the system directories, and
+        HOMEBREW_PREFIX is exported."""
+        (hint,) = self.hints(self.fx.run_brew())
+        lines = pk._zshenv_local_lines(self.prefix)
+        for line in lines:
+            self.assertIn(f"'{line}'", hint)
+        home = self.fx.target.home
+        (home / ".zshenv.local").write_text("\n".join(lines) + "\n")
+        local_bin = home / ".local" / "bin"
+        local_bin.mkdir(parents=True, exist_ok=True)
+        self.fx.bin_dir.mkdir(parents=True, exist_ok=True)
+        work = self.fx.root / "zshenv-check"
+        (work / "tmp").mkdir(parents=True)
+        helper = work / "path_helper"
+        helper.write_bytes(script("echo 'PATH=\"/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin\"; "
+                                  "export PATH;'"))
+        helper.chmod(0o755)
+        zshenv = (REPO_ROOT / "zsh" / "zshenv").read_text(encoding="utf-8")
+        self.assertIn("/usr/libexec/path_helper", zshenv)
+        (work / "zshenv").write_text(zshenv.replace("/usr/libexec/path_helper", str(helper)))
+        probe = ('uname() { if [[ $1 == -m ]]; then print arm64; else print Darwin; fi }\n'
+                 'OSTYPE=darwin24\n'
+                 'source "$ZSHENV_COPY"\n'
+                 'print -r -- "${(t)HOMEBREW_PREFIX}=$HOMEBREW_PREFIX"\n'
+                 'print -rl -- $path\n')
+        env = {"HOME": str(home), "PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "LANG": "C",
+               "TMPDIR": str(work / "tmp"), "ZSHENV_COPY": str(work / "zshenv")}
+        done = subprocess.run([shutil.which("zsh"), "-f", "-c", probe], env=env,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        exported, *path = done.stdout.decode().splitlines()
+        self.assertEqual(exported, f"scalar-export={self.prefix}")
+        order = [str(self.fx.bin_dir), str(local_bin), f"{self.prefix}/bin", f"{self.prefix}/sbin",
+                 "/usr/local/bin", "/usr/bin", "/bin"]
+        for name in order:
+            self.assertIn(name, path)
+        self.assertEqual(sorted(order, key=path.index), order, path)
 
 
 class DarwinToolTests(unittest.TestCase):
@@ -615,7 +730,9 @@ class DarwinToolTests(unittest.TestCase):
 
     def test_nerd_font_is_skipped_with_the_cask_hint(self):
         result = self.fx.run_darwin(only=["nerd-font"])
-        self.assertEqual(result["status"], "PASS", result["reasons"])
+        # Nothing selected is installed here: the phase says so, not PASS
+        # ('dotfiles install nerd-font' must not report a success).
+        self.assertEqual(result["status"], "SKIPPED", result["reasons"])
         font = result["details"]["tools"]["nerd-font"]
         self.assertEqual(font["status"], "SKIPPED")
         self.assertEqual(font["hint"], "brew install --cask font-jetbrains-mono-nerd-font")
@@ -629,11 +746,35 @@ class DarwinToolTests(unittest.TestCase):
         self.fx.tools["tools"]["fzf"]["platforms"] = {"darwin": {"skip": True, "reason": "fixture"}}
         self.fx.write_manifests()
         result = self.fx.run_darwin(only=["fzf"])
-        self.assertEqual(result["status"], "PASS", result["reasons"])
+        self.assertEqual(result["status"], "SKIPPED", result["reasons"])
         self.assertEqual(result["details"]["tools"]["fzf"]["status"], "SKIPPED")
         self.assertEqual(result["details"]["links"], [])
         self.assertIn("fzf: not installed on macOS", result["reasons"])
         self.assertEqual(self.fx.fetch.calls, [])
+
+    def test_a_skipped_tool_next_to_an_installed_one_passes(self):
+        result = self.fx.run_darwin(only=["nerd-font", "fzf"])
+        self.assertEqual(result["status"], "PASS", result["reasons"])
+        self.assertEqual(result["details"]["tools"]["nerd-font"]["status"], "SKIPPED")
+        self.assertEqual(result["details"]["tools"]["fzf"]["status"], "PASS")
+        self.assertIn("nerd-font: not installed on macOS; install it with "
+                      "'brew install --cask font-jetbrains-mono-nerd-font'", result["reasons"])
+
+    def test_a_full_install_passes_with_the_font_skipped(self):
+        result = self.fx.run_darwin()
+        self.assertEqual(result["status"], "PASS", result["reasons"])
+        self.assertEqual(result["details"]["tools"]["nerd-font"]["status"], "SKIPPED")
+        self.assertEqual(result["details"]["homebrew"]["status"], "PASS")
+
+    def test_a_darwin_skip_changes_nothing_on_linux(self):
+        fx = base.Fixture(self)
+        fx.tools["tools"]["fzf"]["platforms"] = {"darwin": {
+            "skip": True, "reason": "fixture", "hint": "brew install --cask x"}}
+        fx.write_manifests()
+        result = fx.run(only=["fzf"])
+        self.assertEqual(result["status"], "PASS", result["reasons"])
+        self.assertEqual(result["details"]["tools"]["fzf"]["status"], "PASS")
+        self.assertFalse([r for r in result["reasons"] if "macOS" in r])
 
     def test_nerd_font_skip_in_a_dry_run(self):
         result = self.fx.run_darwin(only=["nerd-font"], dry_run=True)
@@ -917,6 +1058,19 @@ class MacosProfileTests(unittest.TestCase):
         self.assertEqual(sorted(evidence["closure_count"]),
                          sorted(["arm64_sequoia", "arm64_tahoe", "arm64_golden_gate", "sequoia", "tahoe"]))
         self.assertTrue(evidence["not_proven"].strip())
+
+    def test_the_build_only_formulae_are_documented_as_unchecked(self):
+        """What the Intel warning names is what the evidence found, and the
+        texts say the forbidden check covers the runtime closure only."""
+        build_only = self.mac["evidence"]["build_only_x86_64"]
+        self.assertEqual(sorted(build_only["formulae"]), sorted(pk.INTEL_BUILD_ONLY_FORMULAE))
+        self.assertEqual(build_only["forbidden_hits"], pk.forbidden_matches(
+            pk.INTEL_BUILD_ONLY_FORMULAE, self.mac["forbidden"]["patterns"]))
+        self.assertEqual(build_only["forbidden_hits"], ["cmake"])
+        self.assertIn("The check covers that runtime closure only", self.mac["keys"]["forbidden"])
+        for name in pk.INTEL_BUILD_ONLY_FORMULAE:
+            with self.subTest(formula=name):
+                self.assertIn(name, self.mac["support"]["amd64"])
 
     def test_no_pynvim_and_no_pip_on_macos(self):
         self.assertFalse([p for p in self.formulae() if "pynvim" in p["name"]])

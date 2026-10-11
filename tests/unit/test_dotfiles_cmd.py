@@ -23,6 +23,8 @@ which answers libproc's calls from /proc in macOS's layouts and conventions
 (SimulatedMacosRefreshTerminalTests), and against scripted backends
 (DarwinProbeTests). bin/dotfiles also runs install.py under a python 3.10
 or newer, re-executing itself when its own is older (PythonVersionTests).
+On macOS, 'dotfiles install' leaves out, with what to run instead, a tool
+that tools.json does not install there (PlatformCommandTests).
 """
 
 from __future__ import annotations
@@ -1615,6 +1617,27 @@ class PlatformCommandTests(unittest.TestCase):
         self.mod = load_dotfiles_module()
         self.delegated = []
         self.mod._installer = lambda *args: self.delegated.append(list(args)) or 0
+        # ~/.dotfiles is a scratch checkout whose tools.json has the real
+        # nerd-font entry (skipped on macOS) and a plain fzf.
+        tmp = tempfile.TemporaryDirectory(prefix="pdf-platform-")
+        self.addCleanup(tmp.cleanup)
+        manifests = Path(tmp.name) / "manifests"
+        manifests.mkdir()
+        real = json.loads((REPO_ROOT / "manifests" / "tools.json").read_text(encoding="utf-8"))
+        self.font = real["tools"]["nerd-font"]
+        (manifests / "tools.json").write_text(json.dumps(
+            {"schema": 1, "tools": {"fzf": {}, "nerd-font": self.font}}))
+        self.mod._dotfiles_dir = lambda: tmp.name
+
+    def install(self, *targets, darwin):
+        import contextlib
+        import io
+        self.mod._darwin_host = lambda: darwin
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), \
+                mock.patch.object(sys, "platform", "darwin" if darwin else "linux"):
+            ret = self.mod.install_local(list(targets))
+        return ret, " ".join(out.getvalue().split())
 
     def test_gui_apply_is_not_applicable_on_macos(self):
         self.mod._darwin_host = lambda: True
@@ -1645,6 +1668,55 @@ class PlatformCommandTests(unittest.TestCase):
                         with self.assertRaises(SystemExit):
                             self.mod.install_local(["fzf"])
                         self.assertEqual(self.delegated, [])
+
+    def test_install_of_a_tool_macos_skips_changes_nothing(self):
+        """install.py would report it SKIPPED and exit 0: no 'Installation
+        successful' for a font that was not installed."""
+        ret, out = self.install("nerd-font", darwin=True)
+        self.assertEqual(ret, 2)
+        self.assertEqual(self.delegated, [])
+        self.assertIn("nerd-font is not installed on macOS: Core Text (Terminal, iTerm2, "
+                      "Ghostty) does not read fontconfig directories", out)
+        self.assertNotIn("not installed on macOS: Not installed on macOS", out)
+        self.assertIn("Install it with 'brew install --cask font-jetbrains-mono-nerd-font'.", out)
+        self.assertLess(out.index("Install it with"), out.index("Nothing was changed."))
+        self.assertNotIn("successful", out)
+
+    def test_dotfiles_install_nerd_font_exits_2_on_macos(self):
+        import contextlib
+        import io
+        self.mod._darwin_host = lambda: True
+        with mock.patch.object(sys, "argv", ["dotfiles", "install", "nerd-font"]), \
+                mock.patch.object(sys, "platform", "darwin"), \
+                contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(SystemExit) as raised:
+                self.mod.main()
+        self.assertEqual(raised.exception.code, 2)
+        self.assertEqual(self.delegated, [])
+
+    def test_the_other_targets_are_still_installed_on_macos(self):
+        ret, out = self.install("nerd-font", "fzf", darwin=True)
+        self.assertIsNone(ret)
+        self.assertEqual(self.delegated, [["packages", "--only", "fzf"]])
+        self.assertIn("nerd-font is not installed on macOS", out)
+        self.assertIn("[*] Installation successful: fzf", out)
+        self.assertNotIn("Installation successful: nerd-font", out)
+        self.assertNotIn("Nothing was changed.", out)
+        self.assertLess(out.index("nerd-font is not installed"), out.index("successful: fzf"))
+
+    def test_a_tool_without_a_darwin_skip_is_installed_on_macos(self):
+        ret, out = self.install("fzf", darwin=True)
+        self.assertIsNone(ret)
+        self.assertEqual(self.delegated, [["packages", "--only", "fzf"]])
+        self.assertNotIn("not installed on macOS", out)
+
+    def test_linux_still_installs_the_font(self):
+        self.assertTrue(self.font["platforms"]["darwin"]["skip"])
+        ret, out = self.install("nerd-font", darwin=False)
+        self.assertIsNone(ret)
+        self.assertEqual(self.delegated, [["packages", "--only", "nerd-font"]])
+        self.assertIn("[*] Installation successful: nerd-font", out)
+        self.assertNotIn("macOS", out)
 
 
 # The standard-library modules bin/dotfiles uses, for interpreters without

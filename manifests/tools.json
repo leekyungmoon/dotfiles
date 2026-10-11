@@ -2508,7 +2508,7 @@
       "platforms": {
         "darwin": {
           "skip": true,
-          "reason": "Not installed on macOS: Core Text (Terminal, iTerm2, Ghostty) does not read fontconfig directories such as the prefix above, and macOS has no fc-cache. Fonts in ~/Library/Fonts are left to the user or a Homebrew cask.",
+          "reason": "Not installed on macOS: Core Text (Terminal, iTerm2, Ghostty) does not read fontconfig directories such as ~/.local/share/fonts, and macOS has no fc-cache. Fonts in ~/Library/Fonts are left to the user or a Homebrew cask.",
           "hint": "brew install --cask font-jetbrains-mono-nerd-font",
           "hint_note": "On 2026-10-11 that cask was 3.5.1 with the same archive URL and sha256 as artifacts.any and put each TTF directly into ~/Library/Fonts. Cask versions float, so it is a hint, not a pin."
         }

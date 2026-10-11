@@ -654,17 +654,54 @@ def open_github(argv=()):
         print(GITHUB_URL)
 
 
-def _available_packages():
-    '''Pinned tools from manifests/tools.json (installed without sudo).'''
+def _tools_manifest():
+    '''The "tools" of the checkout's manifests/tools.json; {} when it cannot be read.'''
     path = os.path.join(_dotfiles_dir(), 'manifests', 'tools.json')
     try:
         with open(path) as f:
-            tools = json.load(f).get('tools', {})
+            return json.load(f).get('tools', {})
     except (OSError, ValueError, AttributeError):
-        return []
+        return {}
+
+
+def _available_packages():
+    '''Pinned tools from manifests/tools.json (installed without sudo).'''
+    tools = _tools_manifest()
     if isinstance(tools, dict):
         return list(tools)
     return [t.get('name') for t in tools if isinstance(t, dict) and t.get('name')]
+
+
+# macOS: a tool whose tools.json entry says platforms.darwin.skip (the nerd
+# font: Core Text does not read fontconfig directories) is not installed
+# there. install.py reports it SKIPPED and exits 0, which 'dotfiles install'
+# must not take for an installation.
+
+_NOT_ON_MACOS = 'not installed on macOS'
+
+
+def _skipped_on_macos(targets):
+    '''{target: its platforms.darwin entry} for the targets macOS skips.'''
+    tools = _tools_manifest()
+    skipped = {}
+    for t in targets:
+        spec = tools.get(t) if isinstance(tools, dict) else None
+        entry = (spec.get('platforms') or {}).get('darwin') if isinstance(spec, dict) else None
+        if isinstance(entry, dict) and entry.get('skip'):
+            skipped[t] = entry
+    return skipped
+
+
+def _skip_message(tool, entry):
+    '''"<tool> is not installed on macOS: <reason>. Install it with '<hint>'."'''
+    reason = str(entry.get('reason') or '').strip()
+    if reason.lower().startswith(_NOT_ON_MACOS.lower()):
+        reason = reason[len(_NOT_ON_MACOS):].lstrip(' :;,.')  # it is said once
+    reason = reason.rstrip(' .')
+    message = '{} is {}'.format(tool, _NOT_ON_MACOS) + ((': ' + reason + '.') if reason else '.')
+    if entry.get('hint'):
+        message += " Install it with '{}'.".format(entry['hint'])
+    return message
 
 
 @add_argument('target', nargs='*', help='pinned tool to install, see ~/.dotfiles/manifests/tools.json for list')
@@ -694,6 +731,16 @@ def install_local(target, force=False, argv=()):
         print(RED('Unknown package(s), nothing was changed: ' + ', '.join(unknown)))
         print('Available packages: ' + ', '.join(packages))
         return 2
+
+    if _darwin_host():
+        skipped = _skipped_on_macos(target)
+        for t in target:
+            if t in skipped:
+                print(YELLOW(_skip_message(t, skipped[t])))
+        target = [t for t in target if t not in skipped]
+        if not target:
+            print(YELLOW('Nothing was changed.'))
+            return 2
 
     for t in target:
         args = ['packages', '--only', t]
