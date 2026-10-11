@@ -25,7 +25,7 @@ SUPPORTED_ARCHITECTURES = ("amd64", "arm64")
 # Homebrew has Intel at Tier 3 (no new bottles, formulae may build from
 # source), so amd64 is accepted on its last releases as best effort only.
 # Like the Ubuntu list, anything else is refused before any change; etc/install
-# keeps the same lists (tests/unit/test_platform.py compares them).
+# keeps the same lists (tests/unit/test_bootstrap_policy.py compares them).
 SUPPORTED_MACOS_RELEASES = ("15", "26", "27")
 SUPPORTED_MACOS_ARCHITECTURES = ("arm64", "amd64")
 MACOS_INTEL_RELEASES = ("15", "26")

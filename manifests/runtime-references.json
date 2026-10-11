@@ -1124,10 +1124,10 @@
     },
     {
       "file": "install",
-      "line": "dest=\"$(readlink -e -- \"${HOME}/.dotfiles\")\" || dest=\"\"",
+      "line": "dest=\"${HOME}/.dotfiles\"",
       "kind": "link",
       "classification": "runtime-link",
-      "purpose": "the ~/.dotfiles checkout, compared with the clone ./install runs from (read-only)"
+      "purpose": "the ~/.dotfiles checkout: ./install runs its etc/install only when this very file is that checkout's ./install (bash -ef: same device and inode, through any symlink), else prints what to run (read-only)"
     },
     {
       "file": "install",

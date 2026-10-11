@@ -16,6 +16,13 @@ A fake ``zsh`` on PATH records how the final 'exec zsh -l' started it (a fake
 ``getent`` stands in for the passwd login shell when zsh is not on PATH). The
 piped runs have no controlling terminal (like a harness or cron), so they must
 never start it; the pty runs give the script a real terminal.
+
+``BASH_UNDER_TEST=/path/to/bash`` runs everything under that bash instead of
+/bin/bash, e.g. a GNU bash 3.2.57 build, the version macOS ships as /bin/bash:
+the piped and pty runs start it directly, and ``bash`` on PATH is that one
+(./install's ``#!/usr/bin/env bash``, its ``exec bash`` and the re-exec of
+'sh install'). Only etc/install started by path still gets the host's
+/bin/bash from its shebang.
 """
 
 from __future__ import annotations
@@ -35,6 +42,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[2]
 ETC_INSTALL = REPO_ROOT / "etc" / "install"
 REAL_PYTHON = sys.executable
+BASH = os.path.abspath(os.environ.get("BASH_UNDER_TEST") or "/bin/bash")
 
 
 def _supported_host() -> bool:
@@ -93,6 +101,18 @@ esac
 exit 1
 '''
 
+# Fake mv: a rename whose source path contains one of the FAKE_MV_FAIL words
+# (':'-separated) fails; everything else goes to the real mv (@MV@).
+FAKE_FAILING_MV = r'''#!/bin/sh
+src=""; n=0
+for a; do n=$((n + 1)); if [ "$n" -eq $(($# - 1)) ]; then src=$a; fi; done
+IFS=:
+for word in ${FAKE_MV_FAIL:-}; do
+  case "$src" in *"$word"*) echo "mv: cannot move '$src': Permission denied" >&2; exit 1 ;; esac
+done
+exec "@MV@" "$@"
+'''
+
 DEFAULT_URL = "https://github.com/leekyungmoon/dotfiles.git"
 
 
@@ -101,7 +121,8 @@ class EtcInstallTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls._tmp = tempfile.TemporaryDirectory(prefix="pdf-etc-")
-        root = Path(cls._tmp.name)
+        # resolved: git reports physical paths (macOS's /var is /private/var)
+        root = Path(cls._tmp.name).resolve()
         cls.root = root
         cls.gitconfig = root / "gitconfig"
         cls.gitconfig.write_text("[user]\n\tname = Fixture\n\temail = f@example.invalid\n"
@@ -136,7 +157,7 @@ class EtcInstallTests(unittest.TestCase):
 
     def setUp(self):
         self._case = tempfile.TemporaryDirectory(prefix="pdf-etc-case-")
-        case = Path(self._case.name)
+        case = Path(self._case.name).resolve()
         self.home = case / "home"
         self.home.mkdir()
         self.bin = case / "bin"
@@ -155,6 +176,8 @@ class EtcInstallTests(unittest.TestCase):
         zsh = self.bin / "zsh"
         zsh.write_text(FAKE_ZSH.replace("@LOG@", str(self.zsh_log)))
         zsh.chmod(0o755)
+        if BASH != "/bin/bash":
+            (self.bin / "bash").symlink_to(BASH)  # see BASH_UNDER_TEST above
         self.case = case
 
     def tearDown(self):
@@ -164,7 +187,7 @@ class EtcInstallTests(unittest.TestCase):
         """Run etc/install; an ``extra`` value of None removes that variable."""
         env = self.env_for(path, **extra)
         body = ETC_INSTALL.read_bytes() if script is None else script
-        argv = ["/bin/bash"] + (["-s", "--", *args] if args else [])
+        argv = [BASH] + (["-s", "--", *args] if args else [])
         return subprocess.run(argv, input=body, env=env, stdout=subprocess.PIPE,
                               stderr=subprocess.PIPE, timeout=120,
                               start_new_session=True)  # no controlling terminal
@@ -182,14 +205,16 @@ class EtcInstallTests(unittest.TestCase):
                "DOTFILES_REPO_URL": str(self.mirror), **extra}
         return {k: v for k, v in env.items() if v is not None}
 
-    def run_in_terminal(self, *, args=(), stdout_file=None, command=None, **extra):
+    def run_in_terminal(self, *, args=(), stdout_file=None, command=None, typed=b"",
+                        **extra):
         """Run 'bash -s' with the script on stdin (as 'curl | bash' does) and a
         pseudo-terminal as the controlling terminal and stdout/stderr.
 
         Returns (exit status, terminal output). With ``stdout_file``, stdout
         goes to that file instead (the terminal stays the controlling one).
         With ``command`` (an argv, e.g. ~/.dotfiles/install), that runs
-        instead, with the terminal as stdin too.
+        instead, with the terminal as stdin too. ``typed`` is typed on the
+        terminal right away (it waits there for the first read).
         """
         script = self.case / "install.sh"
         script.write_bytes(ETC_INSTALL.read_bytes())
@@ -197,7 +222,7 @@ class EtcInstallTests(unittest.TestCase):
         if command is not None:
             argv = [str(a) for a in command] + list(args)
         else:
-            argv = ["/bin/bash", "-s", "--", *args] if args else ["/bin/bash", "-s"]
+            argv = [BASH, "-s", "--", *args] if args else [BASH, "-s"]
         pid, fd = pty.fork()
         if pid == 0:  # child: the pty is its controlling terminal
             try:
@@ -210,6 +235,8 @@ class EtcInstallTests(unittest.TestCase):
                 os.execve(argv[0], argv, env)
             finally:
                 os._exit(127)
+        if typed:
+            os.write(fd, typed)
         chunks = []
         deadline = time.monotonic() + 120
         try:
@@ -237,7 +264,7 @@ class EtcInstallTests(unittest.TestCase):
         no controlling terminal: /dev/tty cannot be opened."""
         master, slave = os.openpty()
         try:
-            proc = subprocess.Popen(["/bin/bash", "-s"], stdin=subprocess.PIPE,
+            proc = subprocess.Popen([BASH, "-s"], stdin=subprocess.PIPE,
                                     stdout=slave, stderr=slave, env=self.env_for(),
                                     start_new_session=True)
         finally:
@@ -790,6 +817,64 @@ class EtcInstallTests(unittest.TestCase):
                 self.assertEqual(self.backups(), [])
                 self.assertEqual(self.leftovers(), [])
                 self.assertEqual(self.installer_runs(), [])
+
+    def failing_mv(self, real_mv: str | None = None):
+        """mv on PATH fails the renames named by FAKE_MV_FAIL."""
+        mv = self.bin / "mv"
+        mv.write_text(FAKE_FAILING_MV.replace("@MV@", real_mv or shutil.which("mv")))
+        mv.chmod(0o755)
+
+    def old_checkout(self) -> Path:
+        old = self.home / ".dotfiles"
+        old.mkdir()
+        (old / "notes.txt").write_text("my old dotfiles\n")
+        return old
+
+    def test_failed_rename_into_place_puts_the_old_checkout_back(self):
+        self.failing_mv()
+        old = self.old_checkout()
+        completed = self.run_piped(FAKE_MV_FAIL=".new-")
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn(f"cannot move the new clone into place; {old} was put back.",
+                      completed.stderr.decode())
+        self.assertEqual((old / "notes.txt").read_text(), "my old dotfiles\n")
+        self.assertEqual(self.leftovers(), [])
+        self.assertEqual(self.installer_runs(), [])
+
+    def test_failed_put_back_says_where_the_old_checkout_is(self):
+        # Neither the new clone nor the old checkout can be renamed into
+        # place: the error says where the old one is and how to restore it.
+        self.failing_mv()
+        old = self.old_checkout()
+        completed = self.run_piped(FAKE_MV_FAIL=".new-:/backups/")
+        err = completed.stderr.decode()
+        self.assertNotEqual(completed.returncode, 0)
+        moved = self.backups()[0] / "dotfiles"
+        self.assertIn(f"nor put the previous {old} back. It is in {moved};", err)
+        self.assertEqual((moved / "notes.txt").read_text(), "my old dotfiles\n")
+        self.assertFalse(os.path.lexists(old))
+        self.assertEqual(self.leftovers(), [])
+        self.assertEqual(self.installer_runs(), [])
+        # The printed command restores it (the last copy is the message; the
+        # trace shows the _die call first).
+        restore = err.rsplit("restore it with:\n", 1)[1].splitlines()[0].strip()
+        self.assertEqual(restore, f'mv "{moved}" "{old}"')
+        subprocess.run(["sh", "-c", restore], check=True)
+        self.assertEqual((old / "notes.txt").read_text(), "my old dotfiles\n")
+
+    def test_rename_into_place_is_gnu_mv_t_on_linux(self):
+        # Traced as the plain GNU 'mv -T' it has always been (macOS, whose
+        # BSD mv has no -T, checks the destination first instead).
+        old = self.old_checkout()
+        completed = self.run_piped()
+        err = completed.stderr.decode()
+        self.assertEqual(completed.returncode, 0, err)
+        renames = [line for line in err.splitlines() if line.startswith("+ mv -T -- ")]
+        self.assertEqual(len(renames), 1, err)
+        fresh, dest = renames[0][len("+ mv -T -- "):].split(" ")
+        self.assertTrue(fresh.startswith(f"{old}.new-"), fresh)
+        self.assertEqual(dest, str(old))
+        self.assertNotIn("_rename", err)
 
     def test_clone_with_submodules_is_complete_after_the_rename(self):
         env = self.git_env(self.case)

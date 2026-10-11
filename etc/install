@@ -7,6 +7,11 @@ if [ -z "${BASH_VERSION:-}" ]; then
   echo "ERROR: run this with bash: curl -fsSL https://raw.githubusercontent.com/leekyungmoon/dotfiles/HEAD/etc/install | bash" >&2
   exit 1
 fi
+# 'curl ... | sh' on macOS: its /bin/sh is bash 3.2 in POSIX mode, which
+# passes the check above. This file is written for bash's own mode, which
+# POSIX mode changes (there, for one, the /dev/tty probes below end the
+# whole script when there is no terminal): leave POSIX mode first.
+set +o posix
 
 # Usage:
 #   curl -fsSL https://raw.githubusercontent.com/leekyungmoon/dotfiles/HEAD/etc/install | bash
@@ -28,6 +33,16 @@ fi
 # plain 'git clone' left out are fetched first; install.py then brings all
 # of them to the commits the checkout records, as upstream does.
 #
+# Platforms: Ubuntu 22.04/24.04 (amd64, arm64), where missing prerequisites
+# come from sudo apt-get; and macOS (the releases below; Intel Macs only as
+# best effort), where they come from Homebrew, never with sudo: git, unless
+# the Xcode Command Line Tools have it, and python3 3.10 or newer, which then
+# runs install.py. A Mac without Homebrew gets the offer to run Homebrew's
+# official installer (Apple silicon, in a terminal); otherwise this stops
+# before any change and says what to run. macOS has no wget, but there
+# 'curl ... | sh' works as well (its sh is bash). This file runs under
+# macOS's /bin/bash 3.2 and BSD tools, too.
+#
 # Environment: DOTFILES_REPO_URL (clone source), DOTFILES_REF (branch, tag or
 # commit), DOTFILES_EXEC_SHELL=0 (do not start the new shell at the end).
 #
@@ -40,6 +55,16 @@ fi
 #
 # Everything runs inside main(), which is called on the very last line, so a
 # truncated download never runs a partial script.
+
+# The macOS policy, the same as installer/platform.py's (compared by
+# tests/unit/test_bootstrap_policy.py): the major releases supported on
+# Apple silicon (SUPPORTED_MACOS_RELEASES) and, as best effort, on Intel
+# (MACOS_INTEL_RELEASES); anything else is refused before any change. And
+# Homebrew's default prefix on each (HOMEBREW_PREFIXES).
+_MACOS_ARM64_RELEASES="15 26 27"
+_MACOS_INTEL_RELEASES="15 26"
+_HOMEBREW_ARM64_PREFIX=/opt/homebrew
+_HOMEBREW_INTEL_PREFIX=/usr/local
 
 main() {
   set -e
@@ -64,55 +89,39 @@ EOF
   trap '{ set +x; } 2> /dev/null; _discard_pending_clone' EXIT
 
   # In place when this very file, resolved, is ~/.dotfiles/etc/install ('curl
-  # | bash' has no file: BASH_SOURCE is "main" there). Only bash's own
-  # BASH_SOURCE counts, never one from the environment.
-  [[ "${BASH_SOURCE@a}" == *a* ]] || _die "BASH_SOURCE is set in the environment; unset it and rerun."
-  local in_place=0 self="" checkout=""
-  if self="$(readlink -e -- "${BASH_SOURCE[0]}" 2> /dev/null)" \
-      && checkout="$(readlink -e -- "$dest" 2> /dev/null)" \
-      && [[ "$self" == "$checkout/etc/install" ]]; then
+  # | bash' has no file: BASH_SOURCE is "main" there, or empty in bash 3.2).
+  # -ef compares device and inode, through any symlink or spelling (readlink
+  # -e is GNU only). Only bash's own BASH_SOURCE counts, never one from the
+  # environment.
+  _bash_source_is_own || _die "BASH_SOURCE is set in the environment; unset it and rerun."
+  local in_place=0
+  if [[ -n "${BASH_SOURCE[0]:-}" && "${BASH_SOURCE[0]}" -ef "$dest/etc/install" ]]; then
     in_place=1
   fi
+
+  # Linux or Darwin (macOS) decides which checks and tools apply below.
+  local os_name
+  os_name="$(uname -s 2> /dev/null || true)"
 
   # Refuse root: everything is installed for (and owned by) your own user.
   # _DOTFILES_INSTALL_SIMULATE_ROOT can only add this refusal (tests).
   if [[ "${EUID:-$(id -u)}" -eq 0 || "${_DOTFILES_INSTALL_SIMULATE_ROOT:-0}" == 1 ]]; then
+    if [[ "$os_name" == Darwin ]]; then
+      _die "do not run this as root (or with sudo). Run it as your normal user; Homebrew refuses to run as root."
+    fi
     _die "do not run this as root (or with sudo). Run it as your normal user; sudo is asked only for apt."
   fi
 
-  # Check the platform: Ubuntu 22.04/24.04 on amd64/arm64.
-  [[ -r /etc/os-release ]] || _die "cannot read /etc/os-release"
-  local os_id os_version arch
-  os_id="$(. /etc/os-release && echo "${ID:-}")"
-  os_version="$(. /etc/os-release && echo "${VERSION_ID:-}")"
-  [[ "$os_id" == ubuntu ]] || _die "unsupported distribution '$os_id'; Ubuntu 22.04 or 24.04 is required."
-  case "$os_version" in
-    22.04 | 24.04) ;;
-    *) _die "unsupported Ubuntu release '$os_version'; 22.04 or 24.04 is required." ;;
+  # Check the platform and the prerequisites, and install the missing ones.
+  # python runs install.py: python3 from PATH on Ubuntu, Homebrew's python3
+  # (an absolute path) on macOS.
+  local python=python3
+  case "$os_name" in
+    Linux) _prepare_ubuntu ;;
+    Darwin) _prepare_macos ;;
+    "") _die "cannot tell which system this is ('uname -s' failed)." ;;
+    *) _die "unsupported system '$os_name'; Ubuntu 22.04/24.04, or macOS ${_MACOS_ARM64_RELEASES// /, } on Apple silicon (${_MACOS_INTEL_RELEASES// /, } on Intel, best effort), is required." ;;
   esac
-  arch="$(dpkg --print-architecture 2>/dev/null || uname -m)"
-  case "$arch" in
-    amd64 | x86_64 | arm64 | aarch64) ;;
-    *) _die "unsupported architecture '$arch'; amd64 or arm64 is required." ;;
-  esac
-
-  # Check minimal dependencies; install the missing ones with sudo apt-get.
-  local missing=()
-  command -v git &> /dev/null || missing+=(git)
-  if ! command -v curl &> /dev/null && ! command -v wget &> /dev/null; then missing+=(curl); fi
-  command -v python3 &> /dev/null || missing+=(python3)
-  [[ -e /etc/ssl/certs/ca-certificates.crt ]] || missing+=(ca-certificates)
-  if (( ${#missing[@]} > 0 )); then
-    echo "Missing: ${missing[*]}. Installing git curl ca-certificates python3 with sudo apt-get."
-    echo "Please type your password if sudo asks for it."
-    command -v sudo &> /dev/null || _die "sudo not found. Ask an administrator to run: apt-get install -y git curl ca-certificates python3"
-    local tty_in=/dev/null
-    if [[ -t 0 ]]; then tty_in=/dev/stdin; elif { : < /dev/tty; } 2> /dev/null; then tty_in=/dev/tty; fi
-    { sudo apt-get update && sudo apt-get install -y git curl ca-certificates python3; } < "$tty_in" \
-      || _die "sudo apt-get install failed (sudo refused or apt unavailable). Install git curl ca-certificates python3 and rerun."
-  fi
-  python3 -c 'import sys; sys.exit(sys.version_info < (3, 10))' \
-    || _die "python3 3.10 or newer is required."
 
   local state_home="${XDG_STATE_HOME:-}"
   [[ "$state_home" == /* ]] || state_home="${HOME}/.local/state"
@@ -147,6 +156,13 @@ EOF
     backup="$candidate"
   fi
 
+  # Renames a complete clone into place, never into an existing directory:
+  # GNU 'mv -T' on Linux; BSD mv (macOS) has no -T, so there _rename makes
+  # sure nothing is in the way first. Chosen before tracing starts, so the
+  # trace shows the plain mv on Linux.
+  local rename=(mv -T --)
+  if [[ "$os_name" == Darwin ]]; then rename=(_rename); fi
+
   set -x
 
   # ============================================================================
@@ -155,9 +171,15 @@ EOF
 
   if [[ "$existing" == here ]]; then
     # The submodules a plain 'git clone' left out ('-' lines have no suffix).
-    local unfetched=()
-    mapfile -t unfetched < <(git -C "$dest" submodule status 2> /dev/null \
-      | sed -n 's/^-[0-9a-f]* //p')
+    # One path per line, read into the array by a loop (bash 3.2 has no
+    # mapfile), untraced: the trace shows the list once, not every read.
+    local unfetched=() listed line
+    listed="$(git -C "$dest" submodule status 2> /dev/null | sed -n 's/^-[0-9a-f]* //p')"
+    { set +x; } 2> /dev/null
+    while IFS= read -r line; do
+      if [[ -n "$line" ]]; then unfetched+=("$line"); fi
+    done <<< "$listed"
+    set -x
     if (( ${#unfetched[@]} > 0 )); then
       git -C "$dest" submodule update --init --recursive --jobs 8 -- "${unfetched[@]}"
     fi
@@ -195,9 +217,12 @@ EOF
       echo "Moved the existing $dest to $backup/dotfiles (nothing was deleted)."
       set -x
     fi
-    if ! mv -T -- "$fresh" "$dest"; then
-      if [[ "$existing" == move ]] && mv -T -- "$backup/dotfiles" "$dest"; then
+    if ! "${rename[@]}" "$fresh" "$dest"; then
+      if [[ "$existing" == move ]] && "${rename[@]}" "$backup/dotfiles" "$dest"; then
         _die "cannot move the new clone into place; $dest was put back."
+      fi
+      if [[ "$existing" == move ]]; then
+        _die "cannot move the new clone into place, nor put the previous $dest back. It is in $backup/dotfiles; once nothing is at $dest, restore it with:"$'\n'"  mv \"$backup/dotfiles\" \"$dest\""
       fi
       _die "cannot move the new clone into place."
     fi
@@ -206,9 +231,9 @@ EOF
 
   cd "$dest"
   if [[ -n "$tty_in" ]]; then
-    python3 install.py "$@" < "$tty_in"
+    "$python" install.py "$@" < "$tty_in"
   else
-    python3 install.py "$@" < /dev/null
+    "$python" install.py "$@" < /dev/null
   fi
 
   { set +x; } 2> /dev/null
@@ -218,12 +243,202 @@ EOF
   _exec_new_shell "$@"
 }
 
+# Ubuntu 22.04/24.04 on amd64/arm64, with the prerequisites installed by
+# sudo apt-get when missing: the checks main() always had, unchanged.
+_prepare_ubuntu() {
+  # Check the platform: Ubuntu 22.04/24.04 on amd64/arm64.
+  [[ -r /etc/os-release ]] || _die "cannot read /etc/os-release"
+  local os_id os_version arch
+  os_id="$(. /etc/os-release && echo "${ID:-}")"
+  os_version="$(. /etc/os-release && echo "${VERSION_ID:-}")"
+  [[ "$os_id" == ubuntu ]] || _die "unsupported distribution '$os_id'; Ubuntu 22.04 or 24.04 is required."
+  case "$os_version" in
+    22.04 | 24.04) ;;
+    *) _die "unsupported Ubuntu release '$os_version'; 22.04 or 24.04 is required." ;;
+  esac
+  arch="$(dpkg --print-architecture 2>/dev/null || uname -m)"
+  case "$arch" in
+    amd64 | x86_64 | arm64 | aarch64) ;;
+    *) _die "unsupported architecture '$arch'; amd64 or arm64 is required." ;;
+  esac
+
+  # Check minimal dependencies; install the missing ones with sudo apt-get.
+  local missing=()
+  command -v git &> /dev/null || missing+=(git)
+  if ! command -v curl &> /dev/null && ! command -v wget &> /dev/null; then missing+=(curl); fi
+  command -v python3 &> /dev/null || missing+=(python3)
+  [[ -e /etc/ssl/certs/ca-certificates.crt ]] || missing+=(ca-certificates)
+  if (( ${#missing[@]} > 0 )); then
+    echo "Missing: ${missing[*]}. Installing git curl ca-certificates python3 with sudo apt-get."
+    echo "Please type your password if sudo asks for it."
+    command -v sudo &> /dev/null || _die "sudo not found. Ask an administrator to run: apt-get install -y git curl ca-certificates python3"
+    local tty_in=/dev/null
+    if [[ -t 0 ]]; then tty_in=/dev/stdin; elif { : < /dev/tty; } 2> /dev/null; then tty_in=/dev/tty; fi
+    { sudo apt-get update && sudo apt-get install -y git curl ca-certificates python3; } < "$tty_in" \
+      || _die "sudo apt-get install failed (sudo refused or apt unavailable). Install git curl ca-certificates python3 and rerun."
+  fi
+  python3 -c 'import sys; sys.exit(sys.version_info < (3, 10))' \
+    || _die "python3 3.10 or newer is required."
+}
+
+# macOS: a supported release (see the policy above), natively (not under
+# Rosetta), with Homebrew in its prefix: an absolute $HOMEBREW_PREFIX
+# ('brew shellenv' exports it for a custom prefix), else the default for
+# the architecture. Homebrew comes first on PATH from here on, for this run
+# and install.py. git and python3 3.10 or newer come from Homebrew when
+# missing, never with sudo. Sets main()'s python to Homebrew's python3.
+_prepare_macos() {
+  local version major arch releases prefix sysctl=sysctl
+  # SYSTEM_VERSION_COMPAT=1 would make sw_vers report 10.16.
+  version="$(SYSTEM_VERSION_COMPAT=0 sw_vers -productVersion 2> /dev/null || true)"
+  # A terminal under Rosetta 2 says x86_64 on Apple silicon, which would
+  # pick Intel's Homebrew and releases; on Intel the name does not exist.
+  command -v sysctl > /dev/null 2>&1 || sysctl=/usr/sbin/sysctl
+  if [[ "$("$sysctl" -n sysctl.proc_translated 2> /dev/null || true)" == 1 ]]; then
+    _die "this terminal runs under Rosetta 2 (x86_64 emulation) on an Apple silicon Mac. Open a native terminal (or run 'arch -arm64 /bin/zsh -l' in this one) and rerun."
+  fi
+  arch="$(uname -m 2> /dev/null || true)"
+  case "$arch" in
+    arm64) releases="$_MACOS_ARM64_RELEASES" prefix="$_HOMEBREW_ARM64_PREFIX" ;;
+    x86_64) releases="$_MACOS_INTEL_RELEASES" prefix="$_HOMEBREW_INTEL_PREFIX" ;;
+    *) _die "unsupported architecture '$arch'; macOS on arm64 (Apple silicon) or x86_64 (Intel) is required." ;;
+  esac
+  major="${version%%.*}"
+  case " $releases " in
+    *" ${major:-none} "*) ;;
+    *) _die "unsupported macOS release '${version:-unknown}' on $arch; supported: ${_MACOS_ARM64_RELEASES// /, } on Apple silicon; ${_MACOS_INTEL_RELEASES// /, } on Intel (best effort)." ;;
+  esac
+  if [[ "$arch" == x86_64 ]]; then
+    echo "WARNING: Intel Macs are best effort only: Homebrew supports them at Tier 3 (no new bottles), so packages may be built from source." >&2
+  fi
+  if [[ "${HOMEBREW_PREFIX:-}" == /* ]]; then
+    prefix="$HOMEBREW_PREFIX"
+    while [[ "$prefix" == */ && "$prefix" != / ]]; do prefix="${prefix%/}"; done
+  fi
+  [[ -x "$prefix/bin/brew" ]] || _install_homebrew "$arch" "$prefix"
+  PATH="$prefix/bin:$prefix/sbin:$PATH"
+  export PATH
+
+  # git: Homebrew's, or the one of the Command Line Tools (or Xcode) that
+  # /usr/bin/git runs. Without them /usr/bin/git only opens an install
+  # dialog, so 'command -v git' proves nothing. python3 3.10 or newer: the
+  # Command Line Tools' /usr/bin/python3 is 3.9, so only Homebrew's counts.
+  local missing=() devdir
+  devdir="$(xcode-select -p 2> /dev/null || true)"
+  if [[ ! -x "$prefix/bin/git" ]] && [[ -z "$devdir" || ! -x "$devdir/usr/bin/git" ]]; then
+    missing+=(git)
+  fi
+  python="$prefix/bin/python3"
+  _python_ok "$python" || missing+=(python3)
+  if (( ${#missing[@]} > 0 )); then
+    echo "Missing: ${missing[*]}. Installing with Homebrew: brew install ${missing[*]}"
+    "$prefix/bin/brew" install "${missing[@]}" < /dev/null \
+      || _die "brew install ${missing[*]} failed. Run 'brew doctor', fix what it reports, then rerun."
+  fi
+  _python_ok "$python" \
+    || _die "$python is not python 3.10 or newer. Run 'brew upgrade python3' (or 'brew link python3'), then rerun."
+  # It must run natively, as this script does: an Intel-only python3 (say,
+  # from an Intel Homebrew in /usr/local that HOMEBREW_PREFIX still names
+  # after a migration) runs under Rosetta 2 on Apple silicon, and install.py
+  # refuses Rosetta, but only once the new checkout is in place.
+  local machine
+  machine="$("$python" -c 'import os; print(os.uname().machine)' 2> /dev/null || true)"
+  [[ "$machine" == "$arch" ]] \
+    || _die "$python runs as '${machine:-unknown}' on this $arch Mac (an Intel-only build under Rosetta 2?), and install.py refuses that. Use a native Homebrew (on Apple silicon: /opt/homebrew, with HOMEBREW_PREFIX unset or naming it), then rerun."
+  # install.py downloads with python's default certificate store (macOS
+  # keeps its own in the keychain, and has no /etc/ssl/certs): a CA file or
+  # a CA directory, with something in it (as install.py checks, too).
+  "$python" -c '
+import os, ssl, sys
+p = ssl.get_default_verify_paths()
+try:
+    found = (p.cafile and os.path.getsize(p.cafile)) or (p.capath and os.listdir(p.capath))
+except OSError:
+    found = False
+sys.exit(not found)
+' || _die "$python finds no CA certificates, so its downloads would fail. Run 'brew reinstall ca-certificates openssl@3' (or, for a python.org Python, 'Install Certificates.command' in its /Applications/Python 3.x folder), then rerun."
+}
+
+# Homebrew is missing. Its official installer asks for the password (an
+# administrator account is needed) and installs the Xcode Command Line Tools
+# when they are missing; it runs here only on Apple silicon (it refuses
+# Intel), on a terminal, and after a yes there. Otherwise this stops before
+# any change and says what to run.
+_install_homebrew() {
+  local arch="$1" prefix="$2" answer="" installer status=0 official steps tmp
+  local url=https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh
+  official="/bin/bash -c \"\$(curl -fsSL $url)\""
+  # A custom prefix is the installer's --path (bash -c's arguments start at $0).
+  if [[ "$prefix" != "$_HOMEBREW_ARM64_PREFIX" ]]; then official="$official install.sh --path=$prefix"; fi
+  steps="  xcode-select --install"$'\n'"  $official"
+  if [[ "$arch" != arm64 ]]; then
+    _die "Homebrew is not installed in $prefix. Its official installer supports only Apple silicon now, so this does not install it on an Intel Mac: install the Command Line Tools (xcode-select --install) and Homebrew in $prefix yourself (https://docs.brew.sh/Installation), then rerun."
+  fi
+  if ! { : < /dev/tty > /dev/tty; } 2> /dev/null; then
+    _die "Homebrew is not installed in $prefix, and there is no terminal for its installer. In a terminal, run"$'\n'"$steps"$'\n'"then rerun this."
+  fi
+  {
+    echo "Homebrew is not installed in $prefix; on macOS it provides git, python3 and the packages."
+    printf '%s' "Run its official installer now? It asks for your password (an administrator account is needed) and installs the Xcode Command Line Tools when they are missing. [y/N] "
+  } > /dev/tty
+  IFS= read -r answer < /dev/tty || answer=""
+  case "$answer" in
+    [yY] | [yY][eE][sS]) ;;
+    *) _die "Homebrew is required on macOS. Install it, then rerun:"$'\n'"$steps" ;;
+  esac
+  tmp="${TMPDIR:-}"
+  [[ "$tmp" == /* ]] || tmp=/tmp
+  installer="$(mktemp "${tmp%/}/homebrew-install.XXXXXX")" \
+    || _die "cannot create a temporary file for the Homebrew installer."
+  if ! curl -fsSL -o "$installer" "$url"; then
+    rm -f -- "$installer"
+    _die "cannot download the Homebrew installer ($url); check the network, then rerun."
+  fi
+  if [[ "$prefix" == "$_HOMEBREW_ARM64_PREFIX" ]]; then
+    /bin/bash "$installer" < /dev/tty || status=$?
+  else
+    /bin/bash "$installer" --path="$prefix" < /dev/tty || status=$?
+  fi
+  rm -f -- "$installer"
+  (( status == 0 )) \
+    || _die "the Homebrew installer failed (status $status, see above). Fix what it reports (https://docs.brew.sh/Installation), then rerun."
+  [[ -x "$prefix/bin/brew" ]] \
+    || _die "the Homebrew installer finished, but there is no $prefix/bin/brew. Fix the Homebrew installation, then rerun."
+}
+
+# Whether $1 runs and is python 3.10 or newer.
+_python_ok() {
+  "$1" -c 'import sys; sys.exit(sys.version_info < (3, 10))' > /dev/null 2>&1
+}
+
+# bash's own BASH_SOURCE is an array; one imported from the environment is a
+# plain exported string ('declare -x'). The bash 3.2 spelling of
+# [[ "${BASH_SOURCE@a}" == *a* ]] (bash 4.4 and newer only).
+_bash_source_is_own() {
+  local decl flags
+  decl="$(declare -p BASH_SOURCE 2> /dev/null)" || return 1
+  flags="${decl#declare -}"
+  flags="${flags%% *}"
+  [[ "$flags" == *a* ]]
+}
+
+# Rename $1 to $2 where mv has no -T (macOS): only while nothing is at $2
+# (it was moved aside, or never existed), so $1 never lands inside it.
+# Like a failed 'mv -T', it says why.
+_rename() {
+  if [[ -e "$2" || -L "$2" ]]; then
+    echo "cannot rename $1 to $2: $2 is in the way" >&2
+    return 1
+  fi
+  mv -- "$1" "$2"
+}
+
 # Whether these install.py arguments installed anything: an install or a
 # repair, not a dry run nor --help. install.py's own parser decides (it takes
 # abbreviations such as --dry and grouped flags such as -fh); run in the
 # checkout, after install.py succeeded.
 _installs() {
-  python3 -c '
+  "$python" -c '
 import sys
 sys.dont_write_bytecode = True
 sys.path.insert(0, ".")
@@ -239,7 +454,8 @@ sys.exit(0 if args.command in ("install", "repair") and not getattr(args, "dry_r
 # Replace this script with a login shell on the terminal, as oh-my-zsh's
 # installer does, so the terminal that ran the one-liner is on the new setup
 # at once. The shell is zsh from PATH, else the login shell from passwd
-# (getent), e.g. when zsh landed where the pre-install PATH does not reach.
+# (getent; macOS has none, there python's pwd module asks Directory
+# Services), e.g. when zsh landed where the pre-install PATH does not reach.
 # Only with a terminal (/dev/tty readable and writable, stdout a terminal:
 # not under a test harness, cron or a captured run), and never with
 # DOTFILES_EXEC_SHELL=0. A failed exec ends the script with status 0 (the
@@ -251,7 +467,11 @@ _exec_new_shell() {
   [[ -t 1 ]] || return 0
   shell_bin="$(command -v zsh 2> /dev/null || true)"
   if [[ "$shell_bin" != /* ]]; then
-    shell_bin="$(getent passwd "$(id -u)" 2> /dev/null | cut -d: -f7 || true)"
+    if [[ "$os_name" == Darwin ]]; then
+      shell_bin="$("$python" -c 'import os, pwd; print(pwd.getpwuid(os.getuid()).pw_shell)' 2> /dev/null || true)"
+    else
+      shell_bin="$(getent passwd "$(id -u)" 2> /dev/null | cut -d: -f7 || true)"
+    fi
   fi
   [[ "$shell_bin" == /* && -f "$shell_bin" && -x "$shell_bin" ]] || return 0
   case "${shell_bin##*/}" in nologin | false | true) return 0 ;; esac

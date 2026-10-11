@@ -9,6 +9,8 @@
 # checks as the one-liner, then install.py (options go to it, e.g. ./install
 # --no-gui), then, when it installed, starts a new login shell. Anywhere else
 # it changes nothing and prints what to run instead.
+#
+# It runs under macOS's /bin/bash 3.2 and BSD tools, too.
 
 # Started as 'sh install' or 'zsh install': run it with bash.
 if [ -z "${BASH_VERSION:-}" ]; then exec bash "$0" "$@"; fi
@@ -16,16 +18,29 @@ if [ -z "${BASH_VERSION:-}" ]; then exec bash "$0" "$@"; fi
 set -eu
 CDPATH=
 
-if [[ "${BASH_SOURCE@a}" != *a* ]]; then
+# bash's own BASH_SOURCE is an array; one imported from the environment is a
+# plain exported string ('declare -x'). The bash 3.2 spelling of
+# [[ "${BASH_SOURCE@a}" == *a* ]] (bash 4.4 and newer only).
+_bash_source_is_own() {
+  local decl flags
+  decl="$(declare -p BASH_SOURCE 2> /dev/null)" || return 1
+  flags="${decl#declare -}"
+  flags="${flags%% *}"
+  [[ "$flags" == *a* ]]
+}
+
+if ! _bash_source_is_own; then
   echo "BASH_SOURCE is set in the environment; unset it and rerun." >&2
   exit 2
 fi
 
-here="$(dirname -- "$(readlink -e -- "${BASH_SOURCE[0]}")")"
-dest="$(readlink -e -- "${HOME}/.dotfiles")" || dest=""
+dest="${HOME}/.dotfiles"
 
-if [[ "$here" != "$dest" ]]; then
-  if [[ -z "$dest" ]]; then
+# Unless this very file is the checkout's own ./install: the same file
+# (device and inode) through any symlink or spelling (readlink -e is GNU
+# only).
+if [[ ! "${BASH_SOURCE[0]:-}" -ef "$dest/install" ]]; then
+  if [[ ! -e "$dest" ]]; then
     echo "Clone & install into ~/.dotfiles:" >&2
     echo "  git clone --recursive https://github.com/leekyungmoon/dotfiles.git ~/.dotfiles && ~/.dotfiles/install" >&2
   elif [[ -f "$dest/install" && -f "$dest/etc/install" && -d "$dest/installer" ]]; then
@@ -38,4 +53,4 @@ if [[ "$here" != "$dest" ]]; then
   exit 2
 fi
 
-exec bash "$here/etc/install" "$@"
+exec bash "$dest/etc/install" "$@"
