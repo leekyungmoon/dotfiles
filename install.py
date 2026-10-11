@@ -54,15 +54,26 @@ Install the dotfiles from this checkout, which must be ~/.dotfiles:
     python3 install.py restore (--baseline | --run RUN_ID) [--force] [--id ID ...]
     python3 install.py repair
     python3 install.py gui-apply [--autostart]
+    python3 install.py services [status|enable|disable] [tmux|autosave ...]
 """
 
-SUBCOMMANDS = ("install", "status", "restore", "repair", "gui-apply", "packages")
+SUBCOMMANDS = ("install", "status", "restore", "repair", "gui-apply", "packages",
+               "services")
 # Commands that act on the checkout and so must run from ~/.dotfiles.
 LOCATED_COMMANDS = ("install", "repair", "gui-apply", "packages")
+# Commands that work from anywhere on any host: no platform is detected.
+UNLOCATED_COMMANDS = ("status", "restore", "services")
+# `services`: the LaunchAgents on macOS (installer/launchd.py names them the
+# same), the systemd units on Linux.
+SERVICE_ACTIONS = ("status", "enable", "disable")
+SERVICE_NAMES = ("tmux", "autosave")
+SYSTEMD_UNITS = {"tmux": "tmux.service", "autosave": "tmux-resurrect-autosave.timer"}
 # Entries managed by the pre-release layout that promoted a staged checkout.
 LEGACY_IDS = ("repo", "dotfiles-compat")
 # ~/.local/bin links requested by the packages phase (installer/packages.py).
 TOOL_LINK_PREFIX = "tool-link-"
+# macOS LaunchAgent plists, rendered by installer/launchd.py (no source file).
+LAUNCH_AGENT_PREFIX = "launchd-"
 
 
 @dataclasses.dataclass
@@ -256,6 +267,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--allow-any-location", action="store_true",
                    help=argparse.SUPPRESS)
 
+    p = sub.add_parser("services", help="show, enable or disable starting tmux at "
+                                        "login and the one-minute autosave")
+    p.add_argument("words", nargs="*", metavar="[ACTION] [NAME ...]",
+                   help=f"ACTION: {', '.join(SERVICE_ACTIONS)} (default status); "
+                        f"NAME: {', '.join(SERVICE_NAMES)} (default both)")
+
     # Internal: used by 'dotfiles install <name>'.
     p = sub.add_parser("packages")  # no help=: not listed in --help
     p.add_argument("--only", action="append", required=True, metavar="NAME")
@@ -273,7 +290,28 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     if not argv or (argv[0] not in SUBCOMMANDS and argv[0].startswith("-")
                     and argv[0] not in ("-h", "--help")):
         argv = ["install", *argv]
-    return build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.command == "services":
+        _service_words(parser, args)
+    return args
+
+
+def _service_words(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    """``services [ACTION] [NAME ...]`` into ``args.action`` and ``args.names``:
+    the action defaults to status (so ``services tmux`` shows tmux), the names
+    to both agents."""
+
+    words = list(args.words)
+    action = words.pop(0) if words and words[0] in SERVICE_ACTIONS else "status"
+    names: list[str] = []
+    for word in words:
+        if word not in SERVICE_NAMES:
+            parser.error(f"services: unknown name {word!r} (choose from "
+                         f"{', '.join(SERVICE_NAMES)}; the action comes first)")
+        if word not in names:
+            names.append(word)
+    args.action, args.names = action, names or list(SERVICE_NAMES)
 
 
 _TRISTATE = ("claude_code", "codex")
@@ -352,9 +390,16 @@ def ai_cli_exclusions(ctx: Context, opts: Options, *, record: bool = True) -> li
             wanted = True
         if not wanted:
             exclude += [tool_id, *companions]
-            ui.log_target(label, ui.GRAY("skipped (your choice; "
-                                         f"`python3 ~/.dotfiles/install.py --{option.replace('_', '-')}` "
-                                         "installs it later)"))
+            if platform_system(ctx) == "darwin":
+                # python3 there is usually the Command Line Tools' 3.9, which
+                # install.py refuses; the wrapper runs it with Homebrew's.
+                later = f"`~/.dotfiles/install --{option.replace('_', '-')}` "
+            else:
+                later = (
+                    f"`python3 ~/.dotfiles/install.py --{option.replace('_', '-')}` "
+                )
+            ui.log_target(label, ui.GRAY("skipped (your choice; " + later
+                                         + "installs it later)"))
     if changed and record:
         try:
             _save_choices(ctx.target, choices)
@@ -392,6 +437,10 @@ def packages_phase(ctx: Context, *, disabled: bool, dry_run: bool,
                 kwargs["exclude"] = list(exclude)
         except (TypeError, ValueError):
             pass
+    # The environment the run was started with (HOMEBREW_PREFIX, proxies),
+    # not this process's: tests and callers hand in their own.
+    if _accepts(run, "env"):
+        kwargs["env"] = ctx.env
     try:
         return PhaseResult.coerce(
             run(ctx.target, ctx.platform, ctx.runner, **kwargs), "packages")
@@ -452,8 +501,11 @@ def extra_desired_entries(ctx: Context, packages_result: PhaseResult | None,
         extra += [e for e in previous_tool_links(ctx) if e.id not in fresh]
     # The autostart entry runs 'install.py gui-apply' at a GNOME login, which
     # macOS never has: it is not installed there, and one managed anyway is
-    # retired like any entry that is no longer wanted.
+    # retired like any entry that is no longer wanted. macOS has the
+    # LaunchAgents instead; every caller (also 'dotfiles install <tool>')
+    # wants them, or the transaction would retire them.
     if platform_system(ctx) == "darwin":
+        extra += launch_agent_entries(ctx)
         return extra, warnings
     # --no-gui skips applying desktop settings, but an autostart entry that an
     # earlier run installed stays managed instead of being retired.
@@ -500,6 +552,47 @@ def previous_tool_links(ctx: Context) -> list:
         kept.append(DesiredEntry(entry_id, Path(entry["dest"]), "symlink",
                                  link_text=link_text))
     return kept
+
+
+# --- macOS LaunchAgents ----------------------------------------------------------
+
+def _homebrew_prefix(ctx: Context) -> Path | None:
+    """Homebrew's prefix for this run (HOMEBREW_PREFIX from its environment,
+    else the architecture's); None off macOS."""
+
+    return plat.homebrew_prefix(ctx.platform, ctx.env) if ctx.platform is not None else None
+
+
+def homebrew_dirs(ctx: Context) -> list[Path]:
+    """Homebrew's bin and sbin on macOS (none elsewhere), for child PATHs."""
+
+    prefix = _homebrew_prefix(ctx)
+    return [prefix / "bin", prefix / "sbin"] if prefix is not None else []
+
+
+def launch_agent_entries(ctx: Context) -> list:
+    """The two LaunchAgent plists (installer/launchd.py) for this Target:
+    Homebrew's prefix and a UTF-8 LANG from the environment of this run."""
+
+    from installer import launchd
+
+    return launchd.desired_entries(ctx.target, brew_prefix=_homebrew_prefix(ctx),
+                                   lang=launchd.pick_lang(ctx.env, ctx.runner))
+
+
+def launch_agent_changes(tx_result: PhaseResult) -> dict:
+    """What the transaction did with the plists, for post-install: their ids
+    it ``changed`` (rewrote), ``kept`` (the user edited them; -f overwrites)
+    and left ``unchanged``, and whether it ``applied`` both."""
+
+    from installer import launchd
+
+    result = tx_result.details.get("result") or {}
+    ids = set(launchd.ENTRY_IDS)
+    seen = {key: sorted(ids & set(result.get(key) or ()))
+            for key in ("changed", "kept", "unchanged")}
+    applied = tx_result.status != FAIL and ids <= {i for v in seen.values() for i in v}
+    return {**seen, "applied": applied}
 
 
 # --- location -------------------------------------------------------------------
@@ -746,6 +839,8 @@ def report_entries(ctx: Context, desired: list, befores: dict, applied,
             continue
         if entry.kind == "symlink":
             what = f"symlink created from '{entry.link_text}'"
+        elif entry.kind == "file" and entry.id.startswith(LAUNCH_AGENT_PREFIX):
+            what = "LaunchAgent written for this home"
         elif entry.kind == "file":
             what = f"copied from '{sources.get(entry.id) or 'the repository'}'"
         elif entry.kind == "absent":
@@ -1150,7 +1245,20 @@ def run_pipeline(ctx: Context, command: str, opts: Options) -> int:
         return finish(ctx, command, results, closing=True)
 
     ui.section("Post actions")
-    child_env = phases.child_env(ctx.target, ctx.env)
+    # macOS: launchd instead of systemd, decided by the platform (not by
+    # whether systemd units were applied), Homebrew on the children's PATH,
+    # and chsh only with a terminal to ask for the password on.
+    path_kwargs: dict = {}
+    post_kwargs: dict = {}
+    shell_kwargs: dict = {"interactive": ctx.interactive}
+    darwin = platform_system(ctx) == "darwin"
+    if darwin:
+        path_kwargs = {"extra_path": homebrew_dirs(ctx)}
+        post_kwargs = {"launch_agents": launch_agent_changes(tx_result),
+                       "platform": ctx.platform}
+        shell_kwargs = {"interactive": ctx.interactive if ctx.prompt is not None else None,
+                        "platform": ctx.platform}
+    child_env = phases.child_env(ctx.target, ctx.env, **path_kwargs)
     _report(results, phases.post_install_phase(
         ctx.target, ctx.runner, repo_root=Path(ctx.repo_root), run_id=ctx.run_id,
         systemd_units_applied=systemd_applied, env=child_env,
@@ -1159,18 +1267,24 @@ def run_pipeline(ctx: Context, command: str, opts: Options) -> int:
         # At the end of the post actions, before the running tmux server is
         # converged: respawned shells and every hooked zsh (at its next
         # Enter or prompt) pick up this generation.
-        record_generation=lambda: record_generation(ctx)))
-    smoke = _report(results, phases.smoke_phase(ctx.target, ctx.runner, ctx.env))
+        record_generation=lambda: record_generation(ctx), **post_kwargs))
+    smoke = _report(results, phases.smoke_phase(ctx.target, ctx.runner, ctx.env,
+                                                **path_kwargs))
     # The login shell changes only after the smoke checks passed.
     _report(results, phases.login_shell_phase(
         ctx.target, ctx.runner, current_shell=ctx.current_shell,
-        allow_change=not opts.no_shell_change, interactive=ctx.interactive,
-        checks_passed=smoke.status == PASS))
+        allow_change=not opts.no_shell_change, checks_passed=smoke.status == PASS,
+        **shell_kwargs))
     _report(results, phases.git_identity_phase(ctx.target, ctx.runner,
                                                prompt=ctx.prompt))
     _report(results, phases.auth_phase(ctx.target, ctx.runner, ctx.env))
 
-    ui.section("Desktop settings" if platform_system(ctx) == "darwin" else "GNOME settings")
+    if darwin:
+        # GNOME settings and input-remapper have no macOS counterpart: the
+        # phase is left out, not run as SKIPPED, so it neither shows a
+        # section nor makes every Mac's overall status SKIPPED.
+        return finish(ctx, command, results, closing=True)
+    ui.section("GNOME settings")
     _report(results, gui_phase(ctx, disabled=opts.no_gui))
     return finish(ctx, command, results, closing=True)
 
@@ -1197,21 +1311,29 @@ def dry_run_install(ctx: Context, opts: Options | None = None) -> int:
         # The real run's conditions: what it would leave out is not planned.
         skipped, not_applicable = _condition_skips(resolved, condition_facts(ctx))
         left_out = set(skipped) | set(not_applicable)
-        plan = {}
-        for entry in sorted(resolved, key=lambda e: str(e.dest)):
-            if entry.id in left_out:
-                continue
-            action = _planned_action(entry)
-            plan[entry.id] = f"{action} {entry.dest}"
-            color = ui.GREEN if action in ("unchanged", "keep-absent") else ui.YELLOW
-            ui.log_target(entry.dest, color(f"would {action}"
-                                            if action not in ("unchanged", "keep-absent")
-                                            else "already up-to-date"))
-            print(f"  {plan[entry.id]}")
+        rows = [(entry.dest, entry.id, _planned_action(entry))
+                for entry in resolved if entry.id not in left_out]
         reasons: list[str] = []
+        status = PASS
+        if platform_system(ctx) == "darwin":
+            # The LaunchAgent plists the real run adds (only reading here).
+            try:
+                rows += [(entry.dest, entry.id, _planned_file_action(entry))
+                         for entry in launch_agent_entries(ctx)]
+            except Exception as exc:
+                status = FAIL
+                reasons.append(f"extra entries: {type(exc).__name__}: {exc}")
+        plan = {}
+        for dest, entry_id, action in sorted(rows, key=lambda row: str(row[0])):
+            plan[entry_id] = f"{action} {dest}"
+            color = ui.GREEN if action in ("unchanged", "keep-absent") else ui.YELLOW
+            ui.log_target(dest, color(f"would {action}"
+                                      if action not in ("unchanged", "keep-absent")
+                                      else "already up-to-date"))
+            print(f"  {plan[entry_id]}")
         details: dict = {"entries": plan}
         _report_condition_skips(ctx, resolved, skipped, not_applicable, details, reasons)
-        results.append(PhaseResult("plan", PASS, reasons, details))
+        results.append(PhaseResult("plan", status, reasons, details))
     for result in results:
         print(f"[{result.phase}] {result.status}"
               + (f": {'; '.join(result.reasons)}" if result.reasons else ""))
@@ -1233,6 +1355,19 @@ def _planned_action(entry) -> str:
     return "replace" if exists else "create"
 
 
+def _planned_file_action(entry) -> str:
+    """The plan for a rendered ``kind="file"`` transaction entry: unchanged
+    when the same bytes and mode are already there."""
+
+    dest = Path(entry.dest)
+    if dest.is_file() and not dest.is_symlink():
+        mode = entry.mode if entry.mode is not None else 0o644
+        if (stat.S_IMODE(dest.stat().st_mode) == mode
+                and dest.read_bytes() == (entry.content or b"")):
+            return "unchanged"
+    return "replace" if os.path.lexists(dest) else "create"
+
+
 # --- other commands -----------------------------------------------------------
 
 def cmd_status(ctx: Context, as_json: bool) -> int:
@@ -1243,6 +1378,13 @@ def cmd_status(ctx: Context, as_json: bool) -> int:
     except Exception as exc:
         state = {"error": f"{type(exc).__name__}: {exc}"}
     payload = {"state": phases.jsonable(state), "last_run": phases.read_status(ctx.target)}
+    services = None
+    if platform_system(ctx) == "darwin":
+        from installer import launchd
+
+        # What launchd says now (read only), not what the last run saw.
+        services = launchd.status(ctx.target, ctx.runner)
+        payload["services"] = services
     if as_json:
         print(json.dumps(payload, indent=2, sort_keys=True))
         return 0
@@ -1262,6 +1404,11 @@ def cmd_status(ctx: Context, as_json: bool) -> int:
               f"{len(drifted)} drifted{': ' + ', '.join(drifted) if drifted else ''}")
     elif isinstance(state, dict) and state.get("error"):
         print(f"state:     {state['error']}")
+    if services is not None:
+        from installer import launchd
+
+        for line in launchd.describe_status(services):
+            print(line)
     return 0
 
 
@@ -1315,14 +1462,52 @@ def cmd_restore(ctx: Context, args) -> int:
                 ui.log(ui.YELLOW("GNOME settings are restored from a desktop session: run "
                                  "'python3 ~/.dotfiles/install.py restore --baseline' again "
                                  "inside GNOME (files already restored stay as they are)."))
+    unload_failed = False
+    if platform_system(ctx) == "darwin":
+        unload_failed = _unload_restored_agents(ctx, data)
     print(json.dumps(data, indent=2, sort_keys=True))
-    return 1 if gui_status == phases.FAIL else 0
+    return 1 if gui_status == phases.FAIL or unload_failed else 0
 
 
-def _package_names(repo_root: Path) -> set[str]:
+def _unload_restored_agents(ctx: Context, data: dict) -> bool:
+    """After a restore on macOS: unload each agent the restore covered whose
+    plist is gone, since launchd keeps a loaded job (and the autosave keeps
+    firing) until logout; whether any unload failed.
+
+    A plist the restore put back (an earlier version) is loaded from disk at
+    the next login; ``dotfiles repair`` makes the installer's own again.
+    """
+
+    from installer import launchd
+
+    covered = {entry_id for key in ("restored", "forced", "unchanged")
+               for entry_id in data.get(key) or []}
+    gone = [agent for agent in launchd.AGENTS if agent.entry_id in covered
+            and not os.path.lexists(launchd.plist_path(ctx.target, agent))]
+    if not gone:
+        return False
+    outcomes: dict[str, str] = {}
+    problems = launchd.unload(ctx.target, ctx.runner, [a.label for a in gone],
+                              outcomes=outcomes)
+    data["launchd"] = {agent.name: outcomes.get(agent.label, "failed") for agent in gone}
+    words = {"unloaded": "unloaded (LaunchAgent removed)", "not-loaded": "was not loaded",
+             "no-gui-domain": "not loaded (no desktop login session here)"}
+    for agent in gone:
+        outcome = outcomes.get(agent.label, "failed")
+        color = ui.RED if outcome == "failed" else ui.GREEN
+        ui.log_target(agent.label, color(words.get(outcome, "could not be unloaded")))
+    for problem in problems:
+        print(ui.RED(problem), file=sys.stderr)
+    return bool(problems)
+
+
+def _package_names(repo_root: Path, platform=None) -> set[str]:
     names: set[str] = set()
+    # The platform's system package profile: Homebrew's groups on macOS.
+    profile = load_seam("packages", "package_manifest_name")
+    name = profile(platform) if profile is not None else "packages.json"
     try:
-        data = json.loads((repo_root / "manifests" / "packages.json").read_text("utf-8"))
+        data = json.loads((repo_root / "manifests" / name).read_text("utf-8"))
         names.update(g["id"] for g in data.get("groups", []) if isinstance(g, dict))
     except (OSError, ValueError, KeyError):
         pass
@@ -1339,7 +1524,7 @@ def _package_names(repo_root: Path) -> set[str]:
 
 def cmd_packages(ctx: Context, only: list[str], dry_run: bool,
                  force: bool = False) -> int:
-    allowed = _package_names(Path(ctx.repo_root))
+    allowed = _package_names(Path(ctx.repo_root), ctx.platform)
     unknown = [name for name in only if name not in allowed]
     if unknown:
         print(ui.RED(f"error: not in the package manifests: {', '.join(unknown)}; "
@@ -1359,6 +1544,8 @@ def cmd_packages(ctx: Context, only: list[str], dry_run: bool,
     kwargs = {"dry_run": dry_run, "only": list(only)}
     if force and "force" in parameters:
         kwargs["force"] = True
+    if _accepts(run, "env"):
+        kwargs["env"] = ctx.env
     try:
         result = PhaseResult.coerce(
             run(ctx.target, ctx.platform, ctx.runner, **kwargs), "packages")
@@ -1399,10 +1586,113 @@ def tool_links_phase(ctx: Context, packages_result: PhaseResult, *,
     if managed:
         result, _ = transaction_phase(ctx, extra_entries=extra, force=False)
     else:
-        result, _ = _apply_entries(ctx, extra, resolved=[], skipped=[],
+        # Never installed: the links only (on macOS no LaunchAgents either).
+        links = [e for e in extra if e.id.startswith(TOOL_LINK_PREFIX)]
+        result, _ = _apply_entries(ctx, links, resolved=[], skipped=[],
                                    systemd_ok=False, manifest_path=None, force=False)
     result.reasons.extend(warnings)
     return result
+
+
+def cmd_services(ctx: Context, action: str, names: list[str]) -> int:
+    """``services [status|enable|disable] [tmux|autosave ...]``.
+
+    macOS: the LaunchAgents. disable unloads each one (bootout) and marks it
+    disabled in launchd (persistent: later installs and repairs leave it off
+    and say so); a running tmux server is not stopped. enable clears that
+    mark, then loads and verifies it as a repair would. status shows what
+    launchd says. Linux: systemd manages these units; this prints its
+    commands and changes nothing.
+    """
+
+    if platform_system(ctx) != "darwin":
+        return _systemd_services(action, names)
+    from installer import launchd
+
+    agents = [launchd.agent_named(name) for name in names]
+    if action == "status":
+        view = launchd.status(ctx.target, ctx.runner)
+        view["agents"] = {a.name: view["agents"][a.name] for a in agents}
+        for line in launchd.describe_status(view):
+            print(line)
+        return 0
+    failed = False
+    uid = ctx.target.uid
+    for agent in agents:
+        plist = launchd.plist_path(ctx.target, agent)
+        if action == "disable":
+            outcomes: dict[str, str] = {}
+            problems = launchd.unload(ctx.target, ctx.runner, [agent.label], outcomes=outcomes)
+            try:
+                code = launchd.disable(ctx.runner, uid, agent.label).returncode
+            except Exception as exc:  # launchctl could not run, or timed out
+                problems.append(f"launchctl disable: {exc}")
+            else:
+                if code != 0:
+                    problems.append(f"launchctl disable "
+                                    f"{launchd.service_target(uid, agent.label)} failed "
+                                    f"({launchd.error_text(code)})")
+            if problems:
+                failed = True
+                ui.log_target(plist, ui.RED("could not disable: " + "; ".join(problems)))
+            else:
+                ui.log_target(plist, ui.GREEN(
+                    f"disabled ({outcomes.get(agent.label)}); stays off until: "
+                    f"dotfiles services enable {agent.name}"))
+            continue
+        if not plist.is_file():
+            failed = True
+            ui.log_target(plist, ui.RED("not installed; run: dotfiles repair"))
+            continue
+        try:
+            code = launchd.enable(ctx.runner, uid, agent.label).returncode
+        except Exception as exc:  # launchctl could not run, or timed out
+            failed = True
+            ui.log_target(plist, ui.RED(f"launchctl enable: {exc}"))
+            continue
+        if code != 0:
+            failed = True
+            ui.log_target(plist, ui.RED(
+                "no desktop login session here; run this in a Terminal of your desktop "
+                "session" if code in launchd.NO_GUI_DOMAIN else
+                f"launchctl enable failed ({launchd.error_text(code)})"))
+            continue
+        result = launchd.register(ctx.target, ctx.runner, agent, changed=False, env=ctx.env)
+        if result.status == FAIL:
+            failed = True
+            ui.log_target(plist, ui.RED("; ".join(result.reasons)))
+        elif result.status == phases.RELOGIN_REQUIRED:
+            ui.log_target(plist, ui.YELLOW(
+                "enabled; loads at your next desktop login (or now, in a Terminal of "
+                f"that session: {result.details.get('command')})"))
+        elif result.status == SKIPPED:
+            failed = True  # still disabled: launchctl enable did not take
+            ui.log_target(plist, ui.RED("; ".join(result.reasons)))
+        else:
+            ui.log_target(plist, ui.GREEN("enabled and loaded")
+                          + ("" if not result.reasons else
+                             " " + ui.YELLOW("(" + "; ".join(result.reasons) + ")")))
+    return 1 if failed else 0
+
+
+def _systemd_services(action: str, names: list[str]) -> int:
+    """Linux: the systemctl commands for ``services`` (nothing is run).
+
+    The autosave timer is stopped and started with --now; tmux.service is
+    not (stopping it saves and ends the running server); it is only no
+    longer (or again) started at the next graphical login.
+    """
+
+    units = [SYSTEMD_UNITS[name] for name in names]
+    print("On Linux, systemd user units start tmux and save it every minute; "
+          "nothing was changed. Run:")
+    if action == "status":
+        print(f"    systemctl --user status {' '.join(units)}")
+        return 0
+    for name in names:
+        now = " --now" if name == "autosave" else ""
+        print(f"    systemctl --user {action}{now} {SYSTEMD_UNITS[name]}")
+    return 0
 
 
 def _gui_autostart_id() -> str | None:
@@ -1476,7 +1766,7 @@ def main(argv: list[str] | None = None, *, env: dict | None = None,
     try:
         target = plat.resolve_target(env, euid=euid, getpwuid=getpwuid)
         platform = None
-        if command not in ("status", "restore"):
+        if command not in UNLOCATED_COMMANDS:
             platform = detect()
             plat.require_supported_platform(platform)
     except plat.PlatformError as exc:
@@ -1528,6 +1818,8 @@ def main(argv: list[str] | None = None, *, env: dict | None = None,
         return finish(ctx, "gui-apply", [result], merge=True)
     if command == "packages":
         return cmd_packages(ctx, args.only, args.dry_run, args.force)
+    if command == "services":
+        return cmd_services(ctx, args.action, args.names)
     return 2
 
 

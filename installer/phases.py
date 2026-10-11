@@ -13,11 +13,14 @@ import json
 import os
 import re
 import secrets
+import shlex
 import shutil
+import sys
 import tempfile
 import time
 from pathlib import Path
 
+from installer import platform as plat
 from installer import ui
 
 PASS = "PASS"
@@ -29,6 +32,9 @@ AUTH_REQUIRED = "AUTH_REQUIRED"
 
 # Reported by installer/gui.py on Ubuntu 22.04; permanent, never retried.
 REMAPPER_UNSUPPORTED_REASON = "input-remapper-1.4-cannot-express-intent"
+# macOS: no GUI login domain here (SSH, a sandbox); installer/launchd.py
+# reports it, and the LaunchAgents load at the next desktop login.
+LAUNCHD_GUI_DOMAIN_UNAVAILABLE = "launchd-gui-domain-unavailable"
 STATUSES = (PASS, FAIL, SKIPPED, PENDING_GUI, RELOGIN_REQUIRED, AUTH_REQUIRED)
 
 # Worst first; the overall status of a run is the worst phase status.
@@ -46,8 +52,27 @@ AUTH_TIMEOUT = 30.0
 # Enabled by the manifest's timers.target.wants link; started after reload.
 AUTOSAVE_TIMER = "tmux-resurrect-autosave.timer"
 
-# sun_path is 108 bytes including the NUL; stay well below it.
+# sun_path is 108 bytes including the NUL on Linux, 104 on macOS; stay well
+# below it. tmux resolves TMUX_TMPDIR (/var is /private/var on macOS), so on
+# macOS the resolved path is what is measured.
 SOCKET_PATH_MAX = 100
+
+# Ubuntu's ncurses has it; macOS's (5.7) does not, so the installer compiles
+# the checkout's copy into ~/.terminfo there (tmux.conf's default-terminal).
+TMUX_TERMINFO = "tmux-256color"
+TERMINFO_SOURCE = "etc/terminfo/tmux-256color.terminfo"
+INFOCMP = "/usr/bin/infocmp"
+TIC = "/usr/bin/tic"
+TERMINFO_TIMEOUT = 60.0
+SELF_TEST_TIMEOUT = 120.0
+AI_HOOK = "tmux/resurrect-ai-session.py"
+
+
+def _darwin_host() -> bool:
+    """Whether this process runs on macOS, for the helpers that get no
+    Platform (tests patch it)."""
+
+    return sys.platform == "darwin"
 
 
 @dataclasses.dataclass
@@ -133,14 +158,29 @@ def _out(completed) -> str:
     return data.strip()
 
 
-def child_env(target, base_env: dict[str, str] | None) -> dict[str, str]:
-    """Environment for subprocesses that must behave like the target's login."""
+def child_env(target, base_env: dict[str, str] | None, *,
+              extra_path=None) -> dict[str, str]:
+    """Environment for subprocesses that must behave like the target's login.
+
+    ``extra_path`` (macOS callers: Homebrew's bin and sbin, which a shell
+    gets from zsh/zshenv, but the installer's own PATH may lack right after
+    Homebrew was installed) are put right after ~/.local/bin unless PATH
+    already has them.
+    """
 
     base = dict(base_env or {})
     for key in ("TMUX", "TMUX_PANE", "TMUX_TMPDIR"):
         base.pop(key, None)
     local_bin = str(target.home / ".local" / "bin")
     path = base.get("PATH") or "/usr/local/bin:/usr/bin:/bin"
+    if extra_path:
+        parts = path.split(":")
+        missing = []
+        for entry in map(str, extra_path):
+            if entry not in parts and entry not in missing:
+                missing.append(entry)
+        at = parts.index(local_bin) + 1 if local_bin in parts else 0
+        path = ":".join(parts[:at] + missing + parts[at:])
     if local_bin not in path.split(":"):
         path = f"{local_bin}:{path}"
     base.update({
@@ -344,7 +384,9 @@ _OPTION_SCOPES = (("-g", "-g"), ("-gw", "-gw"), ("-s", "-s"))
 _HOOK_SCOPES = ("-g", "-gw")
 _OPTION_NAME_RE = re.compile(r"^@?[A-Za-z0-9][A-Za-z0-9_.-]*$")
 _PLAIN_WORD_RE = re.compile(r"^[A-Za-z0-9_@%+=:,./-]+$")
-_PTS_RE = re.compile(r"^/dev/pts/[0-9]+$")
+# A pane's terminal: /dev/pts/N on Linux (Unix98 ptys only; tmux never gets
+# another kind there), /dev/ttysNNN on macOS.
+_PTS_RE = re.compile(r"^/dev/(?:pts/[0-9]+|ttys[0-9]+)$")
 _PANE_FORMAT = "\t".join(("#{pane_id}", "#{pane_pid}", "#{pane_dead}", "#{pane_in_mode}",
                           "#{alternate_on}", "#{pane_height}", "#{pane_tty}",
                           "#{pane_current_command}", "#{window_index}",
@@ -533,11 +575,33 @@ def _source_lines(tmux, runner, tenv, workdir: Path, label: str,
     return errors or None
 
 
+def _homebrew_prefix_here(env: dict[str, str] | None = None) -> Path:
+    """This Mac's Homebrew prefix (HOMEBREW_PREFIX, else by architecture),
+    for the helpers that get no Platform."""
+
+    try:
+        architecture = plat.normalize_architecture(os.uname().machine)
+    except plat.PlatformError:
+        architecture = "arm64"
+    # homebrew_prefix reads only the system and the architecture.
+    return plat.homebrew_prefix(plat.Platform("macos", "", architecture, "darwin"), env)
+
+
+def system_tmux_conf(env: dict[str, str] | None = None) -> Path:
+    """The system file tmux reads first, in its build's sysconfdir:
+    /etc/tmux.conf for Ubuntu's tmux, <Homebrew prefix>/etc/tmux.conf for
+    Homebrew's on macOS."""
+
+    if not _darwin_host():
+        return Path("/etc/tmux.conf")
+    return _homebrew_prefix_here(env) / "etc" / "tmux.conf"
+
+
 def default_config_files(target) -> list[Path]:
     """The files a tmux server started without -f loads, as tmux resolves them."""
 
     out, seen = [], set()
-    for path in (Path("/etc/tmux.conf"), target.home / ".tmux.conf",
+    for path in (system_tmux_conf(), target.home / ".tmux.conf",
                  target.config_home / "tmux" / "tmux.conf",
                  target.home / ".config" / "tmux" / "tmux.conf"):
         if path.is_file() and os.path.realpath(path) not in seen:
@@ -1136,6 +1200,172 @@ def converge_running_tmux(target, runner, env: dict[str, str] | None = None, *,
     return [], details
 
 
+# --- macOS: the LaunchAgents, terminfo and the AI hook self-test ------------------
+
+def _launch_agent_plan(target, launch_agents: dict | None) -> dict[str, str]:
+    """entry id -> changed | kept | unchanged | missing for each plist.
+
+    ``launch_agents`` comes from install.py: the ids the transaction
+    ``changed`` (rewrote), ``kept`` (left as the user edited them) and left
+    ``unchanged``, and whether it ``applied`` them at all. Without it, a
+    plist on disk counts as unchanged.
+    """
+
+    from installer import launchd
+
+    plan = {}
+    if launch_agents is None:
+        for agent in launchd.AGENTS:
+            present = launchd.plist_path(target, agent).is_file()
+            plan[agent.entry_id] = "unchanged" if present else "missing"
+        return plan
+    changed = set(launch_agents.get("changed") or ())
+    kept = set(launch_agents.get("kept") or ())
+    unchanged = launch_agents.get("unchanged")
+    for agent in launchd.AGENTS:
+        if agent.entry_id in changed:
+            plan[agent.entry_id] = "changed"
+        elif agent.entry_id in kept:
+            plan[agent.entry_id] = "kept"
+        elif (agent.entry_id in unchanged if unchanged is not None
+              else bool(launch_agents.get("applied"))):
+            plan[agent.entry_id] = "unchanged"
+        else:
+            plan[agent.entry_id] = "missing"
+    return plan
+
+
+_AGENT_DOES = {"tmux": "starts tmux at login", "autosave": "saves tmux every minute"}
+
+
+def _register_agent(target, runner, name: str, plan: dict[str, str], env,
+                    statuses: list[str], reasons: list[str], launchd_details: dict) -> None:
+    """Register one LaunchAgent and fold its result into the phase.
+
+    FAIL and RELOGIN_REQUIRED decide the phase status; an agent the user
+    disabled is left off with a reason only (the phase itself did run).
+    """
+
+    from installer import launchd
+
+    agent = launchd.agent_named(name)
+    plist = launchd.plist_path(target, agent)
+    state = plan.get(agent.entry_id, "missing")
+    if state == "missing":
+        result = launchd.AgentResult(
+            FAIL, [f"{plist} was not installed by this run; run: dotfiles repair"],
+            {"label": agent.label, "plist": str(plist), "action": "missing"})
+    else:
+        result = launchd.register(target, runner, agent, changed=state == "changed", env=env)
+    launchd_details.setdefault("agents", {})[agent.name] = dict(
+        result.details, status=result.status, plist_state=state)
+    does = _AGENT_DOES[agent.name]
+    action = result.details.get("action")
+    if result.status == PASS:
+        done = "already loaded" if action == "unchanged" else "loaded"
+        ui.log_target(plist, ui.GREEN(f"LaunchAgent {done}; {does}"))
+    elif result.status == SKIPPED:
+        ui.log_target(plist, ui.GRAY(f"LaunchAgent disabled by you; left off "
+                                     f"(dotfiles services enable {agent.name})"))
+    elif result.status == RELOGIN_REQUIRED:
+        ui.log_target(plist, ui.YELLOW("no desktop login session here; the LaunchAgent "
+                                       "loads at your next login"))
+    else:
+        ui.log_target(plist, ui.RED("LaunchAgent not loaded (see below)"))
+    if result.status in (FAIL, RELOGIN_REQUIRED):
+        statuses.append(result.status)
+    for reason in result.reasons:
+        if reason not in reasons:  # both agents report a missing GUI domain
+            reasons.append(reason)
+
+
+def _macos_prepare(target, runner, run_id: str, reasons: list[str],
+                   launchd_details: dict) -> None:
+    """Before any agent loads: the log directory, and tmux-continuum's own
+    launcher out of the way (before the converge below loads the config,
+    whose @continuum-boot 'off' would only delete it, never unload it)."""
+
+    from installer import launchd
+
+    try:
+        launchd_details["log_dir"] = str(launchd.prepare_log_dir(target))
+    except OSError as exc:
+        reasons.append(f"could not create the LaunchAgent log directory "
+                       f"{launchd.log_dir(target)}: {exc}")
+    retired = launchd.retire_continuum_launcher(target, runner, run_id)
+    if retired is None:
+        return
+    launchd_details["continuum_launcher"] = retired
+    if retired.get("moved_to"):
+        ui.log_target(retired["plist"], ui.YELLOW(
+            f"tmux-continuum's own launcher; moved to {retired['moved_to']}"))
+    for key in ("bootout_error", "error"):
+        if retired.get(key):
+            reasons.append(retired[key])
+
+
+def _macos_terminfo(target, runner, repo_root: Path, env: dict[str, str],
+                    reasons: list[str], details: dict) -> None:
+    """Compile tmux-256color into ~/.terminfo when the system lacks it.
+
+    tmux.conf makes every pane's TERM tmux-256color; macOS's ncurses 5.7
+    does not know it, so programs in panes would complain or fall back.
+    Done before the tmux agent can start a server. A failure is reported
+    with the exact command, never fatal.
+    """
+
+    try:
+        known = runner.run([INFOCMP, "-x", TMUX_TERMINFO], timeout=TERMINFO_TIMEOUT,
+                           check=False, env=env, read_only=True).returncode == 0
+    except Exception:  # cannot tell: compile it, which is harmless
+        known = False
+    if known:
+        details["terminfo"] = "present"
+        return
+    out_dir = target.home / ".terminfo"
+    source = Path(repo_root) / TERMINFO_SOURCE
+    argv = [TIC, "-x", "-o", str(out_dir), str(source)]
+    try:
+        done = runner.run(argv, timeout=TERMINFO_TIMEOUT, check=False, env=env)
+    except Exception as exc:
+        problem = str(exc)
+    else:
+        problem = None if done.returncode == 0 else (
+            _tail(done.stderr) or f"exit status {done.returncode}")
+    if problem:
+        details["terminfo"] = "failed"
+        reasons.append(f"could not compile the {TMUX_TERMINFO} terminal description: "
+                       f"{problem}; run: {' '.join(shlex.quote(a) for a in argv)}")
+        return
+    details["terminfo"] = "installed"
+    ui.log_target(out_dir, ui.GREEN(f"{TMUX_TERMINFO} compiled from '{source}'"))
+
+
+def _macos_hook_self_test(target, runner, repo_root: Path, env: dict[str, str],
+                          reasons: list[str], details: dict) -> None:
+    """Run the AI hook's --self-test as tmux runs the hook: the script
+    itself (its #!/usr/bin/env python3), with the agents' PATH, so it is the
+    same python3. A failure is a reason, never a FAIL: saves still keep the
+    layout, directories and pane contents."""
+
+    hook = Path(repo_root) / AI_HOOK
+    try:
+        done = runner.run([str(hook), "--self-test"], timeout=SELF_TEST_TIMEOUT,
+                          check=False, env=env, cwd=target.home, read_only=True)
+    except Exception as exc:
+        problem = str(exc)
+    else:
+        problem = None if done.returncode == 0 else (
+            _tail(done.stderr) or f"exit status {done.returncode}")
+    if problem is None:
+        details["ai_hook_self_test"] = "pass"
+        return
+    details["ai_hook_self_test"] = "fail"
+    reasons.append("process inspection unavailable: Codex/Claude resume commands will "
+                   "not be saved (layouts, directories and pane contents still are): "
+                   + problem)
+
+
 def post_install_phase(target, runner, *, repo_root: Path, run_id: str,
                        systemd_units_applied: bool,
                        env: dict[str, str] | None = None,
@@ -1143,7 +1373,9 @@ def post_install_phase(target, runner, *, repo_root: Path, run_id: str,
                        skip_vimplug: bool = False,
                        tmux_env: dict[str, str] | None = None,
                        record_generation=None,
-                       hook_path: Path | None = None) -> PhaseResult:
+                       hook_path: Path | None = None,
+                       launch_agents: dict | None = None,
+                       platform=None) -> PhaseResult:
     """The post actions, in this order:
 
     1. the pinned tmux plugins, the systemd user units and the zsh/nvim
@@ -1158,11 +1390,25 @@ def post_install_phase(target, runner, *, repo_root: Path, run_id: str,
 
     ``tmux_env`` addresses the user's tmux server (it keeps TMUX_TMPDIR,
     which ``env`` from :func:`child_env` drops); it defaults to ``env``.
+
+    On macOS (``platform``) launchd takes systemd's place: the log
+    directory and tmux-continuum's own launcher first, then the autosave
+    agent where the systemd units are on Linux; after the converge the
+    tmux-256color terminfo, the tmux agent last (loading it starts a server
+    only when none runs, so the converge never waits out or resets a server
+    this run started) and the AI hook's self-test. ``launch_agents`` says
+    which plists the transaction changed (see :func:`_launch_agent_plan`).
     """
 
     statuses: list[str] = []
     reasons: list[str] = []
     details: dict = {}
+    darwin = bool(getattr(platform, "is_darwin", False))
+    if darwin:
+        plan = _launch_agent_plan(target, launch_agents)
+        installer_env = tmux_env if tmux_env is not None else env
+        launchd_details: dict = {}
+        details["launchd"] = launchd_details
 
     try:
         status, why, plugin_details = install_tmux_plugins(target, runner, repo_root, run_id)
@@ -1172,7 +1418,11 @@ def post_install_phase(target, runner, *, repo_root: Path, run_id: str,
     reasons += why
     details["tmux_plugins"] = plugin_details
 
-    if not systemd_units_applied:
+    if darwin:
+        _macos_prepare(target, runner, run_id, reasons, launchd_details)
+        _register_agent(target, runner, "autosave", plan, installer_env, statuses, reasons,
+                        launchd_details)
+    elif not systemd_units_applied:
         details["systemd"] = "units-skipped"
     elif systemd_user_reachable(runner, env):
         completed = runner.run(["systemctl", "--user", "daemon-reload"],
@@ -1223,6 +1473,16 @@ def post_install_phase(target, runner, *, repo_root: Path, run_id: str,
     if summary:
         ui.log(summary)
 
+    if darwin:
+        from installer import launchd
+
+        # As the agents run: their PATH and LANG from the installed plist.
+        agent_env = launchd.agent_env(target, launchd.TMUX, installer_env)
+        _macos_terminfo(target, runner, repo_root, agent_env, reasons, details)
+        _register_agent(target, runner, "tmux", plan, installer_env, statuses, reasons,
+                        launchd_details)
+        _macos_hook_self_test(target, runner, repo_root, agent_env, reasons, details)
+
     return PhaseResult("post-install", worst(statuses or [PASS]), reasons, details)
 
 
@@ -1243,6 +1503,14 @@ def _socket_path(socket_dir: str, name: str) -> str:
     return os.path.join(socket_dir, f"tmux-{os.getuid()}", name)
 
 
+def _measured(path: str) -> str:
+    """The directory as tmux will use it: resolved on macOS, where tmux
+    realpath()s TMUX_TMPDIR and /tmp and /var are links into /private (the
+    Linux measurement is unchanged)."""
+
+    return os.path.realpath(path) if _darwin_host() else path
+
+
 def _short_socket_dir(name: str, env: dict[str, str]) -> str | None:
     """A private ``mkdtemp`` directory whose ``-L`` socket path fits sun_path."""
 
@@ -1252,14 +1520,14 @@ def _short_socket_dir(name: str, env: dict[str, str]) -> str | None:
             candidates.append(root)
     for root in candidates:
         # mkdtemp adds '/' + prefix + 8 random characters.
-        projected = _socket_path(os.path.join(root, "pdfs-" + "x" * 8), name)
+        projected = _socket_path(os.path.join(_measured(root), "pdfs-" + "x" * 8), name)
         if len(projected) > SOCKET_PATH_MAX or not os.path.isdir(root):
             continue
         try:
             socket_dir = tempfile.mkdtemp(prefix="pdfs-", dir=root)
         except OSError:
             continue
-        if len(_socket_path(socket_dir, name)) <= SOCKET_PATH_MAX:
+        if len(_socket_path(_measured(socket_dir), name)) <= SOCKET_PATH_MAX:
             return socket_dir
         shutil.rmtree(socket_dir, ignore_errors=True)
     return None
@@ -1304,8 +1572,11 @@ def smoke_tmux(target, runner, env: dict[str, str]) -> tuple[str, str]:
             shutil.rmtree(socket_dir, ignore_errors=True)
 
 
-def smoke_phase(target, runner, env: dict[str, str] | None = None) -> PhaseResult:
-    cenv = child_env(target, env)
+def smoke_phase(target, runner, env: dict[str, str] | None = None, *,
+                extra_path=None) -> PhaseResult:
+    """``extra_path``: as for :func:`child_env` (macOS: Homebrew's bin)."""
+
+    cenv = child_env(target, env, extra_path=extra_path)
     statuses, reasons, details = [], [], {}
     for label, check in (("zsh", smoke_zsh), ("tmux", smoke_tmux)):
         try:
@@ -1363,9 +1634,35 @@ def _sudo_without_password(runner) -> bool:
     return completed.returncode == 0
 
 
+def _macos_login_shell(zsh: str, plain: str, current_shell: str,
+                       interactive) -> PhaseResult:
+    """chsh on macOS: Directory Services asks for the account's password
+    itself; there is no ``passwd -S`` and no locked-password case to work
+    around with sudo. Without a terminal (``interactive`` None) the command
+    is printed instead. A new Terminal window already starts the new shell."""
+
+    if interactive is None:
+        ui.log(ui.YELLOW(f"zsh is not your login shell; to make it one, run: {plain}"))
+        return PhaseResult("login-shell", SKIPPED,
+                           [f"no terminal to ask for your password; run: {plain}"],
+                           {"shell": current_shell, "command": plain, "system": "darwin"})
+    ui.log(ui.YELLOW("Please type your password if you wish to change the default "
+                     "shell to ZSH"))
+    returncode = interactive(["chsh", "-s", zsh])
+    if returncode != 0:
+        return PhaseResult("login-shell", FAIL,
+                           [f"chsh failed ({returncode}); run: {plain}"],
+                           {"shell": current_shell, "command": plain, "system": "darwin"})
+    ui.log("Successfully changed the default shell; new terminal windows start zsh")
+    return PhaseResult("login-shell", RELOGIN_REQUIRED,
+                       ["open a new terminal window (or log out and back in) for zsh "
+                        "to become the login shell"],
+                       {"shell": zsh, "system": "darwin"})
+
+
 def login_shell_phase(target, runner, *, current_shell: str,
                       allow_change: bool, interactive=None,
-                      checks_passed: bool = True) -> PhaseResult:
+                      checks_passed: bool = True, platform=None) -> PhaseResult:
     """Make zsh the passwd login shell.
 
     ``interactive`` is a callable ``(argv) -> returncode`` that runs attached
@@ -1378,6 +1675,9 @@ def login_shell_phase(target, runner, *, current_shell: str,
     with NOPASSWD sudo) cannot pass chsh's PAM check; they are changed with
     ``sudo -n chsh`` when sudo needs no password, and otherwise get the sudo
     command to run instead of a chsh that cannot succeed.
+
+    On macOS (``platform``) see :func:`_macos_login_shell`; there
+    ``interactive`` None means no terminal.
     """
 
     if Path(current_shell or "").name == "zsh":
@@ -1399,6 +1699,8 @@ def login_shell_phase(target, runner, *, current_shell: str,
         return PhaseResult("login-shell", SKIPPED,
                            [f"smoke-failed; after fixing it run: {plain}"],
                            {"shell": current_shell, "command": plain})
+    if getattr(platform, "is_darwin", False):
+        return _macos_login_shell(zsh, plain, current_shell, interactive)
 
     password = password_status(runner, user)
     if password in ("L", "NP") and _sudo_without_password(runner):
@@ -1643,6 +1945,11 @@ def format_summary(results: list[PhaseResult]) -> str:
     if pending_reasons and all(r == REMAPPER_UNSUPPORTED_REASON for r in pending_reasons):
         follow[PENDING_GUI] = ("Ctrl+Super+Left/Right tab switching is unavailable on "
                                "Ubuntu 22.04 (input-remapper 1.4); nothing to rerun.")
+    relogin = [r for r in results if r.status == RELOGIN_REQUIRED]
+    if relogin and all(LAUNCHD_GUI_DOMAIN_UNAVAILABLE in r.reasons for r in relogin):
+        # macOS without a desktop login here (SSH): nothing to log out of.
+        follow[RELOGIN_REQUIRED] = ("Log in to the Mac's desktop to start the tmux "
+                                    "LaunchAgents (see below).")
     for status in _SEVERITY:
         if status in seen and status in follow:
             lines.append("  -> " + follow[status])
@@ -1685,7 +1992,11 @@ def completion_lines(results: list[PhaseResult]) -> list[str]:
         if result.status == AUTH_REQUIRED:
             follow.append(f"{result.phase} needs sign-in: " + "; ".join(result.reasons))
     shell = by_phase.get("login-shell")
-    if shell is not None and shell.status == RELOGIN_REQUIRED:
+    if (shell is not None and shell.status == RELOGIN_REQUIRED
+            and shell.details.get("system") == "darwin"):
+        follow.append("Open a new terminal window (or log out and back in) so zsh "
+                      "becomes your login shell.")
+    elif shell is not None and shell.status == RELOGIN_REQUIRED:
         follow.append("Log out and back in so zsh becomes your login shell.")
     elif (shell is not None and shell.status == SKIPPED
           and shell.details.get("command")):
@@ -1694,6 +2005,19 @@ def completion_lines(results: list[PhaseResult]) -> list[str]:
     post = by_phase.get("post-install")
     if post is not None and "systemd-user-manager-unavailable" in post.reasons:
         follow.append("User services (tmux) start at the next graphical login.")
+    if post is not None and LAUNCHD_GUI_DOMAIN_UNAVAILABLE in post.reasons:
+        agents = (post.details.get("launchd") or {}).get("agents") or {}
+        commands = [entry["command"] for entry in agents.values()
+                    if isinstance(entry, dict) and entry.get("command")]
+        follow.append("The tmux LaunchAgents are installed and load at your next login "
+                      "to the Mac's desktop"
+                      + (" (to load them now, run in a Terminal of that session: "
+                         + "; ".join(commands) + ")." if commands else "."))
+    tmux_agent = ((post.details.get("launchd") or {}).get("agents") or {}).get("tmux") \
+        if post is not None else None
+    if isinstance(tmux_agent, dict) and tmux_agent.get("outcome") == "not-restored":
+        follow.append("tmux started without restoring your last snapshot: press prefix + "
+                      f"C-r in tmux to restore it (why: {tmux_agent.get('log')}).")
     gui = by_phase.get("gui")
     if gui is not None and gui.status == PENDING_GUI:
         # 22.04's input-remapper 1.4 can never express the tab chord, so

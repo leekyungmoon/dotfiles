@@ -20,6 +20,7 @@ import hashlib
 import io
 import json
 import os
+import plistlib
 import pwd
 import shutil
 import subprocess
@@ -31,14 +32,20 @@ from pathlib import Path
 from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
+for _path in (str(REPO_ROOT), str(REPO_ROOT / "tests" / "unit")):
+    if _path not in sys.path:
+        sys.path.insert(0, _path)
 
 import install  # noqa: E402
+from installer import launchd  # noqa: E402
 from installer import ui  # noqa: E402
 from installer.platform import Platform, Target  # noqa: E402
 from installer.runner import Runner  # noqa: E402
 from installer import transaction  # noqa: E402
+
+# The in-memory launchd of the unit tests (the module, so its tests are not
+# collected a second time here).
+import test_launchd as launchd_fakes  # noqa: E402
 
 # Working-tree files carried by the scratch overlay commit.
 OVERLAY_GLOBS = [
@@ -113,7 +120,7 @@ class FakeRunner(Runner):
             return subprocess.CompletedProcess(argv, 0, b"", b"")
         raise AssertionError(f"unexpected command {argv}")
 
-    def which(self, name):
+    def which(self, name, path=None):
         if name == "git":
             return shutil.which("git")
         if name == "systemctl":
@@ -124,6 +131,48 @@ class FakeRunner(Runner):
 
     def ran(self, name) -> list[list[str]]:
         return [c for c in self.calls if Path(c[0]).name == name]
+
+
+TAHOE = Platform("macos", "26", "arm64", "darwin")
+LAUNCH_AGENTS = ("com.github.leekyungmoon.dotfiles.tmux-resurrect-autosave",
+                 "com.github.leekyungmoon.dotfiles.tmux")
+
+
+class DarwinFlowRunner(FakeRunner):
+    """FakeRunner on a simulated Mac: launchctl is test_launchd.LaunchdSim
+    (its state outlives one run, as launchd's does), and xcode-select, locale,
+    infocmp and the AI hook's self-test are answered. The tmux agent's run
+    ends at once (exit 0), as when a server already runs."""
+
+    ANSWERS = {
+        ("/usr/bin/locale", "-a"): "C\nPOSIX\nen_US.UTF-8\nko_KR.UTF-8\n",
+        ("/usr/bin/infocmp", "-x", "tmux-256color"): "",
+    }
+
+    def __init__(self, git_env, sim, developer_dir: Path):
+        super().__init__(git_env)
+        self.sim = sim
+        self.developer_dir = developer_dir
+
+    def run(self, argv, *, timeout, check=True, env=None, input=None, cwd=None,
+            read_only=False):
+        argv = [str(a) for a in argv]
+        if argv[0] == launchd.LAUNCHCTL:
+            self.calls.append(argv)
+            return self.sim.handle(argv)
+        if argv == [install.XCODE_SELECT, "-p"]:
+            self.calls.append(argv)
+            return subprocess.CompletedProcess(argv, 0, f"{self.developer_dir}\n".encode(),
+                                               b"")
+        if tuple(argv) in self.ANSWERS or argv[-1] == "--self-test":
+            self.calls.append(argv)
+            out = self.ANSWERS.get(tuple(argv), "").encode()
+            return subprocess.CompletedProcess(argv, 0, out, b"")
+        return super().run(argv, timeout=timeout, check=check, env=env, input=input,
+                           cwd=cwd, read_only=read_only)
+
+    def launchctl(self, verb: str) -> list[list[str]]:
+        return [c for c in self.calls if c[0] == launchd.LAUNCHCTL and c[1] == verb]
 
 
 def _tree_digest(root: Path, skip=()) -> dict[str, str]:
@@ -767,6 +816,167 @@ class InstallFlowTests(unittest.TestCase):
         rc, out, _ = self.main("restore", "--baseline")
         self.assertEqual(rc, 0, out)
         self.assertFalse(os.path.lexists(dest))
+
+    # -- macOS, simulated: launchd instead of systemd ------------------------------
+
+    def main_darwin(self, *argv) -> tuple[int, str, DarwinFlowRunner]:
+        """install.main on a simulated macOS 26 (arm64): the platform, the
+        kernel name status/restore/services read, and launchd."""
+
+        if not hasattr(self, "sim"):
+            self.sim = launchd_fakes.LaunchdSim(os.getuid())
+        runner = DarwinFlowRunner(self.git_env, self.sim, Path(self._home_tmp.name))
+        out = io.StringIO()
+        env = {"HOME": str(self.home), "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+               "NO_COLOR": "1", "LANG": "ko_KR.UTF-8"}
+        with mock.patch.object(install.plat, "current_system", return_value="darwin"), \
+                launchd_fakes.fake_clock(), redirect_stdout(out), redirect_stderr(out):
+            rc = install.main(list(argv), env=env, euid=os.getuid(), getpwuid=self.getpwuid,
+                              runner=runner, detect=lambda: TAHOE, here=self.checkout,
+                              prompt=False,
+                              interactive=lambda args: self.fail(f"chsh ran: {args}"))
+        self.last_output = out.getvalue()
+        return rc, out.getvalue(), runner
+
+    def plist(self, label: str) -> Path:
+        return self.home / "Library" / "LaunchAgents" / f"{label}.plist"
+
+    def test_macos_install_registers_the_launch_agents(self):
+        self.clone()
+        rc, out, runner = self.main_darwin(*FLAGS)
+        self.assertEqual(rc, 0, out)
+        for label in LAUNCH_AGENTS:
+            plist = self.plist(label)
+            self.assertEqual(plist.stat().st_mode & 0o777, 0o644)
+            data = plistlib.loads(plist.read_bytes())
+            self.assertEqual(data["Label"], label)
+            self.assertEqual(data["EnvironmentVariables"]["LANG"], "ko_KR.UTF-8")
+            self.assertTrue(data["EnvironmentVariables"]["PATH"].startswith(
+                f"{self.target.data_home}/personal-dotfiles/bin:{self.home}/.local/bin:"
+                "/opt/homebrew/bin:/opt/homebrew/sbin:"))
+            program = data["ProgramArguments"][0]
+            self.assertTrue(program.startswith(f"{self.checkout}/tmux/"), program)
+            self.assertTrue(os.access(program, os.X_OK), program)
+            self.assertEqual(plist.read_bytes(), launchd.render(
+                launchd.agent_named("tmux" if label.endswith(".tmux") else "autosave"),
+                self.target, brew_prefix="/opt/homebrew", lang="ko_KR.UTF-8"))
+        log_dir = self.target.state_root / "launchd"
+        self.assertEqual(log_dir.stat().st_mode & 0o777, 0o700)
+        # Registered and verified in gui/<uid>: the autosave agent where the
+        # systemd units are on Linux, the tmux agent last.
+        self.assertEqual(set(self.sim.loaded), set(LAUNCH_AGENTS))
+        self.assertEqual([c[2:] for c in runner.launchctl("bootstrap")],
+                         [[f"gui/{os.getuid()}", str(self.plist(label))]
+                          for label in LAUNCH_AGENTS])
+        self.assertEqual(runner.launchctl("bootout"), [])
+        generation = max(i for i, c in enumerate(runner.calls)
+                         if c[:2] == ["git", "--no-optional-locks"])
+        bootstraps = [i for i, c in enumerate(runner.calls)
+                      if c[:2] == [launchd.LAUNCHCTL, "bootstrap"]]
+        self.assertLess(bootstraps[0], generation)
+        self.assertGreater(bootstraps[1], generation)
+        self.assertFalse(runner.ran("systemctl"))
+        # The self-test ran the checkout's hook itself.
+        self.assertIn([str(self.checkout / "tmux/resurrect-ai-session.py"), "--self-test"],
+                      runner.calls)
+        by_phase = self.phases()
+        # No GNOME phase on macOS at all.
+        self.assertEqual(list(by_phase), ["preflight", "packages", "transaction",
+                                          "post-install", "smoke", "login-shell",
+                                          "git-identity", "auth"])
+        self.assertNotIn("GNOME settings", out)
+        self.assertNotIn("Desktop settings", out)
+        post = by_phase["post-install"]
+        self.assertEqual((post["status"], post["reasons"]), ("PASS", []))
+        agents = post["details"]["launchd"]["agents"]
+        self.assertEqual({name: (a["status"], a["action"]) for name, a in agents.items()},
+                         {"autosave": ("PASS", "bootstrapped"),
+                          "tmux": ("PASS", "bootstrapped")})
+        self.assertEqual((post["details"]["terminfo"], post["details"]["ai_hook_self_test"]),
+                         ("present", "pass"))
+        self.assertNotIn("systemd", post["details"])
+        # Linux-only and systemd files stay away; the rest is installed.
+        for entry in self.manifest:
+            dest = self.dest(entry)
+            if entry.get("condition") in ("linux", "systemd-user"):
+                self.assertFalse(os.path.lexists(dest), entry["id"])
+            elif entry["kind"] == "symlink":
+                self.assertEqual(os.readlink(dest), str(self.checkout / entry["source"]),
+                                 entry["id"])
+        self.assertIn("not applicable on macOS, which uses launchd", out)
+        self.assert_generation()
+        self.assertEqual(_git(self.git_env, "-C", str(self.checkout), "status",
+                              "--porcelain", "--ignored"), "")
+        # status --json reads launchd (read only).
+        loaded = dict(self.sim.loaded)
+        rc, out, runner = self.main_darwin("status", "--json")
+        self.assertEqual(rc, 0, out)
+        services = json.loads(out)["services"]
+        self.assertTrue(all(a["loaded"] and a["plist_present"] and not a["disabled"]
+                            for a in services["agents"].values()), services)
+        self.assertEqual(services["agents"]["autosave"]["run_interval"], 60)
+        self.assertEqual(self.sim.loaded, loaded)
+        self.assertEqual(runner.launchctl("bootstrap") + runner.launchctl("bootout"), [])
+
+    def test_macos_repair_is_idempotent(self):
+        self.clone()
+        self.assertEqual(self.main_darwin(*FLAGS)[0], 0, self.last_output)
+        before = {label: self.plist(label).read_bytes() for label in LAUNCH_AGENTS}
+        rc, out, runner = self.main_darwin("repair", *FLAGS)
+        self.assertEqual(rc, 0, out)
+        self.assertEqual({label: self.plist(label).read_bytes() for label in LAUNCH_AGENTS},
+                         before)
+        self.assertEqual(runner.launchctl("bootstrap") + runner.launchctl("bootout"), [])
+        tx = self.phases()["transaction"]["details"]["result"]
+        self.assertEqual(tx["changed"], [])
+        self.assertTrue(set(launchd.ENTRY_IDS) <= set(tx["unchanged"]))
+        agents = self.phases()["post-install"]["details"]["launchd"]["agents"]
+        self.assertEqual({a["action"] for a in agents.values()}, {"unchanged"})
+        self.assertEqual({a["plist_state"] for a in agents.values()}, {"unchanged"})
+
+    def test_macos_services_disable_survives_repair_until_enabled(self):
+        self.clone()
+        self.assertEqual(self.main_darwin(*FLAGS)[0], 0, self.last_output)
+        rc, out, runner = self.main_darwin("services", "disable")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.sim.loaded, {})
+        self.assertEqual(self.sim.disabled, {label: True for label in LAUNCH_AGENTS})
+        self.assertEqual(len(runner.launchctl("bootout")), 2)
+        # A repair leaves them off and says so; the phase itself passes.
+        rc, out, runner = self.main_darwin("repair", *FLAGS)
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(runner.launchctl("bootstrap"), [])
+        post = self.phases()["post-install"]
+        self.assertEqual(post["status"], "PASS")
+        self.assertEqual(sorted(post["reasons"]),
+                         ["autosave: disabled (enable: dotfiles services enable autosave)",
+                          "tmux: disabled (enable: dotfiles services enable tmux)"])
+        rc, out, _ = self.main_darwin("services")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("tmux       disabled", out)
+        self.assertIn("autosave   disabled", out)
+        rc, out, runner = self.main_darwin("services", "enable")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(set(self.sim.loaded), set(LAUNCH_AGENTS))
+        self.assertFalse(any(self.sim.disabled.values()))
+        rc, out, _ = self.main_darwin("status", "--json")
+        agents = json.loads(out)["services"]["agents"]
+        self.assertTrue(all(a["loaded"] and a["disabled"] is False for a in agents.values()))
+
+    def test_macos_restore_baseline_unloads_the_agents(self):
+        self.clone()
+        self.assertEqual(self.main_darwin(*FLAGS)[0], 0, self.last_output)
+        rc, out, runner = self.main_darwin("restore", "--baseline")
+        self.assertEqual(rc, 0, out)
+        for label in LAUNCH_AGENTS:
+            self.assertFalse(os.path.lexists(self.plist(label)))
+        self.assertEqual(self.sim.loaded, {})
+        self.assertEqual(sorted(c[2] for c in runner.launchctl("bootout")),
+                         sorted(f"gui/{os.getuid()}/{label}" for label in LAUNCH_AGENTS))
+        data = json.loads(out[out.index("{\n"):])
+        self.assertEqual(data["launchd"], {"tmux": "unloaded", "autosave": "unloaded"})
+        self.assertFalse(os.path.lexists(self.home / ".zshrc"))
+        self.assertTrue((self.checkout / ".git").is_dir())
 
 
 if __name__ == "__main__":

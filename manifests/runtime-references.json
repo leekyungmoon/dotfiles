@@ -1054,6 +1054,13 @@
     },
     {
       "file": "install.py",
+      "line": "later = f\"`~/.dotfiles/install --{option.replace('_', '-')}` \"",
+      "kind": "link",
+      "classification": "guidance",
+      "purpose": "macOS user-facing hint: how to install a skipped AI CLI later; it names the ~/.dotfiles/install wrapper, which runs install.py with Homebrew's python3 (python3 there is usually the Command Line Tools' 3.9, which install.py refuses)"
+    },
+    {
+      "file": "install.py",
       "line": "\"Clone the repository into ~/.dotfiles and install it from there:\\n\\n\"",
       "kind": "link",
       "classification": "guidance",
@@ -1649,10 +1656,19 @@
     },
     {
       "id": "terminfo",
-      "entrypoint": "etc/terminfo.sh install (zshrc hint)",
+      "entrypoint": "etc/terminfo.sh install (zshrc hint); on macOS also the install.py post actions (installer/phases.py _macos_terminfo) when /usr/bin/infocmp -x tmux-256color finds no entry",
       "before": "tic -x -o ~/.terminfo",
-      "after": "unchanged (outside the checkout)",
-      "status": "outside-checkout"
+      "after": "unchanged (outside the checkout); on macOS the installer runs /usr/bin/tic -x -o ~/.terminfo <checkout>/etc/terminfo/tmux-256color.terminfo, which only reads the checkout's file",
+      "status": "outside-checkout",
+      "checks": [
+        {
+          "file": "installer/phases.py",
+          "require": [
+            "TIC = \"/usr/bin/tic\"",
+            "argv = \\[TIC, \"-x\", \"-o\", str\\(out_dir\\), str\\(source\\)\\]"
+          ]
+        }
+      ]
     },
     {
       "id": "gitconfig-global-writes",
@@ -1741,7 +1757,7 @@
     },
     {
       "id": "python-bytecode-checkout",
-      "entrypoint": "python imports of modules inside the checkout: bin/dotfiles and etc/install -> install.py -> installer/*.py; tmux/resurrect-ai-session.py -> installer/darwin_proc.py (macOS only); tests importing tools/, tmux/resurrect-ai-session.py, desktop/input-remapper/",
+      "entrypoint": "python imports of modules inside the checkout: bin/dotfiles and etc/install -> install.py -> installer/*.py; tmux/resurrect-ai-session.py -> installer/darwin_proc.py (macOS only); tests importing tools/, tmux/resurrect-ai-session.py, desktop/input-remapper/; install.py's macOS post actions run tmux/resurrect-ai-session.py --self-test as a script (the same no-bytecode path as the hook; its test files live in a TemporaryDirectory under TMPDIR and are removed)",
       "before": "__pycache__/ under installer/, tools/, tmux/, desktop/, tests/ of the checkout (gitignored, but writes into installer-owned source)",
       "after": "install.py sets sys.dont_write_bytecode before importing installer/ and bin/dotfiles runs it with -B; zsh/ and tmux.conf start no python from the checkout; resurrect.conf runs resurrect-ai-session.py as a script (a __main__ script writes no bytecode), and on macOS that script sets sys.dont_write_bytecode before it imports installer/darwin_proc.py from its own checkout (Linux never imports it). Test runners must use python -B / PYTHONDONTWRITEBYTECODE=1",
       "status": "redirected",
@@ -1845,6 +1861,56 @@
           "file": "tmux/resurrect.conf",
           "require": [
             "if-shell 'test \"\\$\\(uname -s\\)\" = Darwin' \"set -g @continuum-boot 'off'\\\""
+          ]
+        }
+      ]
+    },
+    {
+      "id": "launchd-agents",
+      "entrypoint": "install.py install / repair on macOS (installer/launchd.py; the post actions in installer/phases.py), install.py services enable|disable and restore",
+      "before": "none (new on macOS; on Linux tmux.service and tmux-resurrect-autosave.timer are systemd user units)",
+      "after": "the transaction writes ~/Library/LaunchAgents/com.github.leekyungmoon.dotfiles.tmux.plist and ~/Library/LaunchAgents/com.github.leekyungmoon.dotfiles.tmux-resurrect-autosave.plist (rendered per home with absolute paths, mode 0644, entry ids launchd-tmux and launchd-tmux-resurrect-autosave; backed up, drift-checked and restored like every managed path); the macOS post actions create ${XDG_STATE_HOME:-~/.local/state}/personal-dotfiles/launchd (0700) for the agents' logs and load both into gui/<uid> with launchctl bootstrap (after launchctl bootout when the transaction rewrote a plist, never when nothing changed); services disable runs launchctl bootout and launchctl disable (persistent until services enable runs launchctl enable and bootstrap); restore unloads an agent whose plist it removed. Nothing is written under the checkout",
+      "status": "outside-checkout",
+      "evidence": "tests/unit/test_launchd.py (rendering, every launchctl status mapping, registration and unloading on an in-memory launchd); tests/unit/test_install_cli.py MacosPostInstallTests, MacosServicesTests; tests/integration/test_install_flow.py test_macos_* (plists in the temp home's ~/Library/LaunchAgents, mode 0644; repair runs no bootout or bootstrap; services disable survives a repair; restore --baseline unloads both)",
+      "checks": [
+        {
+          "file": "installer/launchd.py",
+          "require": [
+            "LABEL_TMUX = \"com\\.github\\.leekyungmoon\\.dotfiles\\.tmux\"",
+            "LABEL_AUTOSAVE = \"com\\.github\\.leekyungmoon\\.dotfiles\\.tmux-resurrect-autosave\"",
+            "return target\\.home / \"Library\" / \"LaunchAgents\" / f\"\\{agent\\.label\\}\\.plist\"",
+            "return target\\.state_root / \"launchd\"",
+            "os\\.chmod\\(path, 0o700\\)",
+            "mode=0o644\\)"
+          ],
+          "forbid": [
+            "\"KeepAlive\"",
+            "\"TMUX_TMPDIR\":"
+          ]
+        },
+        {
+          "file": "install.py",
+          "require": [
+            "extra \\+= launch_agent_entries\\(ctx\\)",
+            "unload_failed = _unload_restored_agents\\(ctx, data\\)"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "launchd-continuum-launcher-backup",
+      "entrypoint": "install.py install / repair on macOS (installer/launchd.py retire_continuum_launcher, before the running tmux server loads the new config)",
+      "before": "a ~/Library/LaunchAgents/Tmux.Start.plist written by tmux-continuum's @continuum-boot 'on' (an earlier setup) stayed in place and loaded, and opened a terminal running tmux at every login",
+      "after": "launchctl bootout gui/<uid>/Tmux.Start.plist (not loaded is fine), then the file is moved to ${XDG_STATE_HOME:-~/.local/state}/personal-dotfiles/backups/launchd/<run id>/Tmux.Start.plist (directories 0700); it is never deleted, and the installer's own plists are never touched by it",
+      "status": "outside-checkout",
+      "evidence": "tests/unit/test_launchd.py ContinuumLauncherTests; tests/unit/test_install_cli.py MacosPostInstallTests.test_continuum_launcher_is_set_aside_before_the_converge",
+      "checks": [
+        {
+          "file": "installer/launchd.py",
+          "require": [
+            "CONTINUUM_PLIST = \"Tmux\\.Start\\.plist\"",
+            "folder = target\\.state_root / \"backups\" / \"launchd\" / run_id",
+            "shutil\\.move\\(str\\(path\\), str\\(dest\\)\\)"
           ]
         }
       ]

@@ -17,15 +17,21 @@ from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest import mock
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
+HERE = Path(__file__).resolve().parent
+REPO_ROOT = HERE.parents[1]
+for _path in (str(REPO_ROOT), str(HERE)):
+    if _path not in sys.path:
+        sys.path.insert(0, _path)
 
 import install  # noqa: E402
 from installer import phases, ui  # noqa: E402
 from installer.phases import PhaseResult  # noqa: E402
 from installer.platform import Platform, Target  # noqa: E402
 from installer.runner import Runner  # noqa: E402
+
+# The in-memory launchd; importing the module (not its classes) keeps its
+# tests from being collected a second time here.
+import test_launchd as launchd_fakes  # noqa: E402
 
 
 class ScriptedRunner(Runner):
@@ -1954,7 +1960,11 @@ class PlatformManifestTests(TempHome):
                       out)
 
         out = self.dry_run(TAHOE, None)
-        self.assertEqual(self.planned(out), sorted([bashrc, mac_only]))
+        # macOS also plans the two LaunchAgent plists the run would install.
+        agents = [str(self.home / "Library/LaunchAgents" / f"{label}.plist")
+                  for label in ("com.github.leekyungmoon.dotfiles.tmux",
+                                "com.github.leekyungmoon.dotfiles.tmux-resurrect-autosave")]
+        self.assertEqual(self.planned(out), sorted([bashrc, mac_only, *agents]))
         self.assertIn(ui.target_line("systemd user units",
                                      "not applicable on macOS, which uses launchd"),
                       out.splitlines())
@@ -2030,7 +2040,10 @@ class MacosGuiTests(TempHome):
             for no_gui in (False, True):
                 entries, warnings = install.extra_desired_entries(ctx, packages,
                                                                   no_gui=no_gui)
-                self.assertEqual([e.id for e in entries], ["tool-link-fzf"])
+                # The LaunchAgent plists take the autostart entry's place.
+                self.assertEqual([e.id for e in entries],
+                                 ["tool-link-fzf", "launchd-tmux",
+                                  "launchd-tmux-resurrect-autosave"])
                 self.assertEqual(warnings, [])
         self.assertNotIn(("gui", "autostart_desired_entry"), asked)
 
@@ -2060,17 +2073,20 @@ class MacosGuiTests(TempHome):
                 rc = install.run_pipeline(ctx, "install", install.Options(no_packages=True))
             self.assertEqual(preflight.call_args.kwargs, {"packages": False})
             status = {p["phase"]: p for p in phases.read_status(self.target)["phases"]}
-            return rc, out.getvalue(), status["gui"]
+            return rc, out.getvalue(), status
 
-        rc, out, gui = run(TAHOE)
+        # macOS has no GNOME phase at all: no section, no SKIPPED result
+        # that would make every Mac's overall status SKIPPED.
+        rc, out, status = run(TAHOE)
         self.assertEqual(rc, 0)
-        self.assertIn("Desktop settings", out)
+        self.assertNotIn("Desktop settings", out)
         self.assertNotIn("GNOME settings", out)
-        self.assertEqual((gui["status"], gui["reasons"]), ("SKIPPED", ["not-applicable-on-macos"]))
-        rc, out, gui = run(NOBLE)
+        self.assertNotIn("gui", status)
+        rc, out, status = run(NOBLE)
         self.assertIn("GNOME settings", out)
         self.assertNotIn("Desktop settings", out)
-        self.assertEqual((gui["status"], gui["reasons"]), ("SKIPPED", ["gui-phase-not-available"]))
+        self.assertEqual((status["gui"]["status"], status["gui"]["reasons"]),
+                         ("SKIPPED", ["gui-phase-not-available"]))
 
     def run_restore(self, system, seam):
         from argparse import Namespace
@@ -2335,6 +2351,888 @@ class PreflightTests(TempHome):
         except ImportError:  # this Python really lacks it
             return
         self.assertIsNone(install._lzma_problem())
+
+
+# --- macOS: LaunchAgents, post actions, services ---------------------------------
+
+LABEL_TMUX = "com.github.leekyungmoon.dotfiles.tmux"
+LABEL_AUTOSAVE = "com.github.leekyungmoon.dotfiles.tmux-resurrect-autosave"
+SELF_TEST_FAILED = "resurrect AI hook self-test failed on darwin: libproc is unavailable"
+
+
+class MacRunner(launchd_fakes.SimRunner):
+    """launchd from :class:`test_launchd.LaunchdSim`, plus what the macOS post
+    actions run: infocmp, tic and the AI hook's self-test. The installer's
+    own PATH has no tools (``which`` without ``path``), so the plugin steps
+    and the converge do nothing; tmux on the agents' PATH is Homebrew's."""
+
+    def __init__(self, sim, *, infocmp=0, tic=0, self_test=0, events=None, **kw):
+        super().__init__(sim, **kw)
+        self.answers = {"infocmp": infocmp, "tic": tic, "self-test": self_test}
+        self.events = events if events is not None else []
+        self.cwds: list = []
+
+    def run(self, argv, *, timeout, check=True, env=None, input=None, cwd=None,
+            read_only=False):
+        argv = [str(a) for a in argv]
+        self.cwds.append(cwd)
+        if argv[0] in (phases.INFOCMP, phases.TIC) or argv[-1] == "--self-test":
+            name = ("infocmp" if argv[0] == phases.INFOCMP else
+                    "tic" if argv[0] == phases.TIC else "self-test")
+            self.events.append(name)
+            self.calls.append(argv)
+            self.read_only.append(read_only)
+            self.envs.append(env)
+            rc = self.answers[name]
+            err = SELF_TEST_FAILED if name == "self-test" and rc else f"{name}: failed"
+            return subprocess.CompletedProcess(argv, rc, b"", err.encode() if rc else b"")
+        if argv[0] == "/bin/launchctl":
+            self.events.append(f"launchctl {argv[1]}")
+        return super().run(argv, timeout=timeout, check=check, env=env, input=input,
+                           cwd=cwd, read_only=read_only)
+
+    def which(self, name, path=None):
+        return None if path is None else super().which(name, path)
+
+
+class MacosPostInstallTests(TempHome):
+    """post_install_phase with a macOS platform: launchd in systemd's place."""
+
+    def setUp(self):
+        super().setUp()
+        ui.configure(enabled=False)
+        launchd_fakes.install_plists(self.target, lang="ko_KR.UTF-8")
+        self.repo = self.home / "repo"
+        (self.repo / "manifests").mkdir(parents=True)
+        (self.repo / "manifests/tmux-plugins.json").write_text(
+            json.dumps({"schema": 1, "plugins": []}))
+        self.sim = launchd_fakes.LaunchdSim(self.target.uid)
+        self.events: list[str] = []
+
+    def post(self, runner=None, launch_agents=None, **kw):
+        runner = runner or MacRunner(self.sim, events=self.events)
+
+        def converge(target, runner_, env, **kwargs):
+            self.events.append("converge")
+            return [], {"outcome": "no-running-server", "respawned_panes": 0,
+                        "busy_panes": 0}
+
+        def record():
+            self.events.append("generation")
+            return "g1", "g2"
+
+        if launch_agents is None:
+            launch_agents = {"changed": ["launchd-tmux", "launchd-tmux-resurrect-autosave"],
+                             "kept": [], "unchanged": [], "applied": True}
+        with mock.patch.object(phases, "converge_running_tmux", side_effect=converge), \
+                launchd_fakes.fake_clock(), redirect_stdout(io.StringIO()) as out:
+            result = phases.post_install_phase(
+                self.target, runner, repo_root=self.repo, run_id="20260101T000000Z-0123abcd",
+                systemd_units_applied=False, env={"PATH": "/usr/bin:/bin"},
+                tmux_env={"PATH": "/usr/bin:/bin", "TMUX": "/tmp/t,1,0"},
+                record_generation=record, launch_agents=launch_agents, platform=TAHOE, **kw)
+        self.output = out.getvalue()
+        return result, runner
+
+    def test_order_autosave_generation_converge_terminfo_tmux_self_test(self):
+        result, runner = self.post()
+        self.assertEqual(result.status, "PASS", result.reasons)
+        self.assertEqual(result.reasons, [])
+        register = ["launchctl print", "launchctl print-disabled", "launchctl print",
+                    "launchctl bootstrap", "launchctl print"]
+        self.assertEqual(self.events, [*register, "generation", "converge", "infocmp",
+                                       *register, "launchctl print", "self-test"])
+        # Never systemd on macOS, whatever systemd_units_applied says.
+        self.assertFalse(any(c[0] == "systemctl" for c in runner.calls))
+        self.assertNotIn("systemd", result.details)
+        agents = result.details["launchd"]["agents"]
+        self.assertEqual([agents[n]["status"] for n in ("autosave", "tmux")], ["PASS"] * 2)
+        self.assertEqual(agents["tmux"]["plist_state"], "changed")
+        self.assertEqual(agents["tmux"]["outcome"], "started")
+        self.assertEqual(agents["autosave"]["run_interval"], 60)
+        self.assertEqual((result.details["terminfo"], result.details["ai_hook_self_test"]),
+                         ("present", "pass"))
+        log_dir = self.target.state_root / "launchd"
+        self.assertEqual(result.details["launchd"]["log_dir"], str(log_dir))
+        self.assertEqual(log_dir.stat().st_mode & 0o777, 0o700)
+        self.assertIn(LABEL_AUTOSAVE + ".plist", self.output)
+        self.assertIn("LaunchAgent loaded; saves tmux every minute", self.output)
+        self.assertIn("LaunchAgent loaded; starts tmux at login", self.output)
+
+    def test_self_test_runs_the_hook_as_tmux_does(self):
+        _, runner = self.post()
+        index = runner.calls.index([str(self.repo / "tmux/resurrect-ai-session.py"),
+                                    "--self-test"])
+        env = runner.envs[index]
+        # The script itself (its #!/usr/bin/env python3) with the agents' PATH.
+        agent_path = launchd_fakes.launchd.launch_path(self.target, "/opt/homebrew")
+        self.assertEqual(env["PATH"], agent_path)
+        self.assertEqual(env["LANG"], "ko_KR.UTF-8")
+        self.assertNotIn("TMUX", env)
+        self.assertTrue(runner.read_only[index])
+        self.assertEqual(runner.cwds[index], self.home)
+
+    def test_self_test_failure_is_a_reason_not_a_failure(self):
+        runner = MacRunner(self.sim, events=self.events, self_test=1)
+        result, _ = self.post(runner)
+        self.assertEqual(result.status, "PASS")
+        self.assertEqual(result.details["ai_hook_self_test"], "fail")
+        self.assertEqual(len(result.reasons), 1)
+        self.assertTrue(result.reasons[0].startswith(
+            "process inspection unavailable: Codex/Claude resume commands will not be saved"))
+        self.assertIn(SELF_TEST_FAILED, result.reasons[0])
+        self.assertEqual(phases.exit_code([result]), 0)
+
+    def test_terminfo_is_compiled_when_missing(self):
+        runner = MacRunner(self.sim, events=self.events, infocmp=1)
+        result, _ = self.post(runner)
+        tic = ["/usr/bin/tic", "-x", "-o", str(self.home / ".terminfo"),
+               str(self.repo / "etc/terminfo/tmux-256color.terminfo")]
+        self.assertIn(tic, runner.calls)
+        self.assertFalse(runner.read_only[runner.calls.index(tic)])
+        self.assertEqual(runner.calls[runner.calls.index(tic) - 1],
+                         ["/usr/bin/infocmp", "-x", "tmux-256color"])
+        self.assertEqual(result.details["terminfo"], "installed")
+        # Before the tmux agent can start a server.
+        tmux_bootstrap = max(i for i, event in enumerate(self.events)
+                             if event == "launchctl bootstrap")
+        self.assertLess(self.events.index("tic"), tmux_bootstrap)
+        self.assertEqual(result.status, "PASS")
+
+    def test_terminfo_failure_names_the_command(self):
+        runner = MacRunner(self.sim, events=self.events, infocmp=1, tic=1)
+        result, _ = self.post(runner)
+        self.assertEqual(result.status, "PASS")
+        self.assertEqual(result.details["terminfo"], "failed")
+        self.assertIn("could not compile the tmux-256color terminal description", result.reasons[0])
+        self.assertIn(f"run: /usr/bin/tic -x -o {self.home / '.terminfo'} "
+                      f"{self.repo / 'etc/terminfo/tmux-256color.terminfo'}",
+                      result.reasons[0])
+
+    def test_changed_kept_and_unchanged_plists(self):
+        seen = []
+
+        def register(target, runner, agent, *, changed, env=None):
+            seen.append((agent.name, changed))
+            return launchd_fakes.launchd.AgentResult("PASS", [], {"action": "unchanged"})
+
+        plans = (
+            ({"changed": ["launchd-tmux"], "kept": ["launchd-tmux-resurrect-autosave"],
+              "unchanged": [], "applied": True},
+             [("autosave", False), ("tmux", True)], {"autosave": "kept", "tmux": "changed"}),
+            ({"changed": [], "kept": [], "unchanged": ["launchd-tmux",
+                                                       "launchd-tmux-resurrect-autosave"],
+              "applied": True},
+             [("autosave", False), ("tmux", False)],
+             {"autosave": "unchanged", "tmux": "unchanged"}),
+            # The design's minimal form: changed ids and whether they were applied.
+            ({"changed": ["launchd-tmux-resurrect-autosave"], "applied": True},
+             [("autosave", True), ("tmux", False)],
+             {"autosave": "changed", "tmux": "unchanged"}),
+        )
+        for launch_agents, calls, states in plans:
+            seen.clear()
+            with mock.patch.object(launchd_fakes.launchd, "register", side_effect=register):
+                result, _ = self.post(launch_agents=launch_agents)
+            self.assertEqual(seen, calls)
+            agents = result.details["launchd"]["agents"]
+            self.assertEqual({n: agents[n]["plist_state"] for n in agents}, states)
+
+    def test_plists_the_transaction_did_not_apply(self):
+        result, runner = self.post(launch_agents={"changed": [], "applied": False})
+        self.assertEqual(result.status, "FAIL")
+        self.assertEqual(len(result.reasons), 2)
+        self.assertTrue(all("was not installed by this run; run: dotfiles repair" in r
+                            for r in result.reasons))
+        self.assertEqual(runner.launchctl("bootstrap"), [])
+
+    def test_without_launch_agents_the_files_decide(self):
+        launchd_fakes.launchd.plist_path(self.target, launchd_fakes.launchd.TMUX).unlink()
+        runner = MacRunner(self.sim, events=self.events)
+        with mock.patch.object(phases, "converge_running_tmux",
+                               return_value=([], {"outcome": "no-running-server"})), \
+                launchd_fakes.fake_clock(), redirect_stdout(io.StringIO()):
+            result = phases.post_install_phase(
+                self.target, runner, repo_root=self.repo, run_id="20260101T000000Z-0123abcd",
+                systemd_units_applied=False, platform=TAHOE)
+        agents = result.details["launchd"]["agents"]
+        self.assertEqual((agents["autosave"]["plist_state"], agents["autosave"]["status"]),
+                         ("unchanged", "PASS"))
+        self.assertEqual((agents["tmux"]["plist_state"], agents["tmux"]["status"]),
+                         ("missing", "FAIL"))
+
+    def test_no_gui_domain_is_relogin_once(self):
+        self.sim.gui = False
+        result, runner = self.post()
+        self.assertEqual(result.status, "RELOGIN_REQUIRED")
+        self.assertEqual(result.reasons, [phases.LAUNCHD_GUI_DOMAIN_UNAVAILABLE])
+        self.assertEqual(runner.launchctl("bootstrap"), [])
+        self.assertIn("no desktop login session here", self.output)
+        text = "\n".join(phases.completion_lines([result]))
+        self.assertIn("The tmux LaunchAgents are installed and load at your next login", text)
+        for label in (LABEL_TMUX, LABEL_AUTOSAVE):
+            self.assertIn(f"launchctl bootstrap gui/$(id -u) "
+                          f"{self.home / 'Library/LaunchAgents' / (label + '.plist')}", text)
+        self.assertNotIn("User services (tmux) start", text)
+        summary = phases.format_summary([result])
+        self.assertIn("Log in to the Mac's desktop to start the tmux LaunchAgents", summary)
+        # With the login shell also waiting for a relogin: the general line.
+        shell = PhaseResult("login-shell", "RELOGIN_REQUIRED", ["x"])
+        self.assertIn("Log out and back in to finish",
+                      phases.format_summary([result, shell]))
+
+    def test_disabled_agent_is_a_reason_only(self):
+        self.sim.disabled[LABEL_AUTOSAVE] = True
+        result, runner = self.post()
+        self.assertEqual(result.status, "PASS")
+        self.assertEqual(result.reasons, ["autosave: disabled (enable: dotfiles services "
+                                          "enable autosave)"])
+        self.assertEqual(result.details["launchd"]["agents"]["autosave"]["status"], "SKIPPED")
+        self.assertIn("LaunchAgent disabled by you; left off", self.output)
+        self.assertEqual(len(runner.launchctl("bootstrap")), 1)  # tmux only
+
+    def test_failed_registration_fails_the_phase(self):
+        self.sim.force("bootstrap", LABEL_TMUX, 5)
+        result, _ = self.post()
+        self.assertEqual(result.status, "FAIL")
+        self.assertIn("'Allow in the Background'", result.reasons[0])
+        self.assertTrue(result.reasons[0].startswith("tmux: launchctl bootstrap failed (5:"))
+
+    def test_tmux_not_restored_is_a_follow_up(self):
+        self.sim.exit_codes[LABEL_TMUX] = 3
+        result, _ = self.post()
+        self.assertEqual(result.status, "PASS")
+        text = "\n".join(phases.completion_lines([result]))
+        self.assertIn("tmux started without restoring your last snapshot: press prefix + "
+                      "C-r", text)
+        self.assertIn(str(self.target.state_root / "launchd" / f"{LABEL_TMUX}.log"), text)
+
+    def test_continuum_launcher_is_set_aside_before_the_converge(self):
+        agents = self.home / "Library/LaunchAgents"
+        (agents / "Tmux.Start.plist").write_text("<plist/>")
+        self.sim.load("Tmux.Start.plist")
+        result, _ = self.post()
+        moved = self.target.state_root / "backups/launchd/20260101T000000Z-0123abcd" \
+            / "Tmux.Start.plist"
+        self.assertTrue(moved.is_file())
+        self.assertEqual(result.details["launchd"]["continuum_launcher"]["moved_to"],
+                         str(moved))
+        self.assertLess(self.events.index("launchctl bootout"),
+                        self.events.index("converge"))
+        self.assertIn("tmux-continuum's own launcher; moved to", self.output)
+        self.assertNotIn("Tmux.Start.plist", self.sim.loaded)
+
+    def test_linux_never_touches_launchd(self):
+        runner = MacRunner(self.sim, events=self.events)
+        with redirect_stdout(io.StringIO()):
+            result = phases.post_install_phase(
+                self.target, runner, repo_root=self.repo, run_id="20260101T000000Z-0123abcd",
+                systemd_units_applied=False, platform=NOBLE,
+                launch_agents={"changed": ["launchd-tmux"], "applied": True})
+        self.assertEqual(runner.launchctl(), [])
+        self.assertNotIn("launchd", result.details)
+        self.assertEqual(result.details["systemd"], "units-skipped")
+
+
+class MacosLoginShellTests(TempHome):
+    def phase(self, terminal=True, chsh_rc=0, **kw):
+        calls = []
+
+        def interactive(argv):
+            calls.append(argv)
+            return chsh_rc
+
+        kw.setdefault("current_shell", "/bin/bash")
+        runner = ScriptedRunner(which={"zsh": "/opt/homebrew/bin/zsh"})
+        with mock.patch.object(phases, "_preferred_zsh", return_value="/bin/zsh"), \
+                redirect_stdout(io.StringIO()) as out:
+            result = phases.login_shell_phase(
+                self.target, runner, allow_change=True, platform=TAHOE,
+                interactive=interactive if terminal else None, **kw)
+        return result, calls, runner, out.getvalue()
+
+    def test_already_zsh(self):
+        result, calls, runner, out = self.phase(current_shell="/bin/zsh")
+        self.assertEqual(result.status, "PASS")
+        self.assertEqual((calls, runner.calls), ([], []))
+
+    def test_chsh_without_passwd_or_sudo(self):
+        result, calls, runner, out = self.phase()
+        self.assertEqual(result.status, "RELOGIN_REQUIRED")
+        self.assertEqual(calls, [["chsh", "-s", "/bin/zsh"]])
+        self.assertEqual(runner.calls, [])  # no passwd -S, no sudo
+        self.assertIn("Please type your password", out)
+        self.assertEqual(result.reasons, ["open a new terminal window (or log out and back "
+                                          "in) for zsh to become the login shell"])
+        text = "\n".join(phases.completion_lines([result]))
+        self.assertIn("Open a new terminal window (or log out and back in) so zsh", text)
+        self.assertNotIn("Log out and back in so zsh", text)
+
+    def test_chsh_failure(self):
+        result, calls, _, _ = self.phase(chsh_rc=1)
+        self.assertEqual(result.status, "FAIL")
+        self.assertEqual(result.reasons, ["chsh failed (1); run: chsh -s /bin/zsh"])
+        self.assertNotIn("sudo", result.reasons[0])
+
+    def test_without_a_terminal_the_command_is_printed(self):
+        result, calls, runner, out = self.phase(terminal=False)
+        self.assertEqual(result.status, "SKIPPED")
+        self.assertEqual((calls, runner.calls), ([], []))
+        self.assertEqual(result.details["command"], "chsh -s /bin/zsh")
+        self.assertIn("chsh -s /bin/zsh", out)
+        text = "\n".join(phases.completion_lines([result]))
+        self.assertIn("zsh is not your login shell yet", text)
+
+    def test_failed_smoke_still_leaves_it(self):
+        result, calls, _, _ = self.phase(checks_passed=False)
+        self.assertEqual(result.status, "SKIPPED")
+        self.assertEqual(calls, [])
+        self.assertIn("smoke-failed", result.reasons[0])
+
+
+class MacosPipelineTests(TempHome):
+    """What run_pipeline hands the phases on macOS, and not on Linux."""
+
+    def chsh(self, argv):
+        self.fail(f"chsh ran: {argv}")
+
+    def pipeline(self, platform, prompt=None):
+        ctx = self.ctx(platform=platform)
+        ctx.current_shell = "/bin/zsh"
+        ctx.prompt = prompt
+        ctx.interactive = self.chsh
+        ctx.env = {"PATH": "/usr/bin:/bin", "HOME": str(self.home)}
+        passed = lambda name: PhaseResult(name, "PASS")  # noqa: E731
+        tx = PhaseResult("transaction", "PASS", [], {"result": {
+            "changed": ["launchd-tmux", "zshrc"], "kept": [],
+            "unchanged": ["launchd-tmux-resurrect-autosave"]}})
+        mocks = {name: mock.Mock(return_value=passed(name.replace("_phase", "")
+                                                     .replace("_", "-")))
+                 for name in ("post_install_phase", "smoke_phase", "login_shell_phase",
+                              "git_identity_phase", "auth_phase")}
+        ui.configure(enabled=False)
+        with mock.patch.object(install, "preflight_phase", return_value=passed("preflight")), \
+                mock.patch.object(install, "packages_phase",
+                                  return_value=PhaseResult("packages", "SKIPPED")), \
+                mock.patch.object(install, "extra_desired_entries", return_value=([], [])), \
+                mock.patch.object(install, "transaction_phase", return_value=(tx, False)), \
+                mock.patch.multiple(phases, **mocks), \
+                mock.patch.object(install, "gui_phase",
+                                  return_value=PhaseResult("gui", "SKIPPED")), \
+                redirect_stdout(io.StringIO()):
+            rc = install.run_pipeline(ctx, "install", install.Options(no_packages=True))
+        self.assertEqual(rc, 0)
+        return ctx, mocks
+
+    def test_macos_hands_over_launchd_homebrew_and_the_terminal(self):
+        ctx, mocks = self.pipeline(TAHOE)
+        post = mocks["post_install_phase"].call_args.kwargs
+        self.assertEqual(post["launch_agents"], {
+            "changed": ["launchd-tmux"], "kept": [],
+            "unchanged": ["launchd-tmux-resurrect-autosave"], "applied": True})
+        self.assertIs(post["platform"], TAHOE)
+        local = str(self.home / ".local/bin")
+        self.assertEqual(post["env"]["PATH"],
+                         f"{local}:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/bin:/bin")
+        self.assertEqual(post["tmux_env"], ctx.env)
+        self.assertEqual(mocks["smoke_phase"].call_args.kwargs,
+                         {"extra_path": [Path("/opt/homebrew/bin"), Path("/opt/homebrew/sbin")]})
+        shell = mocks["login_shell_phase"].call_args.kwargs
+        self.assertIs(shell["platform"], TAHOE)
+        self.assertIsNone(shell["interactive"])  # no terminal: print the command
+        _, mocks = self.pipeline(TAHOE, prompt=lambda q: "")
+        self.assertEqual(mocks["login_shell_phase"].call_args.kwargs["interactive"],
+                         self.chsh)
+
+    def test_linux_calls_are_as_before(self):
+        ctx, mocks = self.pipeline(NOBLE)
+        post = mocks["post_install_phase"].call_args.kwargs
+        self.assertNotIn("launch_agents", post)
+        self.assertNotIn("platform", post)
+        self.assertEqual(post["env"], phases.child_env(self.target, ctx.env))
+        self.assertEqual(mocks["smoke_phase"].call_args, mock.call(self.target, ctx.runner,
+                                                                   ctx.env))
+        shell = mocks["login_shell_phase"].call_args.kwargs
+        self.assertNotIn("platform", shell)
+        self.assertEqual(shell["interactive"], self.chsh)  # with or without a terminal
+
+    def test_launch_agent_changes(self):
+        tx = PhaseResult("transaction", "PASS", [], {"result": {
+            "changed": ["zshrc"], "kept": ["launchd-tmux"],
+            "unchanged": ["launchd-tmux-resurrect-autosave", "vimrc"]}})
+        self.assertEqual(install.launch_agent_changes(tx), {
+            "changed": [], "kept": ["launchd-tmux"],
+            "unchanged": ["launchd-tmux-resurrect-autosave"], "applied": True})
+        self.assertFalse(install.launch_agent_changes(
+            PhaseResult("transaction", "PASS", [], {"result": {"changed": ["launchd-tmux"]}}))
+            ["applied"])
+        self.assertFalse(install.launch_agent_changes(PhaseResult("transaction", "FAIL"))
+                         ["applied"])
+
+
+class ChildEnvTests(TempHome):
+    def test_linux_is_unchanged(self):
+        env = phases.child_env(self.target, {"PATH": "/usr/bin:/bin", "TMUX": "x"})
+        self.assertEqual(env["PATH"], f"{self.home / '.local/bin'}:/usr/bin:/bin")
+        self.assertNotIn("TMUX", env)
+        self.assertEqual(phases.child_env(self.target, {"PATH": "/usr/bin"}),
+                         phases.child_env(self.target, {"PATH": "/usr/bin"}, extra_path=None))
+        self.assertEqual(phases.child_env(self.target, {})["PATH"],
+                         f"{self.home / '.local/bin'}:/usr/local/bin:/usr/bin:/bin")
+
+    def test_homebrew_right_after_local_bin(self):
+        local = str(self.home / ".local/bin")
+        brew = ["/opt/homebrew/bin", "/opt/homebrew/sbin"]
+        self.assertEqual(phases.child_env(self.target, {"PATH": "/usr/bin:/bin"},
+                                          extra_path=brew)["PATH"],
+                         f"{local}:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/bin:/bin")
+        self.assertEqual(phases.child_env(self.target, {"PATH": f"/x:{local}:/usr/bin"},
+                                          extra_path=brew)["PATH"],
+                         f"/x:{local}:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/bin")
+        # Already on PATH: left where it is, not added twice.
+        self.assertEqual(phases.child_env(
+            self.target, {"PATH": "/opt/homebrew/bin:/usr/bin"},
+            extra_path=[Path("/opt/homebrew/bin"), Path("/opt/homebrew/sbin")])["PATH"],
+            f"{local}:/opt/homebrew/sbin:/opt/homebrew/bin:/usr/bin")
+
+
+class MacosTmuxHelperTests(TempHome):
+    def test_pane_ttys(self):
+        for tty in ("/dev/pts/0", "/dev/pts/12", "/dev/ttys003", "/dev/ttys0"):
+            self.assertTrue(phases._PTS_RE.match(tty), tty)
+        for tty in ("/dev/tty", "/dev/ttys", "/dev/ttyS0", "/dev/pts/x", "/dev/ttys003x",
+                    "/dev/console", "/tmp/dev/pts/1"):
+            self.assertFalse(phases._PTS_RE.match(tty), tty)
+
+    def test_system_tmux_conf(self):
+        self.assertEqual(phases.system_tmux_conf({"HOMEBREW_PREFIX": "/x"}),
+                         Path("/etc/tmux.conf"))
+        with mock.patch.object(phases, "_darwin_host", return_value=True):
+            self.assertEqual(phases.system_tmux_conf({"HOMEBREW_PREFIX": "/custom/brew"}),
+                             Path("/custom/brew/etc/tmux.conf"))
+            with mock.patch.object(phases.os, "uname",
+                                   return_value=mock.Mock(machine="arm64")):
+                self.assertEqual(phases.system_tmux_conf({}),
+                                 Path("/opt/homebrew/etc/tmux.conf"))
+            with mock.patch.object(phases.os, "uname",
+                                   return_value=mock.Mock(machine="x86_64")):
+                self.assertEqual(phases.system_tmux_conf({}), Path("/usr/local/etc/tmux.conf"))
+
+    def test_homebrew_tmux_reads_its_own_system_file(self):
+        prefix = Path(self._tmp.name) / "brew"
+        (prefix / "etc").mkdir(parents=True)
+        (prefix / "etc/tmux.conf").write_text("set -g status on\n")
+        (self.home / ".tmux.conf").write_text("set -g status off\n")
+        with mock.patch.object(phases, "_darwin_host", return_value=True), \
+                mock.patch.dict(os.environ, {"HOMEBREW_PREFIX": str(prefix)}):
+            files = phases.default_config_files(self.target)
+        self.assertEqual(files, [prefix / "etc/tmux.conf", self.home / ".tmux.conf"])
+
+    def test_socket_dir_is_measured_as_tmux_resolves_it(self):
+        # A short link to a long directory: it fits measured as spelled
+        # (Linux, as before), not measured resolved (macOS, where tmux
+        # resolves TMUX_TMPDIR and /tmp is /private/tmp).
+        long_dir = Path(self._tmp.name) / ("d" * 70)
+        long_dir.mkdir()
+        link = Path(self._tmp.name) / "l"
+        link.symlink_to(long_dir)
+        name = "pdfs12345abcd"
+        spelled = len(phases._socket_path(os.path.join(str(link), "pdfs-xxxxxxxx"), name))
+        made = []
+        real_mkdtemp = tempfile.mkdtemp
+
+        def mkdtemp(prefix, dir):
+            path = real_mkdtemp(prefix=prefix, dir=dir)
+            made.append(path)
+            return path
+
+        def short_dir(darwin):
+            with mock.patch.object(phases, "_darwin_host", return_value=darwin):
+                return phases._short_socket_dir(name, {})
+
+        with mock.patch.object(phases.tempfile, "gettempdir", return_value=str(link)), \
+                mock.patch.object(phases.tempfile, "mkdtemp", side_effect=mkdtemp), \
+                mock.patch.object(phases, "SOCKET_PATH_MAX", spelled):
+            try:
+                linux, darwin = short_dir(False), short_dir(True)
+            finally:
+                for path in made:
+                    shutil.rmtree(path, ignore_errors=True)
+        self.assertTrue(linux.startswith(str(link) + "/pdfs-"), linux)
+        self.assertFalse(str(darwin or "").startswith(str(link)), darwin)
+        with mock.patch.object(phases, "_darwin_host", return_value=False):
+            self.assertEqual(phases._measured(str(link)), str(link))
+        with mock.patch.object(phases, "_darwin_host", return_value=True):
+            self.assertEqual(phases._measured(str(link)), str(long_dir))
+
+
+class MacosServicesTests(TempHome):
+    passwd = MainGateTests.passwd
+    run_main = MainGateTests.run_main
+
+    def setUp(self):
+        super().setUp()
+        ui.configure(enabled=False)
+        self.sim = launchd_fakes.LaunchdSim(self.target.uid)
+
+    def main(self, argv, system="darwin", runner=None, **kw):
+        runner = runner or launchd_fakes.SimRunner(self.sim)
+        elsewhere = Path(self._tmp.name) / "elsewhere"
+        elsewhere.mkdir(exist_ok=True)
+        with mock.patch.object(install.plat, "current_system", return_value=system), \
+                launchd_fakes.fake_clock():
+            rc, out, err = self.run_main(
+                argv, runner=runner, here=elsewhere,
+                detect=lambda: self.fail("services detected a platform"), **kw)
+        self.runner = runner
+        return rc, out, err
+
+    def test_parsing(self):
+        cases = ((["services"], "status", ["tmux", "autosave"]),
+                 (["services", "tmux"], "status", ["tmux"]),
+                 (["services", "disable"], "disable", ["tmux", "autosave"]),
+                 (["services", "enable", "autosave", "autosave", "tmux"], "enable",
+                  ["autosave", "tmux"]))
+        for argv, action, names in cases:
+            args = install.parse_args(argv)
+            self.assertEqual((args.command, args.action, args.names), ("services", action,
+                                                                        names), argv)
+        with redirect_stderr(io.StringIO()) as err:
+            for argv in (["services", "frobnicate"], ["services", "tmux", "disable"],
+                         ["services", "Tmux.Start"]):
+                with self.assertRaises(SystemExit, msg=argv):
+                    install.parse_args(argv)
+        self.assertIn("unknown name", err.getvalue())
+        help_text = install.build_parser().format_help()
+        listed = [line.split()[0] for line in help_text.splitlines()
+                  if line.startswith("    ") and line.split()]
+        self.assertIn("services", listed)
+        self.assertIn("install.py services [status|enable|disable] [tmux|autosave ...]",
+                      help_text)
+        self.assertEqual(install.SERVICE_NAMES,
+                         tuple(a.name for a in launchd_fakes.launchd.AGENTS))
+
+    def test_linux_prints_systemctl_and_changes_nothing(self):
+        runner = ScriptedRunner()
+        for argv, lines in (
+                (["services"], ["systemctl --user status tmux.service "
+                                "tmux-resurrect-autosave.timer"]),
+                (["services", "disable"], ["systemctl --user disable tmux.service",
+                                           "systemctl --user disable --now "
+                                           "tmux-resurrect-autosave.timer"]),
+                (["services", "enable", "autosave"], ["systemctl --user enable --now "
+                                                      "tmux-resurrect-autosave.timer"])):
+            rc, out, _ = self.main(argv, system="linux", runner=runner)
+            self.assertEqual(rc, 0)
+            self.assertIn("nothing was changed", out)
+            printed = [line.strip() for line in out.splitlines() if line.startswith("    ")]
+            self.assertEqual(printed, lines, argv)
+        self.assertEqual(runner.calls, [])
+        self.assertEqual(list(self.home.iterdir()), [])
+
+    def test_disable_then_enable(self):
+        launchd_fakes.install_plists(self.target)
+        for label in (LABEL_TMUX, LABEL_AUTOSAVE):
+            self.sim.load(label)
+        rc, out, _ = self.main(["services", "disable"])
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.sim.loaded, {})
+        self.assertEqual(self.sim.disabled, {LABEL_TMUX: True, LABEL_AUTOSAVE: True})
+        self.assertIn("disabled (unloaded); stays off until: dotfiles services enable tmux",
+                      out)
+        verbs = [c[1] for c in self.runner.launchctl()]
+        self.assertEqual(verbs, ["bootout", "disable", "bootout", "disable"])
+        # Disabled agents stay off at a repair.
+        rc, out, _ = self.main(["services", "status"])
+        self.assertIn("tmux       disabled", out)
+        rc, out, _ = self.main(["services", "enable", "tmux"])
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.sim.disabled[LABEL_TMUX], False)
+        self.assertIn(LABEL_TMUX, self.sim.loaded)
+        self.assertNotIn(LABEL_AUTOSAVE, self.sim.loaded)
+        self.assertIn("enabled and loaded", out)
+        self.assertEqual([c[1] for c in self.runner.launchctl()][:2], ["enable", "print"])
+
+    def test_enable_needs_the_plist_and_a_desktop_session(self):
+        rc, out, _ = self.main(["services", "enable", "autosave"])
+        self.assertEqual(rc, 1)
+        self.assertIn("not installed; run: dotfiles repair", out)
+        launchd_fakes.install_plists(self.target)
+        self.sim.gui = False
+        rc, out, _ = self.main(["services", "enable", "autosave"])
+        self.assertEqual(rc, 1)
+        self.assertIn("no desktop login session here", out)
+        self.assertEqual(self.runner.launchctl("bootstrap"), [])
+
+    def test_disable_failure(self):
+        self.sim.force("disable", LABEL_AUTOSAVE, 1)
+        rc, out, _ = self.main(["services", "disable", "autosave"])
+        self.assertEqual(rc, 1)
+        self.assertIn("could not disable", out)
+
+    def test_a_launchctl_that_cannot_run_is_reported(self):
+        from installer.runner import RunnerError
+        launchd_fakes.install_plists(self.target)
+
+        def handle(argv):
+            raise RunnerError(argv, 127, "", "cannot execute: No such file or directory")
+        self.sim.handle = handle
+        for argv, words in ((["services", "disable", "tmux"], "could not disable"),
+                            (["services", "enable", "tmux"], "launchctl enable:")):
+            rc, out, _ = self.main(argv)
+            self.assertEqual(rc, 1, argv)
+            self.assertIn(words, out)
+            self.assertIn("cannot execute", out)
+
+    def test_status_is_read_only(self):
+        launchd_fakes.install_plists(self.target)
+        self.sim.load(LABEL_AUTOSAVE, run_interval=60)
+        rc, out, _ = self.main(["services", "status", "autosave"])
+        self.assertEqual(rc, 0)
+        self.assertTrue(all(self.runner.read_only))
+        self.assertIn("autosave   loaded, not running, every 60 s, last exit 0", out)
+        self.assertNotIn("tmux ", out)
+
+    def test_status_json_has_services_on_macos_only(self):
+        launchd_fakes.install_plists(self.target)
+        self.sim.load(LABEL_TMUX)
+        rc, out, _ = self.main(["status", "--json"])
+        self.assertEqual(rc, 0)
+        services = json.loads(out)["services"]
+        self.assertEqual(services["manager"], "launchd")
+        self.assertTrue(services["agents"]["tmux"]["loaded"])
+        self.assertFalse(services["agents"]["autosave"]["loaded"])
+        self.assertTrue(all(self.runner.read_only))
+        rc, out, _ = self.main(["status"])
+        self.assertIn(f"services:  launchd gui/{self.target.uid}", out)
+        rc, out, _ = self.main(["status", "--json"], system="linux", runner=ScriptedRunner())
+        self.assertNotIn("services", json.loads(out))
+        rc, out, _ = self.main(["status"], system="linux", runner=ScriptedRunner())
+        self.assertNotIn("services:", out)
+
+    def restore(self, restored, runner=None):
+        from argparse import Namespace
+        ctx = self.ctx(runner or launchd_fakes.SimRunner(self.sim), platform=None)
+        args = Namespace(baseline=True, run=None, force=False, ids=None)
+        result = {"restored": restored, "forced": [], "unchanged": [], "backup_dir": None}
+        with mock.patch.object(install.plat, "current_system", return_value="darwin"), \
+                mock.patch("installer.transaction.restore", return_value=result), \
+                redirect_stdout(io.StringIO()) as out, redirect_stderr(io.StringIO()) as err:
+            rc = install.cmd_restore(ctx, args)
+        text = out.getvalue()
+        return rc, json.loads(text[text.index("{\n"):]), text, err.getvalue(), ctx.runner
+
+    def test_restore_unloads_the_agents_it_removed(self):
+        for label in (LABEL_TMUX, LABEL_AUTOSAVE):
+            self.sim.load(label)
+        rc, data, text, _, runner = self.restore(["launchd-tmux",
+                                                  "launchd-tmux-resurrect-autosave", "zshrc"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(data["launchd"], {"tmux": "unloaded", "autosave": "unloaded"})
+        self.assertEqual(self.sim.loaded, {})
+        self.assertIn("unloaded (LaunchAgent removed)", text)
+
+    def test_restore_leaves_agents_alone_otherwise(self):
+        launchd_fakes.install_plists(self.target)  # put back by the restore
+        self.sim.load(LABEL_TMUX)
+        rc, data, _, _, runner = self.restore(["launchd-tmux", "zshrc"])
+        self.assertEqual(rc, 0)
+        self.assertNotIn("launchd", data)
+        self.assertEqual(runner.calls, [])
+        rc, data, _, _, runner = self.restore(["zshrc"])  # not part of the restore
+        self.assertEqual(runner.calls, [])
+
+    def test_restore_unload_failure_is_an_error(self):
+        self.sim.force("bootout", LABEL_TMUX, 1)
+        rc, data, _, err, _ = self.restore(["launchd-tmux"])
+        self.assertEqual(rc, 1)
+        self.assertEqual(data["launchd"], {"tmux": "failed"})
+        self.assertIn("launchctl bootout gui/", err)
+
+
+class MacosHintAndPackagesTests(TempHome):
+    def test_ai_cli_hint_names_the_wrapper_on_macos(self):
+        for platform, hint, other in ((TAHOE, "`~/.dotfiles/install --codex`", "python3"),
+                                      (NOBLE, "`python3 ~/.dotfiles/install.py --codex`",
+                                       "`~/.dotfiles/install --codex`")):
+            ctx = self.ctx(platform=platform)
+            ui.configure(enabled=False)
+            with redirect_stdout(io.StringIO()) as out:
+                exclude = install.ai_cli_exclusions(ctx, install.Options(codex=False,
+                                                                         claude_code=True))
+            self.assertEqual(exclude, ["codex", "oh-my-codex"])
+            self.assertIn(hint, out.getvalue())
+            self.assertNotIn(other, out.getvalue())
+
+    def test_package_names_come_from_the_platform_profile(self):
+        repo = Path(self._tmp.name) / "repo"
+        (repo / "manifests").mkdir(parents=True)
+        (repo / "manifests/packages.json").write_text(json.dumps(
+            {"groups": [{"id": "apt-group"}]}))
+        (repo / "manifests/packages-macos.json").write_text(json.dumps(
+            {"groups": [{"id": "brew-group"}]}))
+        (repo / "manifests/tools.json").write_text(json.dumps({"tools": {"fzf": {}}}))
+        self.assertEqual(install._package_names(repo, NOBLE), {"apt-group", "fzf"})
+        self.assertEqual(install._package_names(repo), {"apt-group", "fzf"})
+        self.assertEqual(install._package_names(repo, TAHOE), {"brew-group", "fzf"})
+        # 'dotfiles install <group>' is checked against this platform's groups.
+        ran = []
+
+        def run(target, platform, runner, *, dry_run=False, only=None):
+            ran.append(list(only))
+            return {"phase": "packages", "status": "PASS", "reasons": [], "details": {}}
+
+        real = install.load_seam
+        for platform, allowed, refused in ((TAHOE, "brew-group", "apt-group"),
+                                           (NOBLE, "apt-group", "brew-group")):
+            ctx = self.ctx(platform=platform)
+            ctx.repo_root = repo
+            with mock.patch.object(install, "load_seam", side_effect=lambda module, name:
+                                   run if name == "run_packages_phase"
+                                   else real(module, name)), \
+                    redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as err:
+                self.assertEqual(install.cmd_packages(ctx, [refused], True), 2)
+                self.assertIn(f"not in the package manifests: {refused}", err.getvalue())
+                self.assertEqual(install.cmd_packages(ctx, [allowed], True), 0)
+        self.assertEqual(ran, [["brew-group"], ["apt-group"]])
+
+    def test_packages_get_the_run_environment_when_they_take_it(self):
+        seen = []
+
+        def with_env(target, platform, runner, *, dry_run=False, only=None, env=None):
+            seen.append(env)
+            return {"phase": "packages", "status": "SKIPPED", "reasons": [], "details": {}}
+
+        def without_env(target, platform, runner, *, dry_run=False, only=None):
+            seen.append("no env")
+            return {"phase": "packages", "status": "SKIPPED", "reasons": [], "details": {}}
+
+        ctx = self.ctx(platform=TAHOE)
+        ctx.env = {"HOMEBREW_PREFIX": "/custom"}
+        names = {"fzf"}
+        for run in (with_env, without_env):
+            with mock.patch.object(install, "load_seam", return_value=run), \
+                    mock.patch.object(install, "_package_names", return_value=names), \
+                    redirect_stdout(io.StringIO()):
+                install.packages_phase(ctx, disabled=False, dry_run=True)
+                install.cmd_packages(ctx, ["fzf"], True)
+        self.assertEqual(seen, [ctx.env, ctx.env, "no env", "no env"])
+
+
+class MacosToolLinkTests(TempHome):
+    """'dotfiles install <tool>' on macOS: the plists are neither retired nor
+    added to a home that was never installed."""
+
+    def setUp(self):
+        super().setUp()
+        ui.configure(enabled=False)
+        self.repo = Path(self._tmp.name) / "repo"
+        (self.repo / "manifests").mkdir(parents=True)
+        (self.repo / "manifests/tools.json").write_text(json.dumps({"tools": {"fzf": {}}}))
+        (self.repo / "bashrc").write_text("# bashrc\n")
+        (self.repo / "manifests/managed-paths.json").write_text(json.dumps(
+            {"schema": 1, "entries": [{"id": "bashrc", "dest": "{home}/.bashrc",
+                                       "kind": "symlink", "source": "bashrc"}]}))
+        self.agents = self.home / "Library/LaunchAgents"
+        self.fzf = self.home / ".local/bin/fzf"
+
+    def ctx(self, runner=None, platform=TAHOE):
+        from installer.transaction import new_run_id
+        ctx = super().ctx(runner or launchd_fakes.SimRunner(
+            launchd_fakes.LaunchdSim(self.target.uid)), platform=platform)
+        ctx.repo_root = self.repo
+        ctx.run_id = new_run_id()
+        return ctx
+
+    def install_fzf(self):
+        from installer import packages
+        bin_dir = self.target.data_home / "personal-dotfiles/bin"
+        links = [{"id": "tool-link-fzf", "dest": str(self.fzf), "kind": "symlink",
+                  "link_text": str(bin_dir / "fzf")}]
+
+        def run(target, platform, runner, *, dry_run=False, only=None):
+            return {"phase": "packages", "status": "PASS", "reasons": [],
+                    "details": {"links": links}}
+
+        def load(module, name):
+            return {("packages", "run_packages_phase"): run,
+                    ("packages", "link_requests"): packages.link_requests}.get((module, name))
+
+        with mock.patch.object(install, "load_seam", side_effect=load), \
+                mock.patch.object(phases, "systemd_user_supported",
+                                  side_effect=AssertionError("systemd on macOS")), \
+                redirect_stdout(io.StringIO()) as out:
+            rc = install.cmd_packages(self.ctx(), ["fzf"], False)
+        self.assertEqual(rc, 0, out.getvalue())
+
+    def test_installed_home_keeps_its_plists(self):
+        with mock.patch.object(phases, "systemd_user_supported",
+                               side_effect=AssertionError("systemd on macOS")), \
+                redirect_stdout(io.StringIO()) as out:
+            ctx = self.ctx()
+            installed, _ = install.transaction_phase(
+                ctx, extra_entries=install.launch_agent_entries(ctx))
+        self.assertEqual(installed.status, "PASS", installed.reasons)
+        # Rendered for this home, not copied from a file in the checkout.
+        self.assertIn(ui.target_line(self.agents / f"{LABEL_TMUX}.plist",
+                                     "LaunchAgent written for this home"),
+                      out.getvalue().splitlines())
+        self.assertNotIn("copied from", out.getvalue())
+        before = {p.name: p.read_bytes() for p in self.agents.iterdir()}
+        self.assertEqual(len(before), 2)
+        self.install_fzf()
+        self.assertTrue(self.fzf.is_symlink())
+        self.assertEqual({p.name: p.read_bytes() for p in self.agents.iterdir()}, before)
+        from installer import transaction
+        self.assertEqual(set(transaction.load_status(self.target)["entries"]),
+                         {"bashrc", "tool-link-fzf", "launchd-tmux",
+                          "launchd-tmux-resurrect-autosave"})
+        tx = {p["phase"]: p for p in phases.read_status(self.target)["phases"]}
+        self.assertEqual(tx["transaction"]["details"]["result"]["retired"], [])
+        for plist in self.agents.iterdir():
+            self.assertEqual(plist.stat().st_mode & 0o777, 0o644)
+
+    def test_never_installed_home_gets_the_link_only(self):
+        self.install_fzf()
+        self.assertTrue(self.fzf.is_symlink())
+        self.assertFalse(self.agents.exists())
+        self.assertFalse((self.home / ".bashrc").exists())
+
+    def test_dry_run_plan_marks_installed_plists_unchanged(self):
+        ctx = self.ctx()
+        for entry in install.launch_agent_entries(ctx):
+            self.assertEqual(install._planned_file_action(entry), "create")
+            entry.dest.parent.mkdir(parents=True, exist_ok=True)
+            entry.dest.write_bytes(entry.content)
+            os.chmod(entry.dest, 0o600)
+            self.assertEqual(install._planned_file_action(entry), "replace")  # mode differs
+            os.chmod(entry.dest, 0o644)
+            self.assertEqual(install._planned_file_action(entry), "unchanged")
+            entry.dest.write_bytes(b"other")
+            self.assertEqual(install._planned_file_action(entry), "replace")
+
+    def test_dry_run_plans_the_plists_read_only(self):
+        from installer.runner import DryRunRunner
+
+        class Recording(DryRunRunner):
+            def run(inner, argv, **kw):
+                if argv[0] == "/usr/bin/locale":
+                    return subprocess.CompletedProcess(argv, 0, b"en_US.UTF-8\n", b"")
+                return super().run(argv, **kw)
+
+        runner = Recording()
+        ctx = self.ctx(runner)
+        ctx.env = {"LANG": "en_US.UTF-8"}
+        with mock.patch.object(phases, "systemd_user_supported",
+                               side_effect=AssertionError("systemd on macOS")), \
+                mock.patch.object(install, "preflight_phase",
+                                  return_value=PhaseResult("preflight", "PASS")), \
+                redirect_stdout(io.StringIO()) as out:
+            rc = install.dry_run_install(ctx, install.Options(dry_run=True, no_packages=True))
+        self.assertEqual(rc, 0, out.getvalue())
+        self.assertIn(f"  create {self.agents / (LABEL_TMUX + '.plist')}", out.getvalue())
+        self.assertEqual(runner.recorded, [])
+        self.assertFalse(self.agents.exists())
 
 
 if __name__ == "__main__":
