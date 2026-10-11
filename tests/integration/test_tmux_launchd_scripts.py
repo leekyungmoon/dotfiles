@@ -3,7 +3,8 @@
 - tmux/tmux-launchd-start and tmux/resurrect-autosave, the programs of the two
   LaunchAgents (com.github.leekyungmoon.dotfiles.tmux and ...tmux-resurrect-
   autosave), first against a recording fake tmux, then against real private
-  tmux servers;
+  tmux servers, including tmux-launchd-start's own restore when continuum
+  skipped it;
 - tmux/resurrect-save's lock fallbacks (flock(1), else lockf's descriptor
   mode, else python3) and its interruption trap;
 - tmux-continuum's macOS boot branch with resurrect.conf (fake `uname`), its
@@ -65,15 +66,36 @@ UTF8 = "en_US.UTF-8" if sys.platform == "darwin" else "C.UTF-8"
 # sizeof(sun_path) - 1
 SOCKET_MAX = 103 if sys.platform == "darwin" else 107
 
-# Records every call; answers from a JSON state file (one call at a time).
+# Records every call; answers from a JSON state file, one call at a time (a
+# lock: the restore tmux-launchd-start runs itself calls it while the script
+# polls).  "layout" holds the sessions: name, attached clients, panes per
+# window.  Setting @tmux-restore-complete (the restore hooks) replaces what
+# the polls of it answer.
 FAKE_TMUX = """#!{python} -I
-import json, os, sys
+import fcntl, json, os, sys
 path = {state!r}
+lock = open(path + ".lock", "a")
+fcntl.flock(lock, fcntl.LOCK_EX)
 with open(path) as f:
     state = json.load(f)
 argv = sys.argv[1:]
 state["calls"].append({{"argv0": sys.argv[0], "argv": argv, "cwd": os.getcwd(),
                         "env": dict(os.environ)}})
+
+
+def render(fmt, values):
+    for name, value in values.items():
+        fmt = fmt.replace("#{{" + name + "}}", str(value))
+    return fmt
+
+
+def sessions():
+    for session in state["layout"]:
+        yield session, {{"session_name": session["name"],
+                        "session_windows": len(session["windows"]),
+                        "session_attached": session["attached"]}}
+
+
 status, out = 0, None
 if argv[:1] == ["has-session"]:
     status = 0 if state["server"] else 1
@@ -91,14 +113,68 @@ elif argv[:2] == ["show-option", "-gqv"]:
         out = sequence.pop(0) if len(sequence) > 1 else sequence[0]
     else:
         out = state["options"].get(name, "")
-elif argv[:2] == ["set-option", "-gq"]:
+elif argv[:1] == ["set-option"] and argv[1] in ("-g", "-gq"):
+    if argv[2] == "@tmux-restore-complete":
+        state["restore_sequence"] = [argv[3]]
     state["options"][argv[2]] = argv[3]
+elif argv[:3] == ["list-panes", "-a", "-F"]:
+    out = "\\n".join(render(argv[3], dict(values, window_panes=panes))
+                     for session, values in sessions()
+                     for panes in session["windows"] for _ in range(panes))
+elif argv[:2] == ["list-sessions", "-F"]:
+    out = "\\n".join(render(argv[2], dict(values, window_panes=session["windows"][0]))
+                     for session, values in sessions())
+elif argv[:2] == ["display-message", "-p"]:
+    out = render(argv[2], {{"socket_path": state["socket_path"], "pid": state["pid"]}})
 with open(path + ".new", "w") as f:
     json.dump(state, f)
 os.replace(path + ".new", path)
 if out and status == 0:
     print(out)
 sys.exit(status)
+"""
+
+# The fake server's address, as `display-message -p '#{socket_path},#{pid}'`
+# answers it.
+FAKE_SOCKET = "/private/tmp/tmux-501/default"
+FAKE_SERVER_PID = 4242
+# The server holds only the untouched login session.
+UNTOUCHED = ({"name": BOOTSTRAP, "attached": 0, "windows": [1]},)
+CONTINUUM_SKIPPED = "tmux-continuum skipped the restore"
+BY_SCRIPT = " (continuum skipped; restored by tmux-launchd-start)"
+IN_USE_TEXT = ("The login session is already in use (a client is attached, or there "
+               "are other sessions, windows or panes), so it was not restored "
+               "automatically.")
+
+# tmux-resurrect's restore.sh as tmux-launchd-start runs it when continuum
+# skipped the restore: records how it was started (argv, cwd, environment,
+# whether stdin, stdout and stderr are /dev/null), then marks the server as
+# the restore hooks would, through the tmux found on PATH.  Modes: ok, slow
+# (2 s between the hooks), never-finishes (only "restoring"), fail (exits at
+# once without restoring, like restore.sh when its own checks fail).
+FAKE_RESTORE = """#!{python} -I
+import json, os, subprocess, sys, time
+null = os.stat(os.devnull)
+with open({calls!r}, "a") as f:
+    f.write(json.dumps({{
+        "argv": sys.argv[1:], "cwd": os.getcwd(), "env": dict(os.environ),
+        "devnull": [os.path.samestat(os.fstat(fd), null) for fd in (0, 1, 2)],
+    }}) + "\\n")
+mode = {mode!r}
+if mode == "fail":
+    sys.exit(1)
+
+
+def mark(value):
+    subprocess.run(["tmux", "set-option", "-g", "@tmux-restore-complete", value],
+                   check=True)
+
+
+mark("restoring")
+if mode == "slow":
+    time.sleep(2)
+if mode != "never-finishes":
+    mark("on")
 """
 
 # A tool that is not really there: what the shell reports for a missing one.
@@ -406,17 +482,31 @@ class LaunchdStartWithFakeTmux(ScriptRun):
         self.snapshots = self.root / "data/tmux/resurrect"
         self.snapshots.mkdir(parents=True)
         self.log = self.root / "launchd.log"
+        self.restore_script = self.root / "plugins/tmux-resurrect/scripts/restore.sh"
+        self.restore_script.parent.mkdir(parents=True)
+        self.restore_log = self.root / "restore-calls.jsonl"
 
     def set_state(self, server=False, snapshot=True, new_session_status=0,
-                  sequence=("", "restoring", "on"), die_on_poll=False, options=None):
+                  sequence=("", "restoring", "on"), die_on_poll=False, options=None,
+                  layout=UNTOUCHED, restore="ok"):
         """The fake server's state; `options` overrides (None: unset) what
-        the config would have set."""
+        the config would have set; `layout` is its sessions (see FAKE_TMUX);
+        `restore` is the mode of the fake restore.sh at the configured path
+        (None: no such file, "not-executable": mode 0644)."""
         if snapshot:
             (self.snapshots / "tmux_resurrect_x.txt").write_text("pane\n")
+            (self.snapshots / "last").unlink(missing_ok=True)
             (self.snapshots / "last").symlink_to("tmux_resurrect_x.txt")
+        self.restore_log.unlink(missing_ok=True)
+        self.restore_script.unlink(missing_ok=True)
+        if restore is not None:
+            write_executable(self.restore_script, FAKE_RESTORE.format(
+                python=sys.executable, calls=str(self.restore_log), mode=restore))
+            if restore == "not-executable":
+                self.restore_script.chmod(0o644)
         values = {
             "@resurrect-dir": str(self.snapshots),
-            "@resurrect-restore-script-path": "/plugins/tmux-resurrect/scripts/restore.sh",
+            "@resurrect-restore-script-path": str(self.restore_script),
             "@continuum-restore": "on",
         }
         values.update(options or {})
@@ -425,6 +515,7 @@ class LaunchdStartWithFakeTmux(ScriptRun):
             "restore_sequence": list(sequence), "die_on_poll": die_on_poll,
             "options": {name: value for name, value in values.items()
                         if value is not None},
+            "layout": list(layout), "socket_path": FAKE_SOCKET, "pid": FAKE_SERVER_PID,
             "calls": [],
         }))
 
@@ -433,6 +524,12 @@ class LaunchdStartWithFakeTmux(ScriptRun):
 
     def calls(self):
         return [call["argv"] for call in self.state()["calls"]]
+
+    def restore_calls(self):
+        """How the fake restore.sh was started, once per run of it."""
+        if not self.restore_log.exists():
+            return []
+        return [json.loads(line) for line in self.restore_log.read_text().splitlines()]
 
     def env(self, **extra):
         values = {
@@ -533,7 +630,8 @@ class LaunchdStartWithFakeTmux(ScriptRun):
         cases = (
             # name, state, exit status, @tmux-restore-status, log text
             ("restored", {}, 0, "restored ", "restored the last snapshot"),
-            ("no continuum restore", {"sequence": ("",)}, 3,
+            ("neither continuum nor this script restored",
+             {"sequence": ("",), "restore": "fail"}, 3,
              "not restored: continuum did not start it within 1s",
              "did not restore the snapshot within 1 s"),
             ("restore never finishes", {"sequence": ("restoring",)}, 3,
@@ -572,6 +670,7 @@ class LaunchdStartWithFakeTmux(ScriptRun):
             self.assertIn(step, result.stderr)
         # Decided at once: no wait for a restore that cannot come.
         self.assertNotIn(["show-option", "-gqv", RESTORE_STATE], self.calls())
+        self.assertEqual(self.restore_calls(), [])
 
     def test_server_gone_while_waiting(self):
         # The wait ends as soon as the server stops answering.
@@ -581,6 +680,147 @@ class LaunchdStartWithFakeTmux(ScriptRun):
         self.assertIn("the tmux server exited before the snapshot was restored",
                       result.stderr)
         self.assertLess(result.elapsed, 20)
+        self.assertEqual(self.restore_calls(), [])
+
+    def test_skipped_restore_is_restored_by_this_script(self):
+        # continuum never starts the restore; this script runs restore.sh,
+        # which takes 2 s between its hooks.
+        for shell_name, shell in posix_shells():
+            with self.subTest(shell_name):
+                self.set_state(sequence=("",), restore="slow")
+                result = self.start(shell, TMUX_LAUNCHD_FINISH_WAIT="60")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertRegex(self.state()["options"][RESTORE_STATUS],
+                                 r"^restored \d{4}-\d\d-\d\d \d\d:\d\d:\d\d"
+                                 + re.escape(BY_SCRIPT) + "$")
+                self.assertIn(CONTINUUM_SKIPPED, result.stderr)
+                self.assertIn("started tmux and restored the last snapshot" + BY_SCRIPT,
+                              result.stderr)
+                self.assertNotIn("To restore it now", result.stderr)
+                # Once, as continuum's job runs it: in HOME, output discarded,
+                # TMUX naming this server as tmux does for a job started while
+                # the config loads, nothing of launchd or this script's own.
+                (call,) = self.restore_calls()
+                self.assertEqual(call["argv"], [])
+                self.assertEqual(call["cwd"], str(self.home))
+                self.assertEqual(call["devnull"], [True, True, True])
+                self.assertEqual(call["env"]["TMUX"], f"{FAKE_SOCKET},{FAKE_SERVER_PID},-1")
+                self.assertEqual(call["env"]["PATH"], self.env()["PATH"])
+                self.assertEqual(call["env"]["LANG"], UTF8)
+                for variable in ("TMUX_PANE", "XPC_SERVICE_NAME", "XPC_FLAGS",
+                                 "TMUX_LAUNCHD_TMUX", "TMUX_LAUNCHD_START_WAIT",
+                                 "TMUX_LAUNCHD_FINISH_WAIT",
+                                 "PERSONAL_DOTFILES_LAUNCHD_LOG"):
+                    self.assertNotIn(variable, call["env"])
+                # Its hooks reached the server through the tmux on PATH.
+                hooks = [call for call in self.state()["calls"]
+                         if call["argv"][:3] == ["set-option", "-g", RESTORE_STATE]]
+                self.assertEqual([hook["argv"][3] for hook in hooks], ["restoring", "on"])
+                for hook in hooks:
+                    self.assertEqual(hook["argv0"], str(self.fake))
+                    self.assertEqual(hook["env"]["TMUX"], call["env"]["TMUX"])
+                # Started only after the login session was found untouched.
+                calls = self.calls()
+                (checked,) = [index for index, argv in enumerate(calls)
+                              if argv[:2] == ["list-panes", "-a"]]
+                self.assertLess(checked, calls.index(hooks[0]["argv"]))
+                self.assertGreaterEqual(result.elapsed, 2)
+                self.assertLess(result.elapsed, 20)
+
+    def test_restore_by_this_script_that_does_not_finish(self):
+        cases = (
+            # name, restore mode, wait to finish, @tmux-restore-status, log text
+            ("never finishes", "never-finishes", "3",
+             "not restored: still restoring after 3s",
+             "restoring the snapshot did not finish within 3 s"),
+            # Not waited for any longer once it ended.
+            ("ends without restoring", "fail", "60",
+             "not restored: continuum did not start it within 1s",
+             "The restore this script started (%s) did not restore it either."),
+        )
+        for name, mode, finish_wait, recorded, text in cases:
+            for shell_name, shell in posix_shells():
+                with self.subTest(name, shell=shell_name):
+                    self.set_state(sequence=("",), restore=mode)
+                    result = self.start(shell, TMUX_LAUNCHD_FINISH_WAIT=finish_wait)
+                    self.assertEqual(result.returncode, 3, result.stderr)
+                    self.assertEqual(self.state()["options"][RESTORE_STATUS], recorded)
+                    self.assertIn(CONTINUUM_SKIPPED, result.stderr)
+                    self.assertIn(text.replace("%s", str(self.restore_script)),
+                                  result.stderr)
+                    for step in RECOVERY:
+                        self.assertIn(step, result.stderr)
+                    self.assertEqual(len(self.restore_calls()), 1)
+                    self.assertLess(result.elapsed, 15)
+
+    def test_login_session_in_use_is_not_restored_into(self):
+        cases = (
+            ("client attached", [{"name": BOOTSTRAP, "attached": 1, "windows": [1]}]),
+            ("another session", [UNTOUCHED[0],
+                                 {"name": "work", "attached": 0, "windows": [1]}]),
+            ("another window", [{"name": BOOTSTRAP, "attached": 0, "windows": [1, 1]}]),
+            ("another pane", [{"name": BOOTSTRAP, "attached": 0, "windows": [2]}]),
+            ("renamed", [{"name": "main", "attached": 0, "windows": [1]}]),
+        )
+        for name, layout in cases:
+            for shell_name, shell in posix_shells():
+                with self.subTest(name, shell=shell_name):
+                    self.set_state(sequence=("",), layout=layout)
+                    result = self.start(shell)
+                    self.assertEqual(result.returncode, 3, result.stderr)
+                    self.assertEqual(self.restore_calls(), [])
+                    self.assertEqual(self.state()["options"][RESTORE_STATUS],
+                                     "not restored: continuum did not start it within 1s")
+                    self.assertIn(IN_USE_TEXT, result.stderr)
+                    self.assertNotIn(CONTINUUM_SKIPPED, result.stderr)
+                    for step in RECOVERY:
+                        self.assertIn(step, result.stderr)
+
+    def test_restore_by_this_script_needs_an_executable_restore_script(self):
+        # A relative path would name a file in HOME, the script's directory.
+        write_executable(self.home / "restore.sh", FAKE_RESTORE.format(
+            python=sys.executable, calls=str(self.restore_log), mode="ok"))
+        cases = (
+            ("missing", {"restore": None}, self.restore_script),
+            ("not executable", {"restore": "not-executable"}, self.restore_script),
+            ("directory", {"options": {"@resurrect-restore-script-path": str(self.root)}},
+             self.root),
+            ("relative", {"options": {"@resurrect-restore-script-path": "restore.sh"}},
+             "restore.sh"),
+        )
+        for name, state, path in cases:
+            for shell_name, shell in posix_shells():
+                with self.subTest(name, shell=shell_name):
+                    self.set_state(sequence=("",), **state)
+                    result = self.start(shell)
+                    self.assertEqual(result.returncode, 3, result.stderr)
+                    self.assertEqual(self.restore_calls(), [])
+                    self.assertEqual(self.state()["options"][RESTORE_STATUS],
+                                     "not restored: continuum did not start it within 1s")
+                    self.assertIn(f"tmux-resurrect's restore script is not an executable "
+                                  f"file ({path}), so it was not restored from here either; "
+                                  "run: dotfiles repair.", result.stderr)
+                    self.assertNotIn(CONTINUUM_SKIPPED, result.stderr)
+
+    def test_restore_by_this_script_never_runs_when_continuum_restores(self):
+        cases = (
+            ("restoring, then restored", ("", "restoring", "on")),
+            ("restored at once", ("on",)),
+            ("still restoring", ("restoring",)),
+        )
+        for name, sequence in cases:
+            for shell_name, shell in posix_shells():
+                with self.subTest(name, shell=shell_name):
+                    self.set_state(sequence=sequence)
+                    result = self.start(shell)
+                    self.assertEqual(self.restore_calls(), [])
+                    self.assertNotIn(CONTINUUM_SKIPPED, result.stderr)
+                    self.assertFalse([call for call in self.calls()
+                                      if call[0] in ("list-panes", "display-message")])
+                    status = self.state()["options"][RESTORE_STATUS]
+                    self.assertNotIn("continuum skipped", status)
+                    self.assertEqual(result.returncode, 3 if name == "still restoring" else 0,
+                                     result.stderr)
 
     def test_failed_start_returns_its_status(self):
         self.set_state(new_session_status=1)
@@ -1103,27 +1343,29 @@ class LaunchdStartEndToEnd(PrivateServer):
         with open(self.log, "a") as log:
             result = self.run_script(START, self.agent_env(**extra), stdout=log,
                                      stderr=subprocess.STDOUT, timeout=300)
-        self.wait_for_continuum_job()
+        self.wait_for_restore_jobs()
         return result
 
     def logged(self):
         return self.log.read_text()
 
-    def continuum_jobs(self):
-        # The job runs as `bash <plugin dir>/scripts/continuum_restore.sh`,
-        # by the path TPM found the plugin under: this test's own HOME
-        # (~/.local/share/tmux/plugins, a link to the clones).  The command
-        # column is the last one, so ps prints it whole.
+    def restore_jobs(self):
+        # They run as `bash <plugin dir>/scripts/continuum_restore.sh`, and
+        # the restore as `bash <plugin dir>/scripts/restore.sh` with its
+        # tmux_spinner.sh, by the path TPM found the plugins under: this
+        # test's own HOME (~/.local/share/tmux/plugins, a link to the clones).
+        # The command column is the last one, so ps prints it whole.
         listing = subprocess.run(["ps", "-A", "-ww", "-o", "pid=", "-o", "command="],
                                  capture_output=True, text=True).stdout
+        names = ("continuum_restore", "scripts/restore.sh", "tmux_spinner")
         return [line for line in listing.splitlines()
-                if str(self.home) in line and "continuum_restore" in line]
+                if str(self.home) in line and any(name in line for name in names)]
 
-    def wait_for_continuum_job(self):
+    def wait_for_restore_jobs(self):
         # continuum restores from a background job that reaches the server by
-        # socket; let it end, so a quick restart never gets the old restore.
-        self.wait_until(lambda: not self.continuum_jobs(), "continuum's restore job",
-                        timeout=60)
+        # socket, and so does tmux-launchd-start when continuum skipped it;
+        # let them end, so a quick restart never gets the old restore.
+        self.wait_until(lambda: not self.restore_jobs(), "the restore jobs", timeout=60)
 
     def sessions(self):
         return sorted(self.tmux("list-sessions", "-F", "#{session_name}").splitlines())
@@ -1168,6 +1410,9 @@ class LaunchdStartEndToEnd(PrivateServer):
         self.assertTrue(self.option(RESTORE_STATUS).startswith("restored "),
                         self.option(RESTORE_STATUS))
         self.assertIn("started tmux and restored the last snapshot", self.logged())
+        # continuum restored it: this script did not run a restore of its own.
+        self.assertNotIn("continuum skipped", self.option(RESTORE_STATUS))
+        self.assertNotIn(CONTINUUM_SKIPPED, self.logged())
         self.assertEqual(self.sessions(), [BOOTSTRAP, "work"])
         self.assertEqual(self.windows(), windows)
 
@@ -1181,21 +1426,67 @@ class LaunchdStartEndToEnd(PrivateServer):
         self.assertEqual(self.tmux("display-message", "-p", "#{pid}"), pid)
         self.assertEqual(self.option(RESTORE_STATUS), "kept")
 
-    def test_skipped_restore_exits_3_with_recovery_steps(self):
+    # Two other tmux processes at startup: continuum skips the restore.
+    OTHER_TMUX = "tmux attach-session -t x   99998\ntmux new-session -s y      99999\n"
+
+    def test_skipped_restore_is_restored_by_this_script(self):
+        self.assertEqual(self.login().returncode, 0, self.logged())
+        windows = self.save_workspace()
+        last = os.readlink(self.snapshots / "last")
+        self.logout()
+        (self.home / "ps-extra").write_text(self.OTHER_TMUX)
+        result = self.login(TMUX_LAUNCHD_START_WAIT="3")
+        self.assertEqual(result.returncode, 0, self.logged())
+        self.assertIn(CONTINUUM_SKIPPED, self.logged())
+        self.assertIn("started tmux and restored the last snapshot" + BY_SCRIPT, self.logged())
+        self.assertEqual(self.option(RESTORE_STATE), "on")
+        self.assertRegex(self.option(RESTORE_STATUS),
+                         r"^restored \d{4}-\d\d-\d\d \d\d:\d\d:\d\d" + re.escape(BY_SCRIPT) + "$")
+        # What continuum's restore brings back: the restore hooks moved the
+        # untouched login session out of the way and then removed it.
+        self.assertEqual(self.sessions(), [BOOTSTRAP, "work"])
+        self.assertEqual(self.windows(), windows)
+        self.assertEqual(os.readlink(self.snapshots / "last"), last)
+
+    def login_session_exists(self):
+        return subprocess.run(
+            [TMUX_BIN, "-S", str(self.socket), "has-session", "-t", f"={BOOTSTRAP}"],
+            env=self.base_env(), capture_output=True, timeout=30,
+        ).returncode == 0
+
+    def test_skipped_restore_into_a_session_in_use_exits_3_with_recovery_steps(self):
         self.assertEqual(self.login().returncode, 0, self.logged())
         self.save_workspace()
         last = os.readlink(self.snapshots / "last")
         self.logout()
-        # Two other tmux processes at startup: continuum skips the restore.
-        (self.home / "ps-extra").write_text(
-            "tmux attach-session -t x   99998\ntmux new-session -s y      99999\n")
-        result = self.login(TMUX_LAUNCHD_START_WAIT="3")
-        self.assertEqual(result.returncode, 3, self.logged())
-        self.assertEqual(self.sessions(), [BOOTSTRAP])
-        self.assertTrue(self.option(RESTORE_STATUS).startswith(
-            "not restored: continuum did not start it within 3s"), self.option(RESTORE_STATUS))
+        (self.home / "ps-extra").write_text(self.OTHER_TMUX)
+        # A window opened in the login session while the script waits for
+        # continuum: the session is in use, so it is not restored into.
+        self.socket.parent.mkdir(mode=0o700, exist_ok=True)
+        with open(self.log, "a") as log:
+            proc = subprocess.Popen(
+                [str(START)], env=self.agent_env(TMUX_LAUNCHD_START_WAIT="5"),
+                cwd=self.root, stdout=log, stderr=subprocess.STDOUT)
+        try:
+            self.wait_until(self.login_session_exists, "the login session")
+            self.tmux("new-window", "-d", "-t", f"={BOOTSTRAP}:")
+            returncode = proc.wait(timeout=300)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+        self.wait_for_restore_jobs()
+        self.assertEqual(returncode, 3, self.logged())
+        self.assertIn(IN_USE_TEXT, self.logged())
+        self.assertNotIn(CONTINUUM_SKIPPED, self.logged())
         for step in RECOVERY:
             self.assertIn(step, self.logged())
+        self.assertEqual(self.option(RESTORE_STATUS),
+                         "not restored: continuum did not start it within 5s")
+        self.assertEqual(self.option(RESTORE_STATE), "")
+        self.assertEqual(self.sessions(), [BOOTSTRAP])
+        self.assertEqual([window.split("|")[0] for window in self.windows()],
+                         [BOOTSTRAP, BOOTSTRAP])
         self.assertEqual(os.readlink(self.snapshots / "last"), last)
 
     def test_halt_file_starts_tmux_without_restoring(self):

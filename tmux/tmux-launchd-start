@@ -14,18 +14,33 @@
 # around every restore), records the outcome in the server option
 # @tmux-restore-status and logs it with recovery steps.
 #
-# tmux is always run by its absolute path.  continuum skips the restore when
-# `ps -u <uid> -o "command pid"` lists more than one line starting with
-# "tmux" besides the server, and the client starting the server stays alive
-# while the config (TPM and every plugin) loads.  Started as "tmux", that
-# client would count, and any one other tmux client at that moment would make
-# continuum skip.  macOS ps cuts a command column that is not the last one to
-# 16 characters, so "/opt/homebrew/bin/tmux ..." never starts with "tmux".
+# continuum also skips the restore whenever it sees another tmux client at
+# that moment (below): one run by another plugin's background setup, or a
+# terminal running `tmux attach` at login.  When it has not started the
+# restore within the start wait, the snapshot is still there, no halt file
+# says otherwise and the server holds only the untouched login session
+# (__continuum_startup with one window and one pane, no client attached,
+# nothing else), this script runs that same restore itself, as continuum's
+# job would have: @resurrect-restore-script-path in the background, tmux
+# found on PATH, output discarded, TMUX naming this server.  It then waits
+# for it as for continuum's and records "restored ... (continuum skipped;
+# restored by tmux-launchd-start)".  A server already in use is never
+# restored into automatically: that is reported with the recovery steps.
 #
-# Exit status: 0 when the snapshot was restored, when there was nothing to
-# restore (no snapshot, or the ~/tmux_no_auto_restore halt file) and when a
-# server was already running; 3 when a snapshot exists but was not restored;
-# 1 when tmux is missing; otherwise the status of the failed new-session.
+# This script itself always runs tmux by its absolute path.  continuum skips
+# the restore when `ps -u <uid> -o "command pid"` lists more than one line
+# starting with "tmux" besides the server, and the client starting the server
+# stays alive while the config (TPM and every plugin) loads.  Started as
+# "tmux", that client would count, and any one other tmux client at that
+# moment would make continuum skip.  macOS ps cuts a command column that is
+# not the last one to 16 characters, so "/opt/homebrew/bin/tmux ..." never
+# starts with "tmux".
+#
+# Exit status: 0 when the snapshot was restored (by continuum, or by this
+# script when continuum skipped it), when there was nothing to restore (no
+# snapshot, or the ~/tmux_no_auto_restore halt file) and when a server was
+# already running; 3 when a snapshot exists but was not restored; 1 when
+# tmux is missing; otherwise the status of the failed new-session.
 #
 # Its output goes to the agent's log, $PERSONAL_DOTFILES_LAUNCHD_LOG, which
 # this script keeps near 1 MiB.  Test seams (the agent never sets them):
@@ -185,6 +200,51 @@ restore_state() {
   "$tmux_bin" show-option -gqv @tmux-restore-complete 2>/dev/null || echo gone
 }
 
+# True while the server holds nothing but the untouched login session: its
+# only pane is in __continuum_startup, which has one window and no client.
+untouched() {
+  panes=$("$tmux_bin" list-panes -a -F \
+    '#{session_name} #{session_windows} #{window_panes} #{session_attached}' 2>/dev/null)
+  [ "$panes" = "__continuum_startup 1 1 0" ]
+}
+
+# True for an absolute path to an executable file.
+program() {
+  case $1 in
+    /*) [ -f "$1" ] && [ -x "$1" ] ;;
+    *) return 1 ;;
+  esac
+}
+
+# Start the restore that continuum skipped (see the top), or say in $why why
+# not.  continuum's job runs the restore script with the TMUX that tmux gives
+# a job started while the config loads, "<socket>,<server pid>,-1"; so does
+# this one, as restore.sh creates each missing session with
+# `tmux -S <the socket in $TMUX>` (an empty one would not reach this server).
+restore_here() {
+  script=$(option @resurrect-restore-script-path)
+  if [ ! -f "$dir/last" ]; then
+    why="The snapshot is gone, so it was not restored from here either."
+  elif [ -e "$HOME/tmux_no_auto_restore" ]; then
+    why="The halt file ~/tmux_no_auto_restore exists now, so it was not restored from here either."
+  elif ! program "$script"; then
+    why="tmux-resurrect's restore script is not an executable file ($script), so it was not restored from here either; run: dotfiles repair."
+  elif ! untouched; then
+    why="The login session is already in use (a client is attached, or there are other sessions, windows or panes), so it was not restored automatically."
+  else
+    server=$("$tmux_bin" display-message -p '#{socket_path},#{pid}' 2>/dev/null) || server=
+    case $server in
+      /*,*)
+        TMUX=$server,-1 "$script" </dev/null >/dev/null 2>&1 &
+        job=$!
+        return 0
+        ;;
+    esac
+    why="The tmux server did not answer, so it was not restored from here either."
+  fi
+  return 1
+}
+
 # continuum restores only into a server younger than its max delay; its
 # restore job sleeps 1 s and the pre-restore hook then marks "restoring".
 max_delay=$(seconds "$(option @continuum-restore-max-delay)" 10)
@@ -196,8 +256,38 @@ while [ "$state" != restoring ] && [ "$state" != on ] && [ "$state" != gone ] &&
   sleep 1
   state=$(restore_state)
 done
+
+# continuum skipped the restore: restore from here (the finish wait bounds it
+# from now), or note why not.
+by=
+why=
+case $state in
+  restoring | on | gone) ;;
+  *)
+    if restore_here; then
+      by=" (continuum skipped; restored by tmux-launchd-start)"
+      say "tmux-continuum skipped the restore (it does whenever another tmux process runs at startup), so this script restores the snapshot itself"
+      deadline=$(($(date +%s) + finish_wait))
+      # Its pre-restore hook marks "restoring" at once.  Stop early only when
+      # it ended without; that is checked before the state is read, so a
+      # restore that finished in between is seen as "on".
+      while :; do
+        running=
+        kill -0 "$job" 2>/dev/null && running=yes
+        state=$(restore_state)
+        case $state in
+          restoring | on | gone) break ;;
+        esac
+        [ -n "$running" ] && [ "$(date +%s)" -lt "$deadline" ] || break
+        sleep 1
+      done
+    else
+      state=$(restore_state)
+    fi
+    ;;
+esac
 if [ "$state" = restoring ]; then
-  deadline=$(($(date +%s) + finish_wait))
+  [ -n "$by" ] || deadline=$(($(date +%s) + finish_wait))
   while [ "$state" = restoring ] && [ "$(date +%s)" -lt "$deadline" ]; do
     sleep 1
     state=$(restore_state)
@@ -206,7 +296,7 @@ fi
 
 case $state in
   on)
-    report "restored $(date '+%Y-%m-%d %H:%M:%S')" "started tmux and restored the last snapshot"
+    report "restored $(date '+%Y-%m-%d %H:%M:%S')$by" "started tmux and restored the last snapshot$by"
     exit 0
     ;;
   gone)
@@ -218,8 +308,11 @@ case $state in
 $steps"
     ;;
   *)
-    report "not restored: continuum did not start it within ${start_wait}s" \
-      "started tmux, but tmux-continuum did not restore the snapshot within ${start_wait} s (it skips the restore when it sees another tmux process at startup).
+    [ -z "$by" ] || why="The restore this script started ($script) did not restore it either."
+    text="started tmux, but tmux-continuum did not restore the snapshot within ${start_wait} s (it skips the restore when it sees another tmux process at startup)."
+    [ -z "$why" ] || text="$text
+$why"
+    report "not restored: continuum did not start it within ${start_wait}s" "$text
 $steps"
     ;;
 esac
