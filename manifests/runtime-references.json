@@ -1738,9 +1738,9 @@
     },
     {
       "id": "python-bytecode-checkout",
-      "entrypoint": "python imports of modules inside the checkout: bin/dotfiles and etc/install -> install.py -> installer/*.py; tests importing tools/, tmux/resurrect-ai-session.py, desktop/input-remapper/",
+      "entrypoint": "python imports of modules inside the checkout: bin/dotfiles and etc/install -> install.py -> installer/*.py; tmux/resurrect-ai-session.py -> installer/darwin_proc.py (macOS only); tests importing tools/, tmux/resurrect-ai-session.py, desktop/input-remapper/",
       "before": "__pycache__/ under installer/, tools/, tmux/, desktop/, tests/ of the checkout (gitignored, but writes into installer-owned source)",
-      "after": "install.py sets sys.dont_write_bytecode before importing installer/ and bin/dotfiles runs it with -B; zsh/ and tmux.conf start no python from the checkout; resurrect.conf runs resurrect-ai-session.py as a script (a __main__ script writes no bytecode). Test runners must use python -B / PYTHONDONTWRITEBYTECODE=1",
+      "after": "install.py sets sys.dont_write_bytecode before importing installer/ and bin/dotfiles runs it with -B; zsh/ and tmux.conf start no python from the checkout; resurrect.conf runs resurrect-ai-session.py as a script (a __main__ script writes no bytecode), and on macOS that script sets sys.dont_write_bytecode before it imports installer/darwin_proc.py from its own checkout (Linux never imports it). Test runners must use python -B / PYTHONDONTWRITEBYTECODE=1",
       "status": "redirected",
       "evidence": "static: markers below. Dev-time test runs without -B still create __pycache__ (seen for tests/unit, tmux/, tools/, installer/ during the parallel lane work)",
       "checks": [
@@ -1767,6 +1767,12 @@
           "file": "tmux/tmux.conf",
           "forbid": [
             "python3? [^\\n]*\\.dotfiles/"
+          ]
+        },
+        {
+          "file": "tmux/resurrect-ai-session.py",
+          "require": [
+            "(?s)sys\\.dont_write_bytecode = True\\n.*from installer import darwin_proc"
           ]
         }
       ]
