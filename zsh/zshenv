@@ -31,6 +31,27 @@ if [[ -n ${_PD_RELOAD_PID:-} ]]; then
   unset _PD_RELOAD_PID _PD_RELOAD_FD _PD_RELOAD_HOOKFD
 fi
 
+# ssh-dotfiles keeps HOME unchanged so programs still see the shared account,
+# but points shell-owned source and writable state at a private profile.  The
+# ordinary install leaves these unset and keeps the historical paths exactly.
+if [[ -n ${SSH_ZSH_HOME:-} ]]; then
+  [[ ${SSH_ZSH_HOME} == /* && ${SSH_ZSH_ROOT:-} == /* && ${ZDOTDIR:-} == /* ]] || {
+    print -u2 -- 'ssh-dotfiles: SSH_ZSH_HOME, SSH_ZSH_ROOT and ZDOTDIR must be absolute paths'
+    return 1
+  }
+  # Prezto's history module reads this style and otherwise replaces HISTFILE.
+  # Keep it in stable profile state and ensure an inherited export attribute
+  # cannot leak the zsh history file to child shells.
+  typeset -g +x HISTFILE
+  HISTFILE="$SSH_ZSH_HOME/state/zsh/history"
+  zstyle ':prezto:module:history' histfile "$HISTFILE"
+  export _FASD_DATA="$SSH_ZSH_HOME/state/fasd"
+  export FZF_MARKS_FILE="$SSH_ZSH_HOME/state/fzf-marks"
+  # gitstatus normally downloads a platform binary on first use.  Remote
+  # profiles are installed from the client and must stay usable offline.
+  export GITSTATUS_AUTO_INSTALL=0
+fi
+
 #
 # Browser
 #
@@ -144,8 +165,9 @@ fpath=("$HOME/.bun" $fpath)
 # GO
 # $GOPATH is where go-installed libraries or command line utilities will be installed.
 # Especially, binaries will be located at $HOME/.go/bin, which should be added to $PATH.
-export GOPATH=$HOME/.go
-mkdir -p $GOPATH
+export GOPATH=${SSH_ZSH_HOME:+$SSH_ZSH_HOME/data/go}
+export GOPATH=${GOPATH:-$HOME/.go}
+mkdir -p -- "$GOPATH"
 prepend_path "$GOPATH/bin"
 
 # rust (cargo)
@@ -161,7 +183,11 @@ fi
 prepend_path "$HOME/.pixi/bin"
 
 # dotfiles-populated bin (having quite high priority)
-prepend_path "$HOME/.dotfiles/bin"
+if [[ -n ${SSH_ZSH_HOME:-} ]]; then
+  prepend_path "$SSH_ZSH_ROOT/bin"
+else
+  prepend_path "$HOME/.dotfiles/bin"
+fi
 
 # Let ~/.local/bin take the most, biggest precedence
 prepend_path "$HOME/.local/bin"
@@ -225,7 +251,11 @@ fi
 export PAGER='less'
 
 # in neovim, try :echo stdpath("data")  or :echo $MASON
-export MASON="$HOME/.local/share/nvim/mason/"
+if [[ -n ${SSH_ZSH_HOME:-} ]]; then
+  export MASON="${XDG_DATA_HOME:-$SSH_ZSH_HOME/data}/nvim/mason/"
+else
+  export MASON="$HOME/.local/share/nvim/mason/"
+fi
 
 # Unset GIT_EDITOR (usually nvr) inside a neovim-floaterm session.
 # See ~/.vimrc: $GIT_EDITOR section for more details.
@@ -267,11 +297,19 @@ fi
 # as some linux systems zsh might be locally-installed on ~/.local/share (like a site config)
 #   but on other systems ~/.local may be treated as user-local config.
 #
-fpath=(
-  $HOME/.zsh/functions
-  $HOME/.local/share/zsh/site-functions
-  $fpath   # e.g. /usr/local/share/zsh/site-functions
-)
+if [[ -n ${SSH_ZSH_HOME:-} ]]; then
+  fpath=(
+    ${ZDOTDIR:-$HOME}/.zsh/functions
+    $HOME/.local/share/zsh/site-functions
+    $fpath
+  )
+else
+  fpath=(
+    $HOME/.zsh/functions
+    $HOME/.local/share/zsh/site-functions
+    $fpath   # e.g. /usr/local/share/zsh/site-functions
+  )
+fi
 
 
 #
@@ -289,7 +327,8 @@ else
 fi
 
 # Set the directory where virtual environments are stored.
-export WORKON_HOME="$HOME/.virtualenvs"
+export WORKON_HOME="${SSH_ZSH_HOME:+$SSH_ZSH_HOME/data/virtualenvs}"
+export WORKON_HOME="${WORKON_HOME:-$HOME/.virtualenvs}"
 export VIRTUAL_ENV_DISABLE_PROMPT=1
 
 # ensure that all new virtual environments are isolated from the system site-packages.
@@ -297,15 +336,21 @@ export VIRTUAL_ENV_DISABLE_PROMPT=1
 # export VIRTUALENVWRAPPER_VIRTUALENV_ARGS='--no-site-packages'
 
 # python startup
-export PYTHONSTARTUP=$HOME/.pythonrc.py
+if [[ -n ${SSH_ZSH_HOME:-} ]]; then
+  export PYTHONSTARTUP="$SSH_ZSH_HOME/config/pythonrc.py"
+else
+  export PYTHONSTARTUP="$HOME/.pythonrc.py"
+fi
 
 
 # Disable dot files in archive
 export COPYFILE_DISABLE=true
 
-if [ -f "$HOME/.zshenv.local" ]; then
-  source "$HOME/.zshenv.local"
+_pd_local_root=${SSH_ZSH_HOME:-$HOME}
+if [ -f "$_pd_local_root/.zshenv.local" ]; then
+  source "$_pd_local_root/.zshenv.local"
 fi
+unset _pd_local_root
 
 
 # Enforce system-wide PATH entries to be put at the back, always
@@ -324,3 +369,17 @@ path=(
   /bin
   /sbin
 )
+
+# The profile release owns both the public wrappers and source helpers.  Keep
+# them ahead of shared-account commands even when PATH was inherited from a
+# login shell or changed by a profile-local override.
+if [[ -n ${SSH_ZSH_HOME:-} ]]; then
+  typeset _ssh_release_bin="${SSH_ZSH_ROOT:h}/bin"
+  typeset _ssh_source_bin="$SSH_ZSH_ROOT/bin"
+  path=(
+    "$_ssh_release_bin"
+    "$_ssh_source_bin"
+    $path
+  )
+  unset _ssh_release_bin _ssh_source_bin
+fi

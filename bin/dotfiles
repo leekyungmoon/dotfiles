@@ -591,6 +591,11 @@ def main():
         sys.exit(1)
     if unknown:
         kwargs['argv'] = unknown
+    if os.environ.get('SSH_ZSH_HOME') and command not in ('github', 'status'):
+        print(RED("This shell is managed by ssh-dotfiles; run "
+                  "'ssh-dotfiles install' on the client to update it."),
+              file=sys.stderr)
+        sys.exit(2)
     refresh = command in ('update', 'repair')
     before = _read_generation() if refresh else None
     ret = COMMANDS[command](**kwargs)

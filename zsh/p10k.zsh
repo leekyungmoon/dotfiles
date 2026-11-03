@@ -25,6 +25,7 @@
   # Unset all configuration options. This allows you to apply configuration changes without
   # restarting zsh. Edit ~/.p10k.zsh and type `source ~/.p10k.zsh`.
   unset -m 'POWERLEVEL9K_*|DEFAULT_USER'
+  [[ -z ${SSH_ZSH_HOME:-} ]] || typeset -g POWERLEVEL9K_DISABLE_GITSTATUS=true
 
   # Zsh >= 5.1 is required.
   autoload -Uz is-at-least && is-at-least 5.1 || return

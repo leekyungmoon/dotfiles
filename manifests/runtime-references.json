@@ -901,6 +901,13 @@
     },
     {
       "file": "zsh/zsh.d/alias.zsh",
+      "line": "[[ -z ${SSH_ZSH_HOME:-} ]] || _dotfiles_bin_dir=\"$SSH_ZSH_ROOT/bin\"",
+      "kind": "identifier",
+      "classification": "identifier",
+      "purpose": "shared-profile override for the pbcopy/pbpaste helper root"
+    },
+    {
+      "file": "zsh/zsh.d/alias.zsh",
       "line": "_dotfiles_bin_dir=${0:A:h:h:h}/bin",
       "kind": "identifier",
       "classification": "identifier",
@@ -1684,7 +1691,7 @@
         {
           "file": "zsh/zshenv",
           "require": [
-            "source \"\\$HOME/\\.zshenv\\.local\""
+            "source \"\\$_pd_local_root/\\.zshenv\\.local\""
           ]
         },
         {
