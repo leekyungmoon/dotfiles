@@ -192,6 +192,12 @@
       "source": "bin/dotfiles"
     },
     {
+      "id": "bin-ssh-dotfiles",
+      "dest": "{home}/.local/bin/ssh-dotfiles",
+      "kind": "symlink",
+      "source": "bin/ssh-dotfiles"
+    },
+    {
       "id": "bin-pbcopy",
       "dest": "{home}/.local/bin/pbcopy",
       "kind": "symlink",

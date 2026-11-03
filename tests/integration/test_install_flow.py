@@ -45,6 +45,7 @@ OVERLAY_GLOBS = [
     "install.py",
     "installer/*.py",
     "bin/dotfiles",
+    "bin/ssh-dotfiles",
     "etc/install",
     "manifests/*.json",
     "systemd/**/*",

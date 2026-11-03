@@ -75,10 +75,18 @@ alias vi='vim'
 alias v='vim'
 
 # Just open ~/.vimrc, ~/.zshrc, etc.
-alias vimrc='vim +"cd ~/.dotfiles" +Vimrc +tabclose\ 1'
-alias plugs='vim +"cd ~/.dotfiles" ~/.dotfiles/vim/plugins.vim'
-
-alias zshrc='vim +cd\ ~/.zsh -O ~/.zsh/zshrc ~/.zsh/zsh.d/alias.zsh'
+if [[ -n ${SSH_ZSH_HOME:-} ]]; then
+  alias vimrc='vim +"cd $SSH_ZSH_ROOT" +Vimrc +tabclose\ 1'
+  function plugs() {
+    print -u2 -- 'plugs: unavailable in the source-only ssh-dotfiles profile (Vim configuration is not installed)'
+    return 2
+  }
+  alias zshrc='vim +"cd $ZDOTDIR/.zsh" -O "$ZDOTDIR/.zsh/zshrc" "$ZDOTDIR/.zsh/zsh.d/alias.zsh"'
+else
+  alias vimrc='vim +"cd ~/.dotfiles" +Vimrc +tabclose\ 1'
+  alias plugs='vim +"cd ~/.dotfiles" ~/.dotfiles/vim/plugins.vim'
+  alias zshrc='vim +cd\ ~/.zsh -O ~/.zsh/zshrc ~/.zsh/zsh.d/alias.zsh'
+fi
 
 function plugged() {
   local selected
@@ -92,6 +100,10 @@ function plugged() {
 
 # Running lua tests for neovim in the command line
 function plenary-busted() {
+    if [[ -n ${SSH_ZSH_HOME:-} ]]; then
+        print -u2 -- 'plenary-busted: unavailable in the source-only ssh-dotfiles profile (Neovim test assets are not installed)'
+        return 2
+    fi
     if [ $# == 0 ]; then
         plenary-busted . || return 1;
     else
@@ -559,6 +571,7 @@ fi
 # working from any checkout location.
 _dotfiles_bin_dir=${0:A:h:h:h}/bin
 [[ -d "$_dotfiles_bin_dir" ]] || _dotfiles_bin_dir="$HOME/.dotfiles/bin"
+[[ -z ${SSH_ZSH_HOME:-} ]] || _dotfiles_bin_dir="$SSH_ZSH_ROOT/bin"
 for _dotfiles_helper in pbcopy pbpaste; do
     if [[ -x "$_dotfiles_bin_dir/$_dotfiles_helper" ]] \
         && (( $+aliases[$_dotfiles_helper] )); then

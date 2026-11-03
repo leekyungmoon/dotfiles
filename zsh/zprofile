@@ -34,8 +34,10 @@ unset CONDA_PYTHON_EXE
 unset CONDA_SHLVL
 
 # Local config for login shell (executed before zshrc)
-if [[ -f "$HOME/.zprofile.local" ]]; then
-  source "$HOME/.zprofile.local"
+_pd_local_root=${SSH_ZSH_HOME:-$HOME}
+if [[ -f "$_pd_local_root/.zprofile.local" ]]; then
+  source "$_pd_local_root/.zprofile.local"
 fi
+unset _pd_local_root
 
 # vim: set ft=zsh ts=2 sts=2 sw=2:

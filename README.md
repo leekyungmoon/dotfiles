@@ -50,6 +50,23 @@ $ dotfiles install fzf            # -> ~/.local/bin/fzf
 ```
 
 
+## Personal zsh on a shared SSH account
+
+The normal local installation also installs `ssh-dotfiles`. Prepare the local
+zsh plugins once, then send that installation's zsh sources and cached plugins
+to a server, even when the **server has no Internet access**:
+
+```sh
+ssh-dotfiles install user@server
+ssh-dotfiles connect user@server
+```
+
+An existing SSH Host alias works too. Only `connect` selects your profile;
+ordinary SSH and the account's shared startup files stay unchanged. The server
+needs Python 3.8+, zsh 5.4.2+, Git, `infocmp`, and fzf 0.48+ already installed.
+No sudo, desktop setup, shell change or service registration is performed.
+See [installation, offline preparation and recovery](docs/SSH-DOTFILES.md).
+
 ## ✨ Highlights
 
 - 📋 `pbcopy` / `pbpaste` on Linux — Wayland, X11, and OSC52 over SSH

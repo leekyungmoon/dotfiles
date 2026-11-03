@@ -8,7 +8,11 @@
 # Execute code that does not affect the current session in the background.
 {
   # Compile the completion dump to increase startup speed.
-  zcompdump="${ZDOTDIR:-$HOME}/.zcompdump"
+  if [[ -n ${SSH_ZSH_HOME:-} ]]; then
+    zcompdump="${XDG_CACHE_HOME:-$SSH_ZSH_HOME/cache}/prezto/zcompdump"
+  else
+    zcompdump="${ZDOTDIR:-$HOME}/.zcompdump"
+  fi
   if [[ -s "$zcompdump" && (! -s "${zcompdump}.zwc" || "$zcompdump" -nt "${zcompdump}.zwc") ]]; then
     zcompile "$zcompdump"
   fi

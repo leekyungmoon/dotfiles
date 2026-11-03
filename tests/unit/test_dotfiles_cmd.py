@@ -174,6 +174,24 @@ class ArgumentTableTests(DotfilesCmdCase):
 
 
 class DelegationTests(DotfilesCmdCase):
+    def test_shared_profile_refuses_mutating_commands(self):
+        before = self.head()
+        for args in (("update",), ("install", "fzf"),
+                     ("restore", "--baseline"), ("repair",),
+                     ("gui-apply",)):
+            completed = self.dotfiles_cmd(
+                *args, extra_env={"SSH_ZSH_HOME": str(self.root / "profile")})
+            self.assertEqual(completed.returncode, 2, (args, completed.stderr))
+            self.assertIn(b"ssh-dotfiles install", completed.stderr)
+        self.assertEqual(self.head(), before)
+        self.assertEqual(self.calls(), [])
+
+        # Read-only commands remain available and do not delegate mutations.
+        self.assertEqual(self.dotfiles_cmd(
+            "status", "--json",
+            extra_env={"SSH_ZSH_HOME": str(self.root / "profile")}).returncode, 0)
+        self.assertEqual(self.calls()[0]["argv"], ["status", "--json"])
+
     def test_install_without_target_lists_pinned_tools(self):
         completed = self.dotfiles_cmd("install")
         self.assertEqual(completed.returncode, 1)
