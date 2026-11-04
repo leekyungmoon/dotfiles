@@ -254,12 +254,12 @@ def install_tmux_plugins(target, runner, repo_root: Path, run_id: str) -> tuple[
 
 
 def _plugin_step(runner, name: str, argv_fn, env, cwd, *, skip: bool,
-                 flag: str) -> tuple[str, str]:
+                 flag: str, binary: str | None = None) -> tuple[str, str]:
     """Run one plugin prefill/update command; ``(status, detail)``."""
 
     if skip:
         return SKIPPED, flag
-    binary = runner.which(name)
+    binary = binary or runner.which(name)
     if binary is None:
         return SKIPPED, f"{name}-not-installed"
     completed = runner.run(argv_fn(binary), timeout=PLUGIN_TIMEOUT, check=False,
@@ -294,7 +294,9 @@ def plugins_step(target, runner, *, env, skip_zplug: bool, skip_vimplug: bool):
         label = "zsh_plugins" if name == "zsh" else "vim_plugins"
         try:
             status, detail = _plugin_step(runner, name, argv_fn, env, target.home,
-                                          skip=skip, flag=flag)
+                                          skip=skip, flag=flag,
+                                          binary=_tool_binary(target, runner, "nvim")
+                                          if name == "nvim" else None)
         except Exception as exc:
             status, detail = FAIL, f"{name} plugins: {exc}"
         details[label] = detail if status != FAIL else "failed"
@@ -1537,6 +1539,91 @@ def auth_phase(target, runner, env: dict[str, str] | None = None) -> PhaseResult
     if not statuses:
         return PhaseResult("auth", SKIPPED, ["sign-in-not-verifiable"], details)
     return PhaseResult("auth", worst(statuses), reasons, details)
+
+
+COPILOT_STATUS_COMMAND = (
+    "lua io.stdout:write('DOTFILES_COPILOT_STATUS=' .. "
+    "require('config.copilot').auth_status() .. '\\n')"
+)
+COPILOT_SIGNED_IN = ("OK", "MaybeOK")
+COPILOT_SIGNED_OUT = ("NotSignedIn", "NotAuthorized")
+COPILOT_REMEDY = "open Neovim and run :Copilot setup, then :Copilot status"
+
+
+def _copilot_status(runner, nvim: str, env) -> str:
+    """Probe the plugin, retaining only its status, never account/token data."""
+
+    try:
+        result = runner.run(
+            [nvim, "--headless", "-i", "NONE", "-c", COPILOT_STATUS_COMMAND,
+             "-c", "qall"], timeout=120, check=False, env=env, input=b"")
+        if result.returncode == 0:
+            for line in _text(result.stdout).splitlines():
+                if line.startswith("DOTFILES_COPILOT_STATUS="):
+                    status = line.partition("=")[2]
+                    if status in (*COPILOT_SIGNED_IN, *COPILOT_SIGNED_OUT):
+                        return status
+    except Exception:
+        pass
+    return "unverified"
+
+
+def copilot_auth_phase(target, runner, env=None, *, prompt=None, interactive=None,
+                       skip: bool = False, plugins_ready: bool = True) -> PhaseResult:
+    """Offer the official plugin's interactive GitHub device-login flow.
+
+    Selection alone never starts a browser or waits for input without a
+    terminal. A successful editor exit is not proof of authentication: check
+    the plugin again afterwards. GitHub CLI credentials are not involved.
+    """
+
+    if skip or not plugins_ready:
+        reason = "--skip-vimplug" if skip else "Neovim plugin installation did not succeed"
+        return PhaseResult("copilot-auth", SKIPPED, [reason])
+    nvim = _tool_binary(target, runner, "nvim")
+    node = _tool_binary(target, runner, "node")
+    if nvim is None or node is None:
+        return PhaseResult("copilot-auth", FAIL,
+                           ["Neovim and Node.js are required; rerun without --no-packages"])
+    plugin = target.data_home / "vim" / "plugged" / "copilot.vim" / "plugin" / "copilot.vim"
+    if not plugin.is_file():
+        return PhaseResult("copilot-auth", FAIL,
+                           ["copilot.vim was not installed; rerun without --skip-vimplug"])
+    cenv = child_env(target, env)
+    status = _copilot_status(runner, nvim, cenv)
+    if status in COPILOT_SIGNED_IN:
+        return PhaseResult("copilot-auth", PASS, [], {"copilot": "signed-in"})
+    if status == "unverified":
+        return PhaseResult("copilot-auth", FAIL,
+                           ["Copilot could not start or report its status; " + COPILOT_REMEDY],
+                           {"copilot": status})
+    pending = PhaseResult("copilot-auth", AUTH_REQUIRED,
+                          ["GitHub Copilot needs sign-in and Copilot access; " + COPILOT_REMEDY],
+                          {"copilot": "not-signed-in"})
+    if prompt is None or interactive is None:
+        return pending
+    answer = prompt("Sign in to GitHub Copilot now? [Y/n] ")
+    if answer is None or answer.strip().lower() not in ("", "y", "yes"):
+        return pending
+    ui.log("Neovim will show GitHub's device code and sign-in instructions. "
+           "Complete approval in your browser; Neovim then closes automatically. "
+           "Ctrl-C cancels sign-in.")
+    try:
+        rc = interactive([nvim, "-c", "Copilot setup", "-c", "qall"], env=cenv)
+    except (Exception, KeyboardInterrupt):
+        pending.reasons.insert(0, "Copilot sign-in was interrupted")
+        return pending
+    if rc != 0:
+        pending.reasons.insert(0, "Neovim exited before sign-in completed")
+        return pending
+    status = _copilot_status(runner, nvim, cenv)
+    if status in COPILOT_SIGNED_IN:
+        return PhaseResult("copilot-auth", PASS, [], {"copilot": "signed-in"})
+    if status == "unverified":
+        return PhaseResult("copilot-auth", FAIL,
+                           ["Could not verify Copilot after sign-in; " + COPILOT_REMEDY],
+                           {"copilot": status})
+    return pending
 
 
 # --- git identity -------------------------------------------------------------

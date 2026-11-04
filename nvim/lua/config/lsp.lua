@@ -383,6 +383,11 @@ function M._setup_inline_completion()
     return false
   end
 
+  -- github/copilot.vim owns :Copilot when selected by the dotfiles installer.
+  if require('config.copilot').enabled() or vim.fn.exists(':Copilot') == 2 then
+    return false
+  end
+
   --- :Copilot enable / :Copilot disable (works for current buffer)
   --- NOTE: You might want to do :LspCopilotSignIn for authentication (~/.config/github-copilot)
   --- NOTE: Install copilot language server via :Mason

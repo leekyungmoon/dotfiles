@@ -77,6 +77,7 @@ class Options:
     # Tri-state: True/False from --[no-]claude-code / --[no-]codex, None = ask.
     claude_code: bool | None = None
     codex: bool | None = None
+    copilot: bool | None = None
 
 
 @dataclasses.dataclass
@@ -119,6 +120,9 @@ def _install_flags(p: argparse.ArgumentParser) -> None:
     p.add_argument("--codex", action=argparse.BooleanOptionalAction, default=None,
                    help="install the Codex CLI and oh-my-codex without asking "
                         "(--no-codex: skip them)")
+    p.add_argument("--copilot", action=argparse.BooleanOptionalAction, default=None,
+                   help="set up github/copilot.vim in Neovim without asking "
+                        "(--no-copilot: disable the plugin; login still needs a terminal)")
     p.add_argument("--allow-any-location", action="store_true",
                    help=argparse.SUPPRESS)
 
@@ -176,7 +180,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return build_parser().parse_args(argv)
 
 
-_TRISTATE = ("claude_code", "codex")
+_TRISTATE = ("claude_code", "codex", "copilot")
 
 
 def options_from(args: argparse.Namespace) -> Options:
@@ -261,6 +265,38 @@ def ai_cli_exclusions(ctx: Context, opts: Options, *, record: bool = True) -> li
         except OSError as exc:
             ui.log(ui.YELLOW(f"could not remember the AI CLI choices: {exc}"))
     return exclude
+
+
+def copilot_choice(ctx: Context, opts: Options, *, record: bool = True) -> bool:
+    """Remember the optional Neovim plugin choice, independently of CLI packages.
+
+    Neovim and Node are already part of the normal installation. Unlike the
+    pre-existing CLI defaults, a new unattended install does not opt into
+    Copilot; use --copilot to enable it without an installation prompt.
+    """
+
+    choices = _load_choices(ctx.target)
+    wanted = opts.copilot
+    if wanted is None:
+        saved = choices.get("copilot")
+        if isinstance(saved, bool):
+            return saved
+        if ctx.prompt is None or opts.skip_vimplug:
+            return False
+        answer = ctx.prompt("Set up GitHub Copilot in Neovim (copilot.vim)? [Y/n] ")
+        # EOF is not an answer to the optional installation question.
+        if answer is None:
+            return False
+        wanted = _yes(answer)
+    if record and choices.get("copilot") is not wanted:
+        choices["copilot"] = wanted
+        # The plugin reads this choice; failure to persist it must not be
+        # reported as a successful selection.
+        _save_choices(ctx.target, choices)
+    ui.log_target("GitHub Copilot (Neovim)",
+                  ("enabled" if wanted else "disabled") if record
+                  else ("would enable" if wanted else "would disable"))
+    return wanted
 
 
 # --- seams --------------------------------------------------------------------
@@ -888,6 +924,11 @@ def run_pipeline(ctx: Context, command: str, opts: Options) -> int:
 
     ui.section("Installing packages")
     exclude = [] if opts.no_packages else ai_cli_exclusions(ctx, opts)
+    try:
+        copilot = copilot_choice(ctx, opts)
+    except OSError as exc:
+        _report(results, PhaseResult("copilot", FAIL, [f"could not save choice: {exc}"]))
+        return finish(ctx, command, results, closing=True)
     packages_result = _report(results, packages_phase(
         ctx, disabled=opts.no_packages, dry_run=False, exclude=exclude))
     if packages_result.status == FAIL:
@@ -910,7 +951,7 @@ def run_pipeline(ctx: Context, command: str, opts: Options) -> int:
 
     ui.section("Post actions")
     child_env = phases.child_env(ctx.target, ctx.env)
-    _report(results, phases.post_install_phase(
+    post = _report(results, phases.post_install_phase(
         ctx.target, ctx.runner, repo_root=Path(ctx.repo_root), run_id=ctx.run_id,
         systemd_units_applied=systemd_applied, env=child_env,
         skip_zplug=opts.skip_zplug, skip_vimplug=opts.skip_vimplug,
@@ -928,6 +969,11 @@ def run_pipeline(ctx: Context, command: str, opts: Options) -> int:
     _report(results, phases.git_identity_phase(ctx.target, ctx.runner,
                                                prompt=ctx.prompt))
     _report(results, phases.auth_phase(ctx.target, ctx.runner, ctx.env))
+    if copilot:
+        _report(results, phases.copilot_auth_phase(
+            ctx.target, ctx.runner, ctx.env, prompt=ctx.prompt,
+            interactive=ctx.interactive, skip=opts.skip_vimplug,
+            plugins_ready=post.details.get("vim_plugins") == "updated"))
 
     ui.section("GNOME settings")
     _report(results, gui_phase(ctx, disabled=opts.no_gui))
@@ -945,6 +991,7 @@ def dry_run_install(ctx: Context, opts: Options | None = None) -> int:
     ui.section("Installing packages")
     results.append(packages_phase(ctx, disabled=opts.no_packages, dry_run=True,
                                   exclude=ai_cli_exclusions(ctx, opts, record=False)))
+    copilot_choice(ctx, opts, record=False)
     ui.section("Creating symbolic links")
     checkout = Path(ctx.repo_root)
     try:
@@ -1167,14 +1214,14 @@ def _open_tty(mode: str):
         return None
 
 
-def _interactive(argv: list[str]) -> int:
-    """Run a command attached to the terminal (chsh needs to prompt)."""
+def _interactive(argv: list[str], *, env: dict | None = None) -> int:
+    """Run a terminal command (chsh or Copilot's Neovim device login)."""
 
     stdin = None
     if not sys.stdin.isatty():
         stdin = _open_tty("rb") or subprocess.DEVNULL
     try:
-        return subprocess.call(argv, stdin=stdin)
+        return subprocess.call(argv, stdin=stdin, env=env)
     finally:
         if stdin not in (None, subprocess.DEVNULL):
             stdin.close()

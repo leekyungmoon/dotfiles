@@ -48,6 +48,20 @@
   },
   "references": [
     {
+      "file": "installer/phases.py",
+      "line": "\"lua io.stdout:write('DOTFILES_COPILOT_STATUS=' .. \"",
+      "kind": "identifier",
+      "classification": "identifier",
+      "purpose": "Status-only marker from the Neovim Copilot probe; contains no credential or account data"
+    },
+    {
+      "file": "installer/phases.py",
+      "line": "if line.startswith(\"DOTFILES_COPILOT_STATUS=\"):",
+      "kind": "identifier",
+      "classification": "identifier",
+      "purpose": "Read only the whitelisted Copilot status from the headless probe output"
+    },
+    {
       "file": "bin/dotfiles",
       "line": "+ list(args), cwd=dotfiles_dir)",
       "kind": "identifier",

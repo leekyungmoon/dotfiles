@@ -32,6 +32,46 @@ $ git clone --recursive https://github.com/leekyungmoon/dotfiles.git ~/.dotfiles
 The installation script will clone the repository into `~/.dotfiles` and create symbolic links (e.g., `~/.vimrc`) for you.
 Existing files are backed up and replaced; `python3 ~/.dotfiles/install.py restore --baseline` brings them back.
 
+### Neovim with GitHub Copilot
+
+The installer already includes Neovim and Node.js. Alongside the Claude Code
+and Codex choices, it now asks:
+
+```text
+Set up GitHub Copilot in Neovim (copilot.vim)? [Y/n]
+```
+
+Press Enter or answer `y` to install the official
+[`github/copilot.vim`](https://github.com/github/copilot.vim) plugin through
+the existing lazy.nvim configuration. The choice is remembered for future
+updates. Answering `n` leaves Neovim available without this plugin; it does
+not delete any existing plugin files.
+
+If Copilot is not signed in, the installer asks `Sign in to GitHub Copilot
+now? [Y/n]` and opens Neovim with `:Copilot setup`. Follow the device-code
+instructions and approve in your browser using the **GitHub account with
+Copilot access**. Neovim closes after setup, and the installer checks the
+sign-in status again. This login is separate from GitHub CLI, Codex and
+Claude Code authentication. Copilot Free or a paid/organization plan is
+required for suggestions.
+
+Enable or disable the integration later:
+
+```sh
+python3 ~/.dotfiles/install.py --copilot
+python3 ~/.dotfiles/install.py --no-copilot
+```
+
+In Neovim, **Alt+Y** accepts a Copilot suggestion; **Tab** and **Ctrl+J** keep
+the existing completion and snippet behavior. Use `:Copilot status` to check
+availability, or `:Copilot setup` to finish a deferred login.
+
+A fresh installation without a terminal skips Copilot unless `--copilot`
+is supplied. Login is never started without a terminal; an unsigned account
+is reported as `AUTH_REQUIRED` with the manual setup command. `--dry-run`
+does not save the choice or log in. `--skip-vimplug` skips plugin installation
+and the Copilot sign-in step; rerun without it to finish setup.
+
 
 ## `$ dotfiles`
 

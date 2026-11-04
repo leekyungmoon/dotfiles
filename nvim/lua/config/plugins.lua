@@ -14,6 +14,7 @@ local PLUGIN_SPEC = {
   { import = "plugins.keymap" },
   { import = "plugins.git" },
   { import = "plugins.ide" },
+  { import = "plugins.copilot" },
   { import = "plugins.treesitter" },
   { import = "plugins.utilities" },
 }
