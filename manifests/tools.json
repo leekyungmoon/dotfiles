@@ -24,6 +24,7 @@
     "nvim",
     "fzf",
     "codex",
+    "copilot",
     "omx"
   ],
   "tools": {
@@ -299,6 +300,58 @@
       "verification": {
         "amd64": "PASS: downloaded, sha256 matched codex-package_SHA256SUMS, codex --version = codex-cli 0.157.1 with an empty temporary HOME and CODEX_HOME (it warned that CODEX_HOME did not exist, and wrote nothing else).",
         "arm64": "Checksum entry present in codex-package_SHA256SUMS; URL answered HTTP 200. Execution UNVERIFIED."
+      }
+    },
+    "copilot-cli": {
+      "version": "1.0.106",
+      "selection": "Official GitHub Copilot CLI standalone release v1.0.106 (2026-11-05); selected with --copilot-cli or the installer prompt.",
+      "license": "Proprietary (GitHub). Downloaded from the official release on the target; not redistributed.",
+      "requires": {
+        "glibc": "2.28"
+      },
+      "artifacts": {
+        "amd64": {
+          "url": "https://github.com/github/copilot-cli/releases/download/v1.0.106/copilot-linux-x64.tar.gz",
+          "sha256": "bb2ac6a50c2d7ceffee3b489f278fb9ba4fd39d4678dd75b5b021d4feedcc3ef",
+          "archive": "tar.gz",
+          "strip_components": 0
+        },
+        "arm64": {
+          "url": "https://github.com/github/copilot-cli/releases/download/v1.0.106/copilot-linux-arm64.tar.gz",
+          "sha256": "1591b72a0e01c286ab3e3aba98f6a204b6895cf6f994d14e3769831c8d37e72c",
+          "archive": "tar.gz",
+          "strip_components": 0
+        }
+      },
+      "integrity": {
+        "checksum_source": {
+          "type": "github-release-asset-digest",
+          "url": "https://api.github.com/repos/github/copilot-cli/releases/tags/v1.0.106",
+          "field": "assets[].digest"
+        },
+        "note": "The pinned SHA-256 values are GitHub release asset digests, not a publisher signature. Both archives are verified before extraction."
+      },
+      "install": {
+        "method": "extract"
+      },
+      "prefix": "{prefix_root}/copilot-cli/{version}",
+      "links": {
+        "copilot": "copilot"
+      },
+      "verify": [
+        {
+          "argv": [
+            "env",
+            "COPILOT_OFFLINE=true",
+            "{prefix}/copilot",
+            "--version"
+          ],
+          "stdout": "^GitHub Copilot CLI 1\\.0\\.106\\."
+        }
+      ],
+      "verification": {
+        "amd64": "PASS: official archive SHA-256 matched the release asset digest; the archive contains one root-level executable. With a temporary HOME, COPILOT_OFFLINE=true copilot --version reported GitHub Copilot CLI 1.0.106. No system Node.js is required by this standalone binary; maximum required GLIBC symbol is 2.28.",
+        "arm64": "Official release asset URL and digest recorded. Execution UNVERIFIED."
       }
     },
     "claude-code": {

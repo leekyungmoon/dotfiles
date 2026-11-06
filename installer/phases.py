@@ -1626,6 +1626,53 @@ def copilot_auth_phase(target, runner, env=None, *, prompt=None, interactive=Non
     return pending
 
 
+def copilot_cli_auth_phase(target, runner, env=None, *, prompt=None, interactive=None,
+                           skip: bool = False, plugins_ready: bool = True) -> PhaseResult:
+    """Run the CLI's own login flow without inventing an auth-status probe.
+
+    This CLI version has no noninteractive status command. Declining login
+    leaves account status unverified, not signed out. No prompt is sent to
+    an agent and no credential file is inspected to infer authentication.
+    """
+
+    phase = "copilot-cli-auth"
+    if skip or not plugins_ready:
+        reason = "--skip-vimplug" if skip else "Neovim plugin installation did not succeed"
+        return PhaseResult(phase, SKIPPED, [reason])
+    binary = _tool_binary(target, runner, "copilot")
+    if binary is None or any(_tool_binary(target, runner, name) is None
+                             for name in ("nvim", "tmux")):
+        return PhaseResult(phase, FAIL,
+                           ["Copilot CLI, Neovim and tmux are required; rerun without --no-packages"])
+    plugin = target.data_home / "vim" / "plugged" / "sidekick.nvim" / "lua" / "sidekick" / "init.lua"
+    if not plugin.is_file():
+        return PhaseResult(phase, FAIL,
+                           ["Sidekick was not installed; rerun without --skip-vimplug"])
+    hint = "Run copilot login if needed; open copilot and use /user to check the account"
+    unverified = PhaseResult(phase, SKIPPED, [hint], {"copilot-cli": "unverified"})
+    if prompt is None or interactive is None:
+        return unverified
+    ui.log("Copilot CLI has a separate login. Choose n if you already signed in; "
+           "you can check your account with /user inside the CLI.")
+    answer = prompt("Sign in to GitHub Copilot CLI now? [Y/n] ")
+    if answer is None or answer.strip().lower() not in ("", "y", "yes"):
+        return unverified
+    ui.log("Follow Copilot CLI's GitHub browser sign-in instructions. "
+           "This does not start an AI coding task.")
+    try:
+        rc = interactive([binary, "login"], env=child_env(target, env))
+    except (Exception, KeyboardInterrupt):
+        return PhaseResult(phase, AUTH_REQUIRED, ["Copilot CLI login was interrupted; " + hint],
+                           {"copilot-cli": "login-interrupted"})
+    if rc != 0:
+        return PhaseResult(phase, AUTH_REQUIRED,
+                           [f"Copilot CLI login exited with status {rc}; " + hint],
+                           {"copilot-cli": "login-failed"})
+    return PhaseResult(phase, PASS,
+                       ["Copilot CLI login completed; use /user inside copilot to check the account"],
+                       {"copilot-cli": "login-completed"})
+
+
 # --- git identity -------------------------------------------------------------
 
 SECRET_HEADER = "# vim: set ft=gitconfig:\n"

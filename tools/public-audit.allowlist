@@ -25,3 +25,5 @@ home-path | tests/test-tmux-smart-paste.sh | fixture/.Xauthority | synthetic XAU
 home-path | tests/integration/test_tmux_service_start.py | GNOME_SETUP_DISPLAY=":1", HOME= | synthetic HOME of a fake user-manager environment
 home-path | tools/public-audit.allowlist | synthetic XAUTHORITY values of the mocked tmux environment | an earlier version of the rule above spelled the synthetic placeholder path itself
 home-path | tools/public-audit.allowlist | synthetic HOME of a fake user-manager environment | an earlier version of the rule above spelled the synthetic placeholder path itself
+email | tests/fixtures/sidekick/runtime.lua | @sample.lua | Synthetic Sidekick file reference in the isolated runtime fixture, not an email address
+email | tests/integration/test_sidekick_runtime.py | @sample.lua | Synthetic Sidekick file reference in the isolated runtime assertion, not an email address

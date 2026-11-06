@@ -43,6 +43,27 @@ pickup of the settings, input-remapper with a physical keyboard, and any
 execution on arm64. Those rows in the results table stay "pending
 verification" until someone runs them.
 
+## Copilot CLI and Sidekick checks (2026-11-06)
+
+On Ubuntu 24.04 amd64, the official Copilot CLI v1.0.106 archive was installed
+in a disposable home through the real package installer. Its pinned SHA-256,
+executable version, link requests and repeat installation were verified.
+No login or AI request was made. The arm64 artifact has a recorded official
+release digest, but its execution remains unverified.
+
+The optional runtime tests use disposable homes:
+
+- `tests/integration/test_copilot_cli_package.py`: official CLI extraction and
+  repeat installation (`DOTFILES_COPILOT_CLI_NETWORK_TEST=1`).
+- `tests/integration/test_sidekick_runtime.py`: real Sidekick and lazy.nvim,
+  with a recording CLI fixture and a private tmux server
+  (`DOTFILES_SIDEKICK_RUNTIME_TEST=1`).
+- `tests/integration/test_copilot_runtime.py`: existing inline Copilot plugin
+  and unsigned account behavior (`DOTFILES_COPILOT_NETWORK_TEST=1`).
+
+Authenticated agent edits and subscription access require a user's own
+interactive session and are not covered by these tests.
+
 
 ## Known release differences
 

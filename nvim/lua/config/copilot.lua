@@ -12,14 +12,18 @@ function M.choice_path()
   return vim.fs.joinpath(state_home(), 'personal-dotfiles', 'choices.json')
 end
 
-function M.enabled()
+function M.choice(name)
   local handle = io.open(M.choice_path(), 'r')
   if not handle then return false end
 
   local contents = handle:read('*a')
   handle:close()
   local ok, choices = pcall(vim.json.decode, contents)
-  return ok and type(choices) == 'table' and choices.copilot == true
+  return ok and type(choices) == 'table' and choices[name] == true
+end
+
+function M.enabled()
+  return M.choice('copilot')
 end
 
 function M.auth_status()

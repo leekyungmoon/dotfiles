@@ -15,6 +15,7 @@ local PLUGIN_SPEC = {
   { import = "plugins.git" },
   { import = "plugins.ide" },
   { import = "plugins.copilot" },
+  { import = "plugins.sidekick" },
   { import = "plugins.treesitter" },
   { import = "plugins.utilities" },
 }

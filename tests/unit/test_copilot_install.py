@@ -252,10 +252,11 @@ class CopilotTests(unittest.TestCase):
                     phases, name, return_value=phases.PhaseResult(name, phases.PASS)))
             stack.enter_context(mock.patch.object(install, "finish", side_effect=finish))
             rc = install.run_pipeline(self.ctx, "install", install.Options(
-                claude_code=False, codex=False, copilot=True))
+                claude_code=False, codex=False, copilot=True, copilot_cli=False))
         self.assertEqual(rc, 0)
         self.assertEqual(seen, ["plugins", "finished"])
-        self.assertEqual(packages.call_args.kwargs["exclude"], ["claude-code", "codex", "oh-my-codex"])
+        self.assertEqual(packages.call_args.kwargs["exclude"],
+                         ["claude-code", "codex", "oh-my-codex", "copilot-cli"])
 
 
 if __name__ == "__main__":
